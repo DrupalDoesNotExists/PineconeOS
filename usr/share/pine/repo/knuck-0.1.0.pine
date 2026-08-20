@@ -3041,7 +3041,7 @@ return function(K)
   }
 
   return M
-end---FILE /lib/knuck/kernel/syscall.lua 0755 26892 9cb4d4b1 src---
+end---FILE /lib/knuck/kernel/syscall.lua 0755 27347 1ce06999 src---
 --[[
   KNUCK syscall dispatcher
   ========================
@@ -3454,6 +3454,17 @@ return function(K)
   end
 
   M.register("open", function(proc, path, flags, mode)
+    -- Normalize flags: accept POSIX numeric flags (O_RDONLY=0, O_WRONLY=1,
+    -- O_RDWR=2, O_APPEND=0x400) or string modes ("r"/"w"/"a"). CraftOS
+    -- fs.open only understands string modes.
+    if type(flags) == "number" then
+      local n = flags
+      local acc = n % 8
+      if acc == 1 then flags = "w"
+      elseif acc == 2 then flags = "r"
+      else flags = "r" end
+      if math.floor(n / 0x400) % 2 == 1 then flags = flags .. "a" end
+    end
     local fd, err = K.vfs.open(proc, path, flags or "r", mode, function(f)
       local n = alloc_fd(proc, f)
       if not n then return nil, "too many open files" end
@@ -3991,7 +4002,7 @@ return function(K)
   end
 
   return M
-end---FILE /lib/knuck/kernel/vfs.lua 0755 31346 76d9576d src---
+end---FILE /lib/knuck/kernel/vfs.lua 0755 31521 78a474bc src---
 --[[
   KNUCK VFS
   =========
@@ -4234,7 +4245,8 @@ return function(K)
         local tgt = ino.target
         if tgt:sub(1, 1) ~= "/" then
           -- relative target: resolve against parent dir
-          local parent = p:match("^(.*)/[^/]+$") or "/"
+          local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
           tgt = parent .. "/" .. tgt
         end
         p = M.normalize(tgt)
@@ -4605,7 +4617,8 @@ return function(K)
     if not ino then
       if not creating then return nil, "no such file" end
       -- create: check parent dir + permission
-      local parent = p:match("^(.*)/[^/]+$") or "/"
+      local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
       local pino = M.get_inode(parent)
       if not pino or pino.type ~= "dir" then return nil, "no such directory" end
       if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
@@ -4741,7 +4754,8 @@ return function(K)
       return nil, "read-only or virtual"
     end
     if fs_mod.exists(p) then return nil, "exists" end
-    local parent = p:match("^(.*)/[^/]+$") or "/"
+    local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
     local pino = M.get_inode(parent)
     if not pino or pino.type ~= "dir" then return nil, "no such directory" end
     if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
@@ -4753,7 +4767,8 @@ return function(K)
   -- mkfifo
   function M.mkfifo(proc, path, mode)
     local p = M.resolve(proc, path)
-    local parent = p:match("^(.*)/[^/]+$") or "/"
+    local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
     local pino = M.get_inode(parent)
     if not pino or pino.type ~= "dir" then return nil, "no such directory" end
     if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
@@ -4828,7 +4843,8 @@ return function(K)
   -- symlink
   function M.symlink(proc, target, path)
     local p = M.resolve(proc, path)
-    local parent = p:match("^(.*)/[^/]+$") or "/"
+    local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
     local pino = M.get_inode(parent)
     if not pino or pino.type ~= "dir" then return nil, "no such directory" end
     if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end

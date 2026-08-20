@@ -22,7 +22,79 @@ version:0.1.0
 arch:any
 deps:
 desc:KNUCK microkernel (Lua 5.2)
-size:157211
-sha:00000000
+size:158960
+sha:af7152fd
 file:knuck-0.1.0.pine
+---
+pkg:textutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Text processing utilities (grep, sed, sort, uniq, cut, tr)
+size:7891
+sha:34669796
+file:textutils-1.0.0.pine
+---
+pkg:fileutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:File manipulation utilities (touch, ln, chmod, chown, rmdir, basename, dirname, find)
+size:6291
+sha:c03cedf4
+file:fileutils-1.0.0.pine
+---
+pkg:procutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Process and system utilities (ps, kill, mount, df, uname, free, uptime, which, whoami, id)
+size:10005
+sha:7d5a2100
+file:procutils-1.0.0.pine
+---
+pkg:nano
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Nano-style non-modal text editor
+size:6115
+sha:2a09303b
+file:nano-1.0.0.pine
+---
+pkg:netutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Networking utilities (ifconfig, wget, nc, ping, ip, route, hostname)
+size:12409
+sha:49c05659
+file:netutils-1.0.0.pine
+---
+pkg:vi
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Vi-style modal text editor
+size:9403
+sha:a451a8d5
+file:vi-1.0.0.pine
+---
+pkg:procutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Process and system utilities (ps, kill, mount, df, uname, free, uptime, which, whoami, id)
+size:9949
+sha:e89872c1
+file:procutils-1.0.0.pine
+---
+pkg:fileutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:File manipulation utilities (touch, ln, chmod, chown, rmdir, basename, dirname, find)
+size:6285
+sha:f9de0112
+file:fileutils-1.0.0.pine
 ---
