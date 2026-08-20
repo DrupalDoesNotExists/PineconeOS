@@ -1,5 +1,0 @@
-# PineconeOS init script
-# service <name> <path> [args...]
-
-service syslogd /knuck/sbin/syslogd.lua
-service hotplugd /knuck/sbin/hotplugd.lua

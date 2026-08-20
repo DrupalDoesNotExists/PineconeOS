@@ -1,66 +1,71 @@
 --[[
-  PineconeOS init (pid 1)
-  =======================
-  Parses /boot/init.rc, spawns each declared service, then reaps children
-  forever (waitpid loop) so zombies never accumulate.
+  PineconeOS init (pid 1) — runit-style supervisor
+  =================================================
+  Scans /etc/sv/ for service directories, spawns each <name>/run script,
+  then supervises them: on exit, respawns with a short backoff so a crashing
+  service doesn't spin the CPU.
 
-  init.rc format (one directive per line, '#' comments):
-    service <name> <path> [args...]
+  Service layout (runit convention):
+    /etc/sv/<name>/run     executable Lua script (the service)
 
-  The kernel spawns this as pid 1 (default /knuck/sbin/init.lua, overridable
-  via `init <path>` in /boot/knuck.conf).
+  The kernel spawns this as pid 1 (default /sbin/init.lua, overridable via
+  `init <path>` in /boot/knuck.conf).
 ]]
 
-local function read_all(path)
-  local f = open(path, "r")
-  if not f then return nil end
-  local data = read(f, 65536)
-  close(f)
-  return data
-end
+local BACKOFF = 1  -- seconds to wait before respawning a crashed service
 
 local function log(msg)
   print("[init] " .. msg)
 end
 
--- ---- parse /boot/init.rc ----
-local services = {}
-local rc = read_all("/boot/init.rc")
-if rc then
-  for line in (rc .. "\n"):gmatch("([^\n]*)\n") do
-    line = line:gsub("^%s+", ""):gsub("%s+$", "")
-    if line ~= "" and not line:match("^#") then
-      local cmd, rest = line:match("^(%S+)%s+(.+)$")
-      if cmd == "service" and rest then
-        local name, path = rest:match("^(%S+)%s+(%S+)")
-        if name and path then
-          local args = {}
-          for a in (rest:gsub("^%S+%s+%S+", "")):gmatch("%S+") do
-            args[#args + 1] = a
-          end
-          services[#services + 1] = { name = name, path = path, args = args }
-        end
-      end
+-- ---- discover services under /etc/sv ----
+local services = {}  -- { name = <name>, path = <path>, pid = <pid> }
+local ok, entries = pcall(readdir, "/etc/sv")
+if ok and entries then
+  for _, entry in ipairs(entries) do
+    local name = entry.name
+    local run = "/etc/sv/" .. name .. "/run"
+    local ino = stat(run)
+    if ino and ino.type == "file" then
+      services[#services + 1] = { name = name, path = run, pid = nil }
     end
   end
 else
-  log("no /boot/init.rc, starting with no services")
+  log("no /etc/sv, starting with no services")
 end
 
 -- ---- spawn all services ----
 for _, svc in ipairs(services) do
-  local pid = spawn(svc.path, table.unpack(svc.args))
+  local pid = spawn(svc.path)
   if pid then
+    svc.pid = pid
     log("started " .. svc.name .. " pid " .. pid)
   else
-    log("FAILED to start " .. svc.name .. " (" .. svc.path .. ")")
+    log("FAILED to start " .. svc.name)
   end
 end
 
--- ---- reap children forever ----
+-- ---- supervise: reap children, respawn crashed services ----
 while true do
   local pid, how, code = waitpid(-1)
   if pid then
-    log("reaped pid " .. pid .. " (" .. tostring(how) .. " " .. tostring(code) .. ")")
+    -- find which service this pid belonged to
+    local svc = nil
+    for _, s in ipairs(services) do
+      if s.pid == pid then svc = s break end
+    end
+    if svc then
+      log(svc.name .. " exited (" .. tostring(how) .. " " .. tostring(code) .. "), respawning")
+      sleep(BACKOFF)
+      local np = spawn(svc.path)
+      if np then
+        svc.pid = np
+        log("restarted " .. svc.name .. " pid " .. np)
+      else
+        log("FAILED to restart " .. svc.name)
+      end
+    else
+      log("reaped unknown pid " .. pid)
+    end
   end
 end
