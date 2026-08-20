@@ -1,0 +1,2 @@
+-- PineconeOS login service (getty): prompt, verify, spawn shell.
+exec("/usr/bin/login.lua")

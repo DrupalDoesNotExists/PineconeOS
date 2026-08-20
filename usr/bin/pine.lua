@@ -1,240 +1,915 @@
 --[[
   PineconeOS package manager (pine)
   ================================
-  Pacman-style. Package format: .cone = tar archive containing a .CONEINFO
-  metadata file plus the payload files (paths relative to /).
-
-  Commands:
-    pine -U <file.cone>   install from a local .cone file
-    pine -S <pkg>         install from a configured repository
-    pine -R <pkg>         remove an installed package
-    pine -Q               list installed packages
-    pine -Ss <term>       search repositories
-    pine -Sy              refresh repository databases
-
-  Config: /etc/pine/pine.conf   (repo lines: repo <name> <url>)
-  DB:     /var/lib/pine/local/<name>/   (installed package + file list)
-  Cache:  /var/cache/pine/pkg/
+  Line-based .pine format. Minimal DB. Bytecode support.
+  Runs as system process with load/io/os available.
+  Uses syscall wrappers for file I/O.
 ]]
 
-local tar = dofile("/usr/lib/tar.lua")
+-- ---- args ----
+local args = {}
+for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
-local CONF = "/etc/pine/pine.conf"
-local LOCAL_DB = "/var/lib/pine/local"
-local CACHE = "/var/cache/pine/pkg"
+-- ---- constants ----
+local DB_DIR     = "/var/lib/pine/db"
+local CONF_DIR   = "/var/lib/pine/conffiles"
+local STAGE_DIR  = "/var/lib/pine/stage"
+local REPO_INDEX = "/usr/share/pine/repo/PINEINDEX"
+local REPO_DIR   = "/usr/share/pine/repo"
+local LOCK_DIR   = "/var/lib/pine/lock"
+local SEP = ","
+
+-- ---- flags ----
+local flag_force   = false
+local flag_nohook  = false
+local flag_dryrun  = false
+
+local function parse_flags()
+  local filtered = {}
+  for _, a in ipairs(args) do
+    if a == "--force" then flag_force = true
+    elseif a == "--no-hooks" then flag_nohook = true
+    elseif a == "--dry-run" then flag_dryrun = true
+    else filtered[#filtered + 1] = a
+    end
+  end
+  return filtered
+end
+
+args = parse_flags()
+local cmd = args[1]
+
+-- ---- bit lib (Lua 5.2: bit32; KNUCK: may provide bit) ----
+local bit = (function()
+  local ok, b = pcall(require, "bit")
+  if ok and b and b.bxor then return b end
+  ok, b = pcall(require, "bit32")
+  if ok and b and b.bxor then return b end
+  -- fallback: pure-arithmetic bxor for 32-bit values
+  local bxor_impl
+  bxor_impl = function(a, b)
+    if a == 0 then return b end
+    if b == 0 then return a end
+    local r, p = 0, 1
+    for _ = 1, 32 do
+      local ab, bb = a % 2, b % 2
+      if ab ~= bb then r = r + p end
+      a, b = math.floor(a / 2), math.floor(b / 2)
+      p = p * 2
+      if a == 0 and b == 0 then break end
+    end
+    return r
+  end
+  return { bxor = bxor_impl }
+end)()
 
 -- ---- helpers ----
 
-local function read_all(path)
-  local f = open(path, "r")
-  if not f then return nil end
-  local data = read(f, 65536)
-  close(f)
-  return data
+local function err(msg)
+  write(2, "pine: " .. tostring(msg) .. "\n")
 end
 
-local function write_all(path, data)
-  local f = open(path, "w")
-  if not f then return false end
-  write(f, data)
-  close(f)
+local function die(msg)
+  error(msg, 0)
+end
+
+-- ---- lock ----
+
+local function acquire_lock()
+  local ok = mkdir(LOCK_DIR)
+  if ok then
+    local fd = open(LOCK_DIR .. "/pid", "w")
+    if fd then write(fd, tostring(getpid())); close(fd) end
+    return true
+  end
+  -- lock held — check if owner is still alive
+  local fd = open(LOCK_DIR .. "/pid", "r")
+  if fd then
+    local pid_str = read(fd, 32)
+    close(fd)
+    if pid_str then
+      local pid = tonumber(pid_str)
+      if pid and kill(pid, 0) then
+        die("another pine instance is running (pid " .. pid .. ")")
+      end
+    end
+  end
+  -- stale lock — clean up and retry once
+  unlink(LOCK_DIR .. "/pid")
+  rmdir(LOCK_DIR)
+  ok = mkdir(LOCK_DIR)
+  if not ok then die("cannot acquire lock") end
+  fd = open(LOCK_DIR .. "/pid", "w")
+  if fd then write(fd, tostring(getpid())); close(fd) end
   return true
 end
 
-local function ensure_dir(path)
-  if not stat(path) then mkdir(path) end
+local function release_lock()
+  unlink(LOCK_DIR .. "/pid")
+  rmdir(LOCK_DIR)
 end
 
-local function log(msg)
-  print("[pine] " .. msg)
+local function msg(msg)
+  write(1, "pine: " .. tostring(msg) .. "\n")
 end
 
--- ---- .CONEINFO parsing ----
+-- read entire file, loop until EOF
+local function read_all(path)
+  local fd = open(path, "r")
+  if not fd then return nil end
+  local parts = {}
+  while true do
+    local chunk = read(fd, 4096)
+    if not chunk then break end
+    parts[#parts + 1] = chunk
+  end
+  close(fd)
+  return table.concat(parts)
+end
 
--- parse "key = value" lines into a table
-local function parse_coneinfo(content)
-  local info = {}
-  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-    line = line:gsub("^%s+", ""):gsub("%s+$", "")
-    if line ~= "" and not line:match("^#") then
-      local k, v = line:match("^(%S+)%s*=%s*(.+)$")
-      if k then info[k] = v end
+local function write_all(path, data)
+  local fd = open(path, "w")
+  if not fd then return false end
+  write(fd, data)
+  close(fd)
+  return true
+end
+
+-- mkdir_p: walk path components, mkdir each missing
+local function mkdir_p(path, mode)
+  mode = mode or 493 -- 0755
+  if stat(path) then return true end
+  -- build list of components to create
+  local stack = {}
+  local cur = path
+  while cur and cur ~= "" and not stat(cur) do
+    stack[#stack + 1] = cur
+    cur = cur:match("^(.+)/[^/]+$")
+  end
+  -- create from top down
+  for i = #stack, 1, -1 do
+    mkdir(stack[i], mode)
+  end
+  return stat(path) ~= nil
+end
+
+-- write file with mkdir_p for parents
+local function write_file(path, data, mode)
+  mode = mode or 493
+  local dir = path:match("^(.+)/[^/]+$")
+  if dir then mkdir_p(dir, mode) end
+  local fd = open(path, "w")
+  if not fd then return false end
+  write(fd, data)
+  close(fd)
+  if mode then chmod(path, mode) end
+  return true
+end
+
+local function file_exists(path)
+  return stat(path) ~= nil
+end
+
+local function split_csv(s)
+  local t = {}
+  if not s or s == "" then return t end
+  for item in s:gmatch("[^" .. SEP .. "]+") do
+    t[#t + 1] = item:gsub("^%s+", ""):gsub("%s+$", "")
+  end
+  return t
+end
+
+-- ---- FNV-1a ----
+local function fnv1a(data)
+  local h = 0x811c9dc5
+  for i = 1, #data do
+    h = bit.bxor(h, string.byte(data, i))
+    h = (h * 0x01000193) % 0x100000000
+  end
+  return string.format("%08x", h)
+end
+
+-- ---- version compare ----
+local function ver_split(v)
+  local maj, min, pat = v:match("^(%d+)%.(%d+)%.(%d+)$")
+  if maj then return tonumber(maj), tonumber(min), tonumber(pat) end
+  return nil
+end
+
+local function ver_cmp(a, b)
+  local am, ai, ap = ver_split(a)
+  local bm, bi, bp = ver_split(b)
+  if not am or not bm then return 0 end
+  if am ~= bm then return am < bm and -1 or 1 end
+  if ai ~= bi then return ai < bi and -1 or 1 end
+  if ap ~= bp then return ap < bp and -1 or 1 end
+  return 0
+end
+
+-- version_satisfies: "" or "*" -> true; ops: >= > <= < = ~> (compatible)
+local function version_satisfies(installed, constraint)
+  if not constraint or constraint == "" or constraint == "*" then return true end
+  local op, ver = constraint:match("^(>=?|<=?|=|~>?)%s*(.+)$")
+  if not op then
+    -- bare name -> exact match
+    return installed == constraint
+  end
+  local c = ver_cmp(installed, ver)
+  if op == ">=" then return c >= 0
+  elseif op == ">" then return c > 0
+  elseif op == "<=" then return c <= 0
+  elseif op == "<" then return c < 0
+  elseif op == "=" or op == "==" then return c == 0
+  elseif op == "~>" then
+    -- compatible: same major, installed >= constraint
+    local am, ai, ap = ver_split(installed)
+    local bm, bi, bp = ver_split(ver)
+    if am ~= bm then return false end
+    return c >= 0
+  end
+  return false
+end
+
+-- ---- DB operations ----
+
+local function db_path(name)
+  return DB_DIR .. "/" .. name
+end
+
+local function read_db(name)
+  local data = read_all(db_path(name))
+  if not data then return nil end
+  local db = {}
+  for line in (data .. "\n"):gmatch("([^\n]*)\n") do
+    local k, v = line:match("^([^=]+)%s*=%s*(.+)$")
+    if k then db[k] = v end
+  end
+  return db
+end
+
+local function write_db(name, db)
+  mkdir_p(DB_DIR, 493)
+  local parts = {}
+  for k, v in pairs(db) do
+    parts[#parts + 1] = k .. "=" .. v
+  end
+  return write_all(db_path(name), table.concat(parts, "\n") .. "\n")
+end
+
+local function delete_db(name)
+  local path = db_path(name)
+  unlink(path)
+end
+
+local function list_installed()
+  local entries = readdir(DB_DIR)
+  if not entries then return {} end
+  local pkgs = {}
+  for _, e in ipairs(entries) do
+    if not e.is_dir or e.name:sub(1, 1) ~= "." then
+      pkgs[#pkgs + 1] = e.name
     end
   end
-  return info
+  table.sort(pkgs)
+  return pkgs
 end
 
--- read .CONEINFO from a .cone archive
-local function read_coneinfo(cone_path)
-  local content = tar.read_entry(cone_path, ".CONEINFO")
-  if not content then return nil, "no .CONEINFO in package" end
-  return parse_coneinfo(content)
+-- find which package owns a given file path
+local function find_file_owner(target_path)
+  local pkgs = list_installed()
+  for _, name in ipairs(pkgs) do
+    local db = read_db(name)
+    if db and db.installed_files then
+      for _, f in ipairs(split_csv(db.installed_files)) do
+        if f == target_path then return name end
+      end
+    end
+  end
+  return nil
 end
 
--- ---- repository config ----
+-- check if a package is installed
+local function is_installed(name)
+  return file_exists(db_path(name))
+end
 
-local function load_repos()
-  local repos = {}
-  local conf = read_all(CONF)
-  if conf then
-    for line in (conf .. "\n"):gmatch("([^\n]*)\n") do
-      line = line:gsub("^%s+", ""):gsub("%s+$", "")
-      if line ~= "" and not line:match("^#") then
-        local name, url = line:match("^repo%s+(%S+)%s+(%S+)$")
-        if name and url then
-          repos[#repos + 1] = { name = name, url = url }
+-- ---- .pine parsing (length-prefixed binary-safe) ----
+
+local function parse_pine(data)
+  local manifest = {}
+  local files = {}
+  local chunks = {} -- hook chunks keyed by hook name
+  local pos = 1
+  local dlen = #data
+
+  -- expect ---PINEPKG v1--- (plain find: dashes are literal, not pattern quantifiers)
+  local he, hs = data:find("---PINEPKG v1---", pos, true)
+  if not hs or he ~= 1 then return nil, "invalid package format (missing header)" end
+  pos = hs + 1
+
+  -- read manifest fields until ---END MANIFEST---
+  while pos <= dlen do
+    -- find next line
+    local le = data:find("\n", pos)
+    local line
+    if le then
+      line = data:sub(pos, le - 1)
+      pos = le + 1
+    else
+      line = data:sub(pos)
+      pos = dlen + 1
+    end
+    if line == "---END MANIFEST---" then
+      break
+    end
+    local k, v = line:match("^([^=]+)%s*=%s*(.*)$")
+    if k then manifest[k] = v end
+  end
+
+  -- parse hooks from manifest strings
+  for _, hk in ipairs({"preinst", "postinst", "prerem", "postrem"}) do
+    if manifest[hk] and manifest[hk] ~= "" then
+      chunks[hk] = manifest[hk]
+    end
+  end
+
+  -- read FILE entries (length-prefixed: exactly size bytes follow each header)
+  while pos <= dlen do
+    -- check for ---FILE at current position (we're always at a block boundary)
+    if data:sub(pos, pos + 7) ~= "---FILE " then break end
+    local fe = pos + 7 -- past "---FILE "
+    -- find end of header line
+    local hline_end = data:find("\n", fe + 1)
+    if not hline_end then return nil, "malformed FILE header (no newline)" end
+    local hline = data:sub(fe + 1, hline_end - 1)
+    pos = hline_end + 1 -- now pointing at start of content bytes
+
+    -- strip trailing --- delimiter (last 3 chars)
+    if hline:sub(-3) ~= "---" then
+      return nil, "malformed FILE header (no --- delimiter): " .. hline
+    end
+    hline = hline:sub(1, -4)
+
+    local fpath, fmode, fsize_s, fchk, ftype = hline:match("^(%S+) (%S+) (%S+) (%S+) (%S+)$")
+    if not fpath then return nil, "bad FILE header fields: " .. hline end
+    local fsize = tonumber(fsize_s)
+    if not fsize then return nil, "bad file size: " .. fsize_s end
+
+    -- extract exactly fsize raw bytes
+    if pos + fsize - 1 > dlen then
+      return nil, "truncated content for " .. fpath .. " (need " .. fsize .. " bytes)"
+    end
+    local content = data:sub(pos, pos + fsize - 1)
+    pos = pos + fsize
+
+    files[#files + 1] = {
+      path = fpath,
+      mode = tonumber(fmode, 8),
+      size = fsize,
+      checksum = fchk,
+      type = ftype,
+      content = content,
+    }
+  end
+
+  -- validate required fields
+  if not manifest.name then return nil, "missing package name" end
+  if not manifest.version then return nil, "missing package version" end
+  if not manifest.files then return nil, "missing files count" end
+
+  return {
+    manifest = manifest,
+    files = files,
+    chunks = chunks,
+  }
+end
+
+-- read and parse a .pine file
+local function read_pine_file(path)
+  local data = read_all(path)
+  if not data then return nil, "cannot read " .. path end
+  return parse_pine(data)
+end
+
+-- ---- Repo index ----
+
+local function parse_repo_index(data)
+  local pkgs = {}
+  -- split by --- on its own line
+  local blocks = {}
+  for block in (data .. "\n---\n"):gmatch("(.-)\n%-%-%-\n") do
+    blocks[#blocks + 1] = block
+  end
+  for _, block in ipairs(blocks) do
+    local pkg = {}
+    for line in (block .. "\n"):gmatch("([^\n]*)\n") do
+      local k, v = line:match("^(%S+):(.*)$")
+      if k then pkg[k] = v end
+    end
+    if pkg.pkg then
+      pkg.name = pkg.pkg
+      pkgs[pkg.name] = pkg
+    end
+  end
+  return pkgs
+end
+
+local function load_repo_index()
+  local data = read_all(REPO_INDEX)
+  if not data then return {} end
+  -- validate header
+  local first_line = data:match("([^\n]+)")
+  if first_line ~= "---PINEINDEX v1---" then return {} end
+  return parse_repo_index(data)
+end
+
+-- find .pine file path for a package from repo
+local function find_repo_pkg(name, version)
+  local index = load_repo_index()
+  local pkg = index[name]
+  if not pkg then return nil, "package " .. name .. " not found in repo" end
+  if version and pkg.version ~= version then
+    -- check if repo version satisfies
+    if not version_satisfies(pkg.version, ">=" .. version) then
+      return nil, "repo version " .. pkg.version .. " does not match required " .. version
+    end
+  end
+  -- look for the .pine file in REPO_DIR
+  local pine_file = pkg.file or (name .. "-" .. pkg.version .. ".pine")
+  local path = REPO_DIR .. "/" .. pine_file
+  if not file_exists(path) then
+    -- try name-version.pine pattern
+    local entries = readdir(REPO_DIR)
+    if entries then
+      for _, e in ipairs(entries) do
+        if e.name:match("^" .. name:gsub("%-", "%%-") .. "%-.*%.pine$") then
+          path = REPO_DIR .. "/" .. e.name
+          break
         end
       end
     end
   end
-  return repos
+  if not file_exists(path) then
+    return nil, "pine file not found for " .. name
+  end
+  return path
+end
+
+-- ---- hooks ----
+
+local function run_hook(pkg_name, hook_name, code_str, stage_dir)
+  if flag_nohook then return true end
+  if not load then
+    err("hooks disabled (no load)")
+    return true
+  end
+  if not code_str or code_str == "" then return true end
+
+  -- build restricted environment
+  local env = {
+    string = string,
+    table = table,
+    math = math,
+    open = open,
+    read = read,
+    write = write,
+    close = close,
+    stat = stat,
+    mkdir = mkdir,
+    unlink = unlink,
+    rename = rename,
+    readdir = readdir,
+    PKG_NAME = pkg_name,
+    HOOK = hook_name,
+    PKG_STAGE = stage_dir or "",
+    print = function(...)
+      local parts = {}
+      for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+      write(1, table.concat(parts, "\t") .. "\n")
+    end,
+    tostring = tostring,
+    tonumber = tonumber,
+    type = type,
+    pairs = pairs,
+    ipairs = ipairs,
+    pcall = pcall,
+    error = error,
+  }
+  setmetatable(env, { __index = _G })
+
+  local fn, compile_err = load(code_str, "=" .. hook_name, "t", env)
+  if not fn then
+    err("hook compile error (" .. hook_name .. "): " .. tostring(compile_err))
+    return false
+  end
+
+  local ok, run_err = pcall(fn)
+  if not ok then
+    err("hook runtime error (" .. hook_name .. "): " .. tostring(run_err))
+    return false
+  end
+  return true
 end
 
 -- ---- install ----
 
--- install a .cone file: extract to /, record file list in the local db
-local function install_file(cone_path)
-  local info, err = read_coneinfo(cone_path)
-  if not info then return nil, err end
-  local name = info.name
-  if not name then return nil, "package has no name" end
-  local version = info.version or "0"
+local function do_install(target, resolved_set)
+  resolved_set = resolved_set or {}
+  local name, version, force_dep
 
-  -- list files before extracting (for the db)
-  local entries = tar.list(cone_path)
-  local files = {}
-  for _, e in ipairs(entries or {}) do
-    if e.name ~= ".CONEINFO" and e.typeflag == "0" then
-      files[#files + 1] = "/" .. e.name
+  -- determine if target is a .pine file or a package name
+  if target:match("%.pine$") then
+    -- local file
+    local pkg, err = read_pine_file(target)
+    if not pkg then die("parse error: " .. tostring(err)) end
+    name = pkg.manifest.name
+    version = pkg.manifest.version
+
+    -- version check
+    local old_db = read_db(name)
+    if old_db and old_db.version and not flag_force then
+      local cmp = ver_cmp(old_db.version, version)
+      if cmp >= 0 then
+        msg(name .. " " .. old_db.version .. " is already up to date")
+        return
+      end
     end
+
+    -- dep resolution
+    local deps = split_csv(pkg.manifest.deps)
+    for _, dep_spec in ipairs(deps) do
+      local dep_name, dep_con = dep_spec:match("^([^@]+)@?(.*)$")
+      if dep_con == "" then dep_con = nil end
+      if not resolved_set[dep_name] then
+        resolved_set[dep_name] = true
+        if is_installed(dep_name) then
+          local dep_db = read_db(dep_name)
+          if dep_db and dep_db.version and dep_con then
+            if not version_satisfies(dep_db.version, dep_con) then
+              msg("dependency " .. dep_name .. " version mismatch, reinstalling...")
+              do_install(dep_name, resolved_set)
+            end
+          end
+        else
+          msg("installing dependency: " .. dep_name)
+          do_install(dep_name, resolved_set)
+        end
+      end
+    end
+
+    -- conflict check
+    for _, f in ipairs(pkg.files) do
+      local owner = find_file_owner(f.path)
+      if owner and owner ~= name and not flag_force then
+        die("file " .. f.path .. " is owned by " .. owner .. " (use --force)")
+      end
+    end
+
+    -- backup conffiles
+    local conffiles = split_csv(pkg.manifest.conffiles)
+    if old_db and #conffiles > 0 then
+      mkdir_p(CONF_DIR, 493)
+      for _, cf in ipairs(conffiles) do
+        local basename = cf:match("([^/]+)$")
+        local bak = CONF_DIR .. "/" .. name .. "." .. basename
+        local data = read_all(cf)
+        if data then write_all(bak, data) end
+      end
+    end
+
+    if flag_dryrun then
+      msg("[dry-run] would install " .. name .. " " .. version .. " (" .. #pkg.files .. " files)")
+      for _, f in ipairs(pkg.files) do
+        msg("  " .. f.path)
+      end
+      return
+    end
+
+    -- extract to staging
+    local stage_base = STAGE_DIR .. "/" .. name
+    for _, f in ipairs(pkg.files) do
+      local stage_path = stage_base .. f.path
+      write_file(stage_path, f.content, f.mode)
+    end
+
+    -- preinst hook
+    run_hook(name, "preinst", pkg.chunks.preinst, stage_base)
+
+    -- place files
+    for _, f in ipairs(pkg.files) do
+      local stage_path = stage_base .. f.path
+      local target_path = f.path
+      local data = read_all(stage_path)
+      if data then
+        mkdir_p(target_path:match("^(.+)/[^/]+$") or "/", 493)
+        write_file(target_path, data, f.mode)
+      end
+    end
+
+    -- postinst hook
+    run_hook(name, "postinst", pkg.chunks.postinst, stage_base)
+
+    -- write DB entry (include hook chunks for removal hooks)
+    local file_paths = {}
+    for _, f in ipairs(pkg.files) do file_paths[#file_paths + 1] = f.path end
+    local db = {
+      name = name,
+      version = version,
+      arch = pkg.manifest.arch or "any",
+      maintainer = pkg.manifest.maintainer or "",
+      description = pkg.manifest.description or "",
+      license = pkg.manifest.license or "",
+      deps = pkg.manifest.deps or "",
+      provides = pkg.manifest.provides or "",
+      conffiles = pkg.manifest.conffiles or "",
+      installed_files = table.concat(file_paths, SEP),
+      installed_at = tostring(time()),
+      prerem = pkg.manifest.prerem or "",
+      postrem = pkg.manifest.postrem or "",
+    }
+    write_db(name, db)
+
+    -- cleanup staging
+    for _, f in ipairs(pkg.files) do
+      unlink(STAGE_DIR .. "/" .. name .. f.path)
+    end
+
+    msg("installed " .. name .. " " .. version .. " (" .. #pkg.files .. " files)")
+
+  else
+    -- repo install by name
+    -- version check first if installed
+    local old_db = read_db(target)
+    if old_db and old_db.version and not flag_force then
+      -- check if repo has newer
+      local index = load_repo_index()
+      local repo_pkg = index[target]
+      if repo_pkg then
+        local cmp = ver_cmp(old_db.version, repo_pkg.version)
+        if cmp >= 0 then
+          msg(target .. " " .. old_db.version .. " is already up to date")
+          return
+        end
+      end
+    end
+
+    local pine_path, find_err = find_repo_pkg(target)
+    if not pine_path then die(tostring(find_err)) end
+    do_install(pine_path, resolved_set)
   end
-
-  -- extract to /
-  local n = tar.extract(cone_path, "")
-  if not n then return nil, "extract failed" end
-
-  -- record in local db
-  local dbdir = LOCAL_DB .. "/" .. name
-  ensure_dir(dbdir)
-  write_all(dbdir .. "/info", "name = " .. name .. "\nversion = " .. version .. "\n")
-  local fl = table.concat(files, "\n")
-  write_all(dbdir .. "/files", fl)
-
-  log("installed " .. name .. " " .. version .. " (" .. #files .. " files)")
-  return true
 end
 
 -- ---- remove ----
 
-local function remove_pkg(name)
-  local dbdir = LOCAL_DB .. "/" .. name
-  local files = read_all(dbdir .. "/files")
-  if not files then return nil, "package " .. name .. " not installed" end
-  for line in (files .. "\n"):gmatch("([^\n]*)\n") do
-    line = line:gsub("^%s+", ""):gsub("%s+$", "")
-    if line ~= "" then
-      unlink(line)
+local function do_remove(name)
+  local db = read_db(name)
+  if not db then die("package " .. name .. " is not installed") end
+
+  -- reverse-dep check
+  local pkgs = list_installed()
+  for _, other in ipairs(pkgs) do
+    if other ~= name then
+      local odb = read_db(other)
+      if odb and odb.deps then
+        for _, dep_spec in ipairs(split_csv(odb.deps)) do
+          local dep_name = dep_spec:match("^([^@]+)@?.*$")
+          if dep_name == name and not flag_force then
+            die("required by " .. other .. " (use --force)")
+          end
+        end
+      end
     end
   end
-  -- remove db dir (best effort)
-  local entries = readdir(dbdir)
-  if entries then
-    for _, e in ipairs(entries) do unlink(dbdir .. "/" .. e.name) end
-  end
-  rmdir(dbdir)
-  log("removed " .. name)
-  return true
-end
 
--- ---- query ----
+  -- prerem hook (need to read hook code from the package's original manifest)
+  -- For simplicity, hooks are stored in DB or we skip if not available
+  -- We store hook code in the DB as well for removal
+  local prerem_code = db.prerem
+  local postrem_code = db.postrem
 
-local function query()
-  local entries = readdir(LOCAL_DB)
-  if not entries then
-    log("no packages installed")
+  if flag_dryrun then
+    msg("[dry-run] would remove " .. name)
+    local files = split_csv(db.installed_files)
+    for _, f in ipairs(files) do
+      local owner = find_file_owner(f)
+      if owner == name then
+        msg("  " .. f)
+      end
+    end
     return
   end
-  for _, e in ipairs(entries) do
-    local info = read_all(LOCAL_DB .. "/" .. e.name .. "/info")
-    local version = "?"
-    if info then
-      version = info:match("version%s*=%s*(%S+)") or "?"
+
+  run_hook(name, "prerem", prerem_code, nil)
+
+  -- remove files
+  local files = split_csv(db.installed_files)
+  for _, f in ipairs(files) do
+    local owner = find_file_owner(f)
+    if owner == name then
+      unlink(f)
     end
-    print(e.name .. " " .. version)
+  end
+
+  run_hook(name, "postrem", postrem_code, nil)
+
+  -- conffiles cleanup
+  local conffiles = split_csv(db.conffiles)
+  for _, cf in ipairs(conffiles) do
+    local basename = cf:match("([^/]+)$")
+    local bak = CONF_DIR .. "/" .. name .. "." .. basename
+    local current = read_all(cf)
+    local backup = read_all(bak)
+    if current and backup and current == backup then
+      unlink(cf)
+    end
+    unlink(bak)
+  end
+
+  -- delete DB
+  delete_db(name)
+  msg("removed " .. name)
+end
+
+-- ---- list ----
+
+local function do_list()
+  local pkgs = list_installed()
+  if #pkgs == 0 then
+    msg("no packages installed")
+    return
+  end
+  for _, name in ipairs(pkgs) do
+    local db = read_db(name)
+    local ver = db and db.version or "?"
+    local desc = db and db.description or ""
+    local nfiles = 0
+    if db and db.installed_files then
+      for _ in db.installed_files:gmatch("[^" .. SEP .. "]+") do nfiles = nfiles + 1 end
+    end
+    local line = string.format("%-20s %-12s [%d files]", name, ver, nfiles)
+    if desc ~= "" then
+      line = line .. " " .. desc
+    end
+    write(1, line .. "\n")
+  end
+end
+
+-- ---- files ----
+
+local function do_files(name)
+  local db = read_db(name)
+  if not db then die("package " .. name .. " is not installed") end
+  local files = split_csv(db.installed_files)
+  for _, f in ipairs(files) do
+    write(1, f .. "\n")
+  end
+end
+
+-- ---- owns ----
+
+local function do_owns(path)
+  local owner = find_file_owner(path)
+  if owner then
+    msg(path .. " is owned by " .. owner)
+  else
+    msg(path .. " is not owned by any package")
+  end
+end
+
+-- ---- info ----
+
+local function do_info(name)
+  local db = read_db(name)
+  if not db then die("package " .. name .. " is not installed") end
+  local fields = {"name", "version", "arch", "maintainer", "description", "license", "deps", "provides", "conffiles"}
+  for _, f in ipairs(fields) do
+    if db[f] and db[f] ~= "" then
+      write(1, f .. ": " .. db[f] .. "\n")
+    end
+  end
+  local nfiles = 0
+  if db.installed_files then
+    for _ in db.installed_files:gmatch("[^" .. SEP .. "]+") do nfiles = nfiles + 1 end
+  end
+  write(1, "files: " .. nfiles .. "\n")
+  if db.installed_at then
+    write(1, "installed_at: " .. db.installed_at .. "\n")
   end
 end
 
 -- ---- search ----
 
-local function search(term)
-  local repos = load_repos()
+local function do_search(pattern)
+  local index = load_repo_index()
   local found = false
-  for _, repo in ipairs(repos) do
-    -- local dir repo: url = file:///path
-    local dir = repo.url:match("^file://(.+)$")
-    if dir then
-      local entries = readdir(dir)
-      if entries then
-        for _, e in ipairs(entries) do
-          if e.name:match("%.cone$") and (not term or e.name:find(term, 1, true)) then
-            print(repo.name .. "/" .. e.name)
-            found = true
+  local names = {}
+  for name, _ in pairs(index) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local pkg = index[name]
+    if name:find(pattern, 1, true) or (pkg.desc and pkg.desc:find(pattern, 1, true)) then
+      local line = string.format("%-20s %-12s %s", name, pkg.version or "?", pkg.desc or "")
+      write(1, line .. "\n")
+      found = true
+    end
+  end
+  if not found then
+    msg("no matches for '" .. pattern .. "'")
+  end
+end
+
+-- ---- update (re-read index) ----
+
+local function do_update()
+  -- just re-read the index to confirm it works
+  local index = load_repo_index()
+  local count = 0
+  for _ in pairs(index) do count = count + 1 end
+  msg("repo index loaded: " .. count .. " packages")
+end
+
+-- ---- upgrade ----
+
+local function do_upgrade(target)
+  if target then
+    -- upgrade single package
+    local db = read_db(target)
+    if not db then
+      die("package " .. target .. " is not installed")
+    end
+    do_install(target)
+  else
+    -- upgrade all installed packages
+    local pkgs = list_installed()
+    for _, name in ipairs(pkgs) do
+      local db = read_db(name)
+      if db and db.version then
+        local index = load_repo_index()
+        local repo_pkg = index[name]
+        if repo_pkg and repo_pkg.version then
+          if ver_cmp(db.version, repo_pkg.version) < 0 then
+            msg("upgrading " .. name .. " " .. db.version .. " -> " .. repo_pkg.version)
+            do_install(name)
+          else
+            msg(name .. " is up to date")
           end
         end
       end
     end
   end
-  if not found then log("no matches for '" .. tostring(term) .. "'") end
 end
 
--- ---- install from repo ----
+-- ---- usage ----
 
-local function install_from_repo(pkg)
-  local repos = load_repos()
-  for _, repo in ipairs(repos) do
-    local dir = repo.url:match("^file://(.+)$")
-    if dir then
-      local entries = readdir(dir)
-      if entries then
-        for _, e in ipairs(entries) do
-          if e.name:match("^" .. pkg .. "%-.*%.cone$") then
-            -- copy repo file to cache, then install
-            ensure_dir(CACHE)
-            local src = dir .. "/" .. e.name
-            local dst = CACHE .. "/" .. e.name
-            local s = open(src, "r")
-            if s then
-              local data = read(s, 65536)
-              close(s)
-              write_all(dst, data)
-            end
-            return install_file(dst)
-          end
-        end
-      end
-    end
+local function usage()
+  write(1, "Usage: pine <command> [options]\n")
+  write(1, "Commands:\n")
+  write(1, "  install <name|file.pine>  Install a package\n")
+  write(1, "  remove <name>            Remove an installed package\n")
+  write(1, "  list                     List installed packages\n")
+  write(1, "  files <name>             List files owned by a package\n")
+  write(1, "  owns <path>              Show which package owns a file\n")
+  write(1, "  info <name>              Show package information\n")
+  write(1, "  search <pattern>         Search repo for packages\n")
+  write(1, "  update                   Update repo index\n")
+  write(1, "  upgrade [name]           Upgrade package(s)\n")
+  write(1, "Options:\n")
+  write(1, "  --force                  Force operation\n")
+  write(1, "  --no-hooks               Skip pre/post install/remove hooks\n")
+  write(1, "  --dry-run                Show what would happen without doing it\n")
+end
+
+-- ---- main dispatch ----
+
+acquire_lock()
+local ok, res = pcall(function()
+  if cmd == "install" then
+    if not args[2] then die("usage: pine install <name|file.pine>") end
+    do_install(args[2])
+  elseif cmd == "remove" then
+    if not args[2] then die("usage: pine remove <name>") end
+    do_remove(args[2])
+  elseif cmd == "list" then
+    do_list()
+  elseif cmd == "files" then
+    if not args[2] then die("usage: pine files <name>") end
+    do_files(args[2])
+  elseif cmd == "owns" then
+    if not args[2] then die("usage: pine owns <path>") end
+    do_owns(args[2])
+  elseif cmd == "info" then
+    if not args[2] then die("usage: pine info <name>") end
+    do_info(args[2])
+  elseif cmd == "search" then
+    if not args[2] then die("usage: pine search <pattern>") end
+    do_search(args[2])
+  elseif cmd == "update" then
+    do_update()
+  elseif cmd == "upgrade" then
+    do_upgrade(args[2])
+  else
+    usage()
   end
-  return nil, "package " .. pkg .. " not found in any repo"
-end
-
--- ---- main ----
-
-local args = { ... }
-local cmd = args[1]
-
-if cmd == "-U" then
-  local ok, err = install_file(args[2])
-  if not ok then log("error: " .. tostring(err)) end
-elseif cmd == "-S" then
-  local ok, err = install_from_repo(args[2])
-  if not ok then log("error: " .. tostring(err)) end
-elseif cmd == "-R" then
-  local ok, err = remove_pkg(args[2])
-  if not ok then log("error: " .. tostring(err)) end
-elseif cmd == "-Q" then
-  query()
-elseif cmd == "-Ss" then
-  search(args[2])
-else
-  print("usage: pine -U <file.cone> | -S <pkg> | -R <pkg> | -Q | -Ss <term>")
-end
+end)
+release_lock()
+if not ok then err(res); exit(1) end

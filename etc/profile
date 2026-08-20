@@ -1,0 +1,3 @@
+# PineconeOS system-wide shell startup (/etc/profile)
+setenv PATH /bin:/usr/bin
+echo "PineconeOS ready."

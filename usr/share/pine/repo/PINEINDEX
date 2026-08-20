@@ -1,0 +1,19 @@
+---PINEINDEX v1---
+pkg:coreutils
+version:1.0.0
+arch:any
+deps:
+desc:Basic file utilities
+size:14371
+sha:9e3bed37
+file:coreutils-1.0.0.pine
+---
+pkg:shell
+version:0.1.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:PineconeOS interactive shell
+size:4474
+sha:ea3b2529
+file:shell-0.1.0.pine
+---
