@@ -146,11 +146,11 @@ local function mkdir_p(path, mode)
     stack[#stack + 1] = cur
     cur = cur:match("^(.+)/[^/]+$")
   end
-  -- create from top down
-  for i = #stack, 1, -1 do
-    mkdir(stack[i], mode)
-  end
-  return stat(path) ~= nil
+    -- create from top down
+    for i = #stack, 1, -1 do
+      mkdir(stack[i], mode)
+    end
+    return stat(path) ~= nil
 end
 
 -- write file with mkdir_p for parents
@@ -616,6 +616,7 @@ local function do_install(target, resolved_set)
       name = name,
       version = version,
       arch = pkg.manifest.arch or "any",
+      essential = pkg.manifest.essential or "",
       maintainer = pkg.manifest.maintainer or "",
       description = pkg.manifest.description or "",
       license = pkg.manifest.license or "",
@@ -664,6 +665,13 @@ end
 local function do_remove(name)
   local db = read_db(name)
   if not db then die("package " .. name .. " is not installed") end
+
+  if db and db.essential == "yes" and not flag_force then
+    die(name .. " is an essential package (use --force to remove)")
+  end
+  if db and db.essential == "yes" and flag_force then
+    msg("warning: removing essential package " .. name .. " — system may not boot")
+  end
 
   -- reverse-dep check
   local pkgs = list_installed()

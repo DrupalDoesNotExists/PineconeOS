@@ -1,0 +1,10 @@
+-- /startup — distro-owned boot entry (CraftOS runs this).
+-- Loads the KNUCK kernel, which is provided by the `knuck` pine package
+-- (the package owns /lib/knuck/). Removing that package leaves
+-- /lib/knuck/boot.lua missing, so the system won't boot — pine refuses
+-- to remove it without --force.
+local f, err = loadfile("/lib/knuck/boot.lua", "t", _G)
+if not f then
+  error("kernel not installed: /lib/knuck/boot.lua missing (install the knuck package)")
+end
+f()

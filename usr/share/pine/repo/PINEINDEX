@@ -17,3 +17,12 @@ size:4474
 sha:ea3b2529
 file:shell-0.1.0.pine
 ---
+pkg:knuck
+version:0.1.0
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2)
+size:157211
+sha:00000000
+file:knuck-0.1.0.pine
+---
