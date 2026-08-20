@@ -98,3 +98,21 @@ size:6285
 sha:f9de0112
 file:fileutils-1.0.0.pine
 ---
+pkg:textutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:Text processing utilities (grep, sed, sort, uniq, cut, tr)
+size:13652
+sha:8279c93c
+file:textutils-1.0.0.pine
+---
+pkg:fileutils
+version:1.0.0
+arch:any
+deps:coreutils@>=1.0.0
+desc:File manipulation utilities (touch, ln, chmod, chown, rmdir, basename, dirname, find)
+size:6279
+sha:b572fe48
+file:fileutils-1.0.0.pine
+---
