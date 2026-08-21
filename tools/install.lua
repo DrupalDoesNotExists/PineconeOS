@@ -566,38 +566,34 @@ end
 local DEFAULT_SV_SERVICES = {
   dhcp = [=[
 #!/usr/bin/env lua
--- Default DHCP service
+-- Default DHCP service (spawn, not dofile — services have no dofile in sandbox)
 while true do
-  local ok, err = pcall(function() dofile("/usr/bin/dhcp.lua") end)
-  if not ok then print("dhcp error: "..tostring(err)) sleep(5) else sleep(60) end
+  local pid = spawn("/usr/bin/dhcp.lua")
+  if pid then waitpid(pid) end
+  sleep(60)
 end
 ]=],
 
   getty = [=[
 #!/usr/bin/env lua
--- Getty: login prompt on console (auth via login, not raw sh)
+-- Getty: login prompt on console (auth via login)
 while true do
-  local ok, err = pcall(function() dofile("/usr/bin/login.lua") end)
-  if not ok then print("getty error: "..tostring(err)) sleep(2) end
+  local pid = spawn("/usr/bin/login.lua")
+  if pid then waitpid(pid) end
+  sleep(1)
 end
 ]=],
 
   hotplugd = [=[
 #!/usr/bin/env lua
 -- hotplugd: watches device hotplug via /dev (stub)
-while true do
-  local ok, err = pcall(function() sleep(10) end)
-  if not ok then print("hotplugd error: "..tostring(err)) sleep(2) end
-end
+while true do sleep(10) end
 ]=],
 
   syslogd = [=[
 #!/usr/bin/env lua
--- syslogd: system log collector (stub, drains print buffer)
-while true do
-  local ok, err = pcall(function() sleep(10) end)
-  if not ok then print("syslogd error: "..tostring(err)) sleep(2) end
-end
+-- syslogd: system log collector (stub)
+while true do sleep(10) end
 ]=],
 }
 
