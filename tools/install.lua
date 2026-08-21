@@ -32,6 +32,9 @@ local CORE_PACKAGES = {
   "shell",      -- interactive shell
   "coreutils",  -- basic utilities (cat, ls, cp, mv, rm, mkdir)
   "login",      -- login/auth
+  "man",        -- manual pages
+  "ttybcd",     -- tty broadcast daemon
+  "termkernel", -- drop to clean CraftOS (root only)
 }
 
 -- ============================================================
@@ -369,6 +372,32 @@ local function download_and_extract(pkg_name, pkg_info)
     end
   end
 
+  -- Write DB entry (mirrors pine.lua write_db)
+  mkdir_p(INSTALL_ROOT .. "/var/lib/pine/db")
+  local file_paths = {}
+  for _, f in ipairs(pkg.files) do file_paths[#file_paths + 1] = f.path end
+  local SEP = ","
+  local db_lines = {
+    "name=" .. pkg_name,
+    "version=" .. (pkg.manifest.version or version),
+    "arch=" .. (pkg.manifest.arch or "any"),
+    "essential=" .. (pkg.manifest.essential or ""),
+    "maintainer=" .. (pkg.manifest.maintainer or ""),
+    "description=" .. (pkg.manifest.description or ""),
+    "license=" .. (pkg.manifest.license or ""),
+    "deps=" .. (pkg.manifest.deps or ""),
+    "provides=" .. (pkg.manifest.provides or ""),
+    "conffiles=" .. (pkg.manifest.conffiles or ""),
+    "installed_files=" .. table.concat(file_paths, SEP),
+    "installed_at=" .. tostring(os.time()),
+    "prerem=" .. (pkg.manifest.prerem or ""),
+    "postrem=" .. (pkg.manifest.postrem or ""),
+  }
+  local db_path = INSTALL_ROOT .. "/var/lib/pine/db/" .. pkg_name
+  if not write_file(db_path, table.concat(db_lines, "\n") .. "\n") then
+    warn("failed to write DB entry for " .. pkg_name)
+  end
+
   -- Run postinst hook if present
   if pkg.manifest.postinst and pkg.manifest.postinst ~= "" then
     msg("Running postinst hook...")
@@ -617,6 +646,16 @@ while true do
   sleep(10)
   local h = open("/var/log/syslog", "a")
   if h then write(h, "[syslog] heartbeat\n") close(h) end
+end
+]=],
+
+  ttybcd = [=[
+#!/usr/bin/env lua
+-- ttybcd: TTY broadcast daemon (mirrors terminal to /dev/peripherals/monitors/*)
+while true do
+  local pid = spawn("/usr/bin/ttybcd.lua")
+  if pid then waitpid(pid) end
+  sleep(1)
 end
 ]=],
 }

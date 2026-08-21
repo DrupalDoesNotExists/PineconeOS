@@ -26,7 +26,10 @@ local function parse_args(args)
             paths[#paths+1] = a
         end
     end
-    if #paths == 0 then paths[1] = "." end
+    if #paths == 0 then
+        local cwd = getcwd and getcwd() or "."
+        paths[1] = cwd
+    end
     return flags, paths
 end
 

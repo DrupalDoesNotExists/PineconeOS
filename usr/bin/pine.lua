@@ -318,17 +318,6 @@ local function list_installed()
     end
   end
   table.sort(pkgs)
-  if #pkgs == 0 then
-    -- fallback for fresh image: DB not yet seeded but base packages are already extracted via installer
-    -- consider core packages as installed if their repo entry exists
-    local ok, index = pcall(load_repo_index)
-    if ok and index then
-      for _, name in ipairs({"knuck","pine","shell","coreutils","login"}) do
-        if index[name] then pkgs[#pkgs+1]=name end
-      end
-      table.sort(pkgs)
-    end
-  end
   return pkgs
 end
 
@@ -531,18 +520,13 @@ local function fetch_cone_http(name, version)
   local filename = pkg.file or (name .. "-" .. pkg.version .. ".cone")
   local url = REPO_BASE .. "/" .. filename
 
-  if not http then return nil, "HTTP API not available" end
-
-  msg("fetching " .. filename .. " from repo...")
-  local ok, resp = pcall(http.get, url)
-  if not ok or not resp then
-    return nil, "failed to download " .. filename
+  msg("fetching " .. filename .. " from repo via AF_HTTP...")
+  local data, ferr = fetch_url_afhttp(url)
+  if not data then
+    return nil, "failed to download " .. filename .. ": " .. tostring(ferr)
   end
 
-  local data = resp.readAll()
-  resp.close()
-
-  if not data or #data == 0 then
+  if #data == 0 then
     return nil, "downloaded package is empty"
   end
 
@@ -965,20 +949,29 @@ end
 
 -- ---- update (fetch remote index) ----
 
--- Fetch remote PINEINDEX via HTTP and write to local REPO_INDEX.
+-- Fetch remote PINEINDEX via AF_HTTP socket (no raw http global, kernel provides external HTTP via AF_HTTP)
 -- Returns true on success, nil+err on failure.
+local function fetch_url_afhttp(url)
+  local fd, ferr = socket(AF_HTTP, SOCK_STREAM, 0)
+  if not fd then return nil, "socket: " .. tostring(ferr) end
+  local ok, cerr = connect(fd, url)
+  if not ok then close(fd); return nil, "connect: " .. tostring(cerr) end
+  local ok2, serr = send(fd, "")
+  if not ok2 then close(fd); return nil, "send: " .. tostring(serr) end
+  local data, rerr = recv(fd, 65536)
+  close(fd)
+  if not data then return nil, rerr or "recv failed" end
+  local body = data:match("\r\n\r\n(.*)")
+  if body then return body else return data end
+end
+
 local function fetch_repo_index()
-  if not http then
-    return nil, "HTTP API not available"
-  end
   local url = REPO_BASE .. "/PINEINDEX"
-  local ok, resp = pcall(http.get, url)
-  if not ok or not resp then
-    return nil, "failed to fetch PINEINDEX from " .. url
+  local data, err = fetch_url_afhttp(url)
+  if not data then
+    return nil, "failed to fetch PINEINDEX from " .. url .. ": " .. tostring(err)
   end
-  local data = resp.readAll()
-  resp.close()
-  if not data or #data == 0 then
+  if #data == 0 then
     return nil, "downloaded PINEINDEX is empty"
   end
   -- validate header
@@ -1026,6 +1019,11 @@ local function do_upgrade(target)
   else
     -- upgrade all installed packages
     local pkgs = list_installed()
+    if #pkgs == 0 then
+      msg("no packages installed; nothing to upgrade")
+      return
+    end
+    local upgraded = 0
     for _, name in ipairs(pkgs) do
       local db = read_db(name)
       if db and db.version then
@@ -1035,12 +1033,15 @@ local function do_upgrade(target)
           if ver_cmp(db.version, repo_pkg.version) < 0 then
             msg("upgrading " .. name .. " " .. db.version .. " -> " .. repo_pkg.version)
             do_install(name)
+            upgraded = upgraded + 1
           else
             msg(name .. " is up to date")
           end
         end
       end
     end
+    msg("upgrade complete: " .. upgraded .. " package(s) upgraded, "
+        .. (#pkgs - upgraded) .. " up to date")
   end
 end
 
@@ -1065,6 +1066,58 @@ end
 
 -- ---- usage ----
 
+-- Reconstruct the package DB from repo cones for packages already on disk.
+-- Use after an install that did not seed /var/lib/pine/db, or to recover a
+-- missing/corrupted DB. Downloads each repo cone, and if its files are present
+-- on the filesystem, writes a DB entry mirroring a native install.
+local function do_rebuild_db()
+  local index = load_repo_index()
+  if not index or not next(index) then
+    die("no repo index; run 'pine update' first")
+  end
+  local count = 0
+  for name, pkg in pairs(index) do
+    local path, ferr = fetch_cone_http(name, pkg.version)
+    if not path then
+      warn("rebuild-db: could not fetch " .. name .. ": " .. tostring(ferr))
+    else
+      local cone, perr = read_cone_file(path)
+      if not cone then
+        warn("rebuild-db: cannot parse " .. name .. ": " .. tostring(perr))
+      else
+        local first = cone.files[1]
+        if first and stat(first.path) then
+          local file_paths = {}
+          for _, f in ipairs(cone.files) do
+            file_paths[#file_paths + 1] = f.path
+          end
+          local db = {
+            name = name,
+            version = cone.manifest.version,
+            arch = cone.manifest.arch or "any",
+            essential = cone.manifest.essential or "",
+            maintainer = cone.manifest.maintainer or "",
+            description = cone.manifest.description or "",
+            license = cone.manifest.license or "",
+            deps = cone.manifest.deps or "",
+            provides = cone.manifest.provides or "",
+            conffiles = cone.manifest.conffiles or "",
+            installed_files = table.concat(file_paths, SEP),
+            installed_at = tostring(time()),
+            prerem = cone.manifest.prerem or "",
+            postrem = cone.manifest.postrem or "",
+          }
+          if write_db(name, db) then
+            count = count + 1
+            msg("rebuilt DB for " .. name .. " " .. cone.manifest.version)
+          end
+        end
+      end
+    end
+  end
+  msg("rebuild-db: wrote " .. count .. " package DB entries")
+end
+
 local function usage()
   write(1, "Usage: pine <command> [options]\n")
   write(1, "Commands:\n")
@@ -1078,6 +1131,7 @@ local function usage()
   write(1, "  update                   Update repo index\n")
   write(1, "  upgrade [name]           Upgrade package(s)\n")
   write(1, "  clean                    Delete cached .cone files (keeps PINEINDEX)\n")
+  write(1, "  rebuild-db               Reconstruct package DB from repo cones for installed packages\n")
   write(1, "Options:\n")
   write(1, "  --force                  Force operation\n")
   write(1, "  --no-hooks               Skip pre/post install/remove hooks\n")
@@ -1115,6 +1169,8 @@ local ok, res = pcall(function()
     do_upgrade(args[2])
   elseif cmd == "clean" then
     do_clean()
+  elseif cmd == "rebuild-db" then
+    do_rebuild_db()
   else
     usage()
   end
