@@ -103,8 +103,8 @@ version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
 desc:PineconeOS login and auth
-size:1562
-sha:774b08ee
+size:2131
+sha:a5edbc63
 file:login-1.0.0.cone
 ---
 pkg:man
