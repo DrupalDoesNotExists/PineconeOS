@@ -512,14 +512,13 @@ else
   log("no /etc/sv, starting with no services")
 end
 
--- spawn all services
+-- spawn all services (quiet: do not log to console so getty owns the terminal)
 for _, svc in ipairs(services) do
   local pid = spawn(svc.path)
   if pid then
     svc.pid = pid
-    log("started " .. svc.name .. " pid " .. pid)
   else
-    log("FAILED to start " .. svc.name)
+    print("[init] FAILED to start " .. svc.name)
   end
 end
 
@@ -533,17 +532,16 @@ while true do
       if s.pid == pid then svc = s break end
     end
     if svc then
-      log(svc.name .. " exited (" .. tostring(how) .. " " .. tostring(code) .. "), respawning")
+      -- respawn crashed service (no console output to avoid disrupting getty)
       sleep(BACKOFF)
       local np = spawn(svc.path)
       if np then
         svc.pid = np
-        log("restarted " .. svc.name .. " pid " .. np)
       else
-        log("FAILED to restart " .. svc.name)
+        print("[init] FAILED to restart " .. svc.name)
       end
     else
-      log("reaped unknown pid " .. pid)
+      -- unknown child reaped (no console output)
     end
   end
 end
@@ -577,10 +575,15 @@ end
   getty = [=[
 #!/usr/bin/env lua
 -- Getty: login prompt on console (auth via login)
+-- Clears boot noise, then loops: spawn login, wait, clear, repeat.
+clear()
+write(1, "PineconeOS (KNUCK)\n\n")
 while true do
   local pid = spawn("/usr/bin/login.lua")
   if pid then waitpid(pid) end
   sleep(1)
+  clear()
+  write(1, "PineconeOS (KNUCK)\n\n")
 end
 ]=],
 
