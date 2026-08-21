@@ -10,7 +10,8 @@ local function read_line(echo)
   local buf = ""
   while true do
     local ev = read(0, 1)
-    if type(ev) == "table" then
+    if not ev then sleep(0.05)
+    elseif type(ev) == "table" then
       if ev[1] == "char" then
         local ch = ev[2]
         if ch == "\n" or ch == "\r" then

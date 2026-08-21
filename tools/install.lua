@@ -583,6 +583,8 @@ if fd then
   dup2(fd, 1)
   dup2(fd, 2)
   if fd > 2 then close(fd) end
+  -- Switch physical display to tty2 so getty output is visible
+  ioctl(0, "VT_ACTIVATE", 2)
 end
 clear()
 write(1, "PineconeOS (KNUCK) tty2\n\n")
