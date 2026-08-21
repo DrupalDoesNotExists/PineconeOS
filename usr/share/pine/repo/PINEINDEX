@@ -206,3 +206,12 @@ size:135267
 sha:bfed81db
 file:knuck-1.0.2.cone
 ---
+pkg:knuck
+version:1.0.3
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2)
+size:135394
+sha:b956571b
+file:knuck-1.0.3.cone
+---

@@ -574,8 +574,16 @@ end
 
   getty = [=[
 #!/usr/bin/env lua
--- Getty: allocates tty2 for login as real Linux (init detached, getty creates tty)
-settty(2)
+-- Getty: captures already-created /dev/tty2 (kernel creates tty1..6 at boot)
+-- Real Linux: open RDWR + TIOCSCTTY to claim controlling tty, then dup2 stdio.
+local fd = open("/dev/tty2", 2)  -- O_RDWR=2
+if fd then
+  ioctl(fd, "TIOCSCTTY", 0)  -- make tty2 our controlling tty
+  dup2(fd, 0)
+  dup2(fd, 1)
+  dup2(fd, 2)
+  if fd > 2 then close(fd) end
+end
 clear()
 write(1, "PineconeOS (KNUCK) tty2\n\n")
 while true do
