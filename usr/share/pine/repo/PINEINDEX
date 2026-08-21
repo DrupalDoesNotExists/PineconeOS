@@ -58,8 +58,8 @@ version:0.1.1
 arch:any
 deps:
 desc:KNUCK microkernel (Lua 5.2)
-size:112594
-sha:ed7b7c2b
+size:112536
+sha:db306b48
 file:knuck-0.1.1.cone
 ---
 pkg:knuck
@@ -67,8 +67,8 @@ version:1.0.5
 arch:any
 deps:
 desc:KNUCK microkernel (Lua 5.2) — fix TIOCSCTTY tty bind, sched starvation guard
-size:110768
-sha:03302105
+size:112568
+sha:3aabb555
 file:knuck-1.0.5.cone
 ---
 pkg:knuck-icmp

@@ -5,14 +5,8 @@ arch=any
 maintainer=pine@pineconeos.dev
 description=KNUCK microkernel (includes all kernel modules)
 license=MIT
-essential=yes
+essential=no
 deps=
-provides=
-conffiles=
-preinst=
-postinst=
-prerem=
-postrem=
 files=15
 ---END MANIFEST---
 ---FILE /lib/knuck/boot.lua 0755 4304 4a052858 src---

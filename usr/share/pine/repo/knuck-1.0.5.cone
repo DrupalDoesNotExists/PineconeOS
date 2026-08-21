@@ -5,11 +5,213 @@ arch=any
 maintainer=pine@pineconeos.dev
 description=KNUCK microkernel (Lua 5.2) — fix TIOCSCTTY tty bind, sched starvation guard
 license=MIT
-essential=no
+essential=yes
 deps=
-files=14
+files=15
 ---END MANIFEST---
----FILE /lib/knuck/kernel/auth.lua 0755 1819 5c3ca9c2 src---
+---FILE /lib/knuck/boot.lua 0755 4304 4a052858 src---
+
+
+local K = {
+env = _G,
+modules = {},
+selfcheck = {},
+}
+
+K.bit = {
+band = function(a, b)
+local r, bit = 0, 1
+while a > 0 and b > 0 do
+if a % 2 == 1 and b % 2 == 1 then r = r + bit end
+a = math.floor(a / 2); b = math.floor(b / 2); bit = bit * 2
+end
+return r
+end,
+bor = function(a, b)
+local r, bit = 0, 1
+while a > 0 or b > 0 do
+if a % 2 == 1 or b % 2 == 1 then r = r + bit end
+a = math.floor(a / 2); b = math.floor(b / 2); bit = bit * 2
+end
+return r
+end,
+bnot = function(a)
+return 0xFFFFFFFF - a
+end,
+}
+
+K.log_ring = {}   K.log_ring_max = 200
+function K.log(msg)
+local line = "[" .. tostring(os.time()) .. "] " .. tostring(msg)
+table.insert(K.log_ring, line)
+if #K.log_ring > K.log_ring_max then
+table.remove(K.log_ring, 1)
+end
+term.setTextColor(colors.yellow)
+K.term_write("[k] " .. tostring(msg) .. "\n")
+term.setTextColor(colors.white)
+end
+
+function K.term_write(s)
+local t = term
+local text = tostring(s or "")
+if not t or not t.getSize or not t.getCursorPos or not t.setCursorPos then
+if t and t.write then t.write(text) end
+return
+end
+local w, h = t.getSize()
+if not w or w < 1 or not h or h < 1 then
+if t.write then t.write(text) end
+return
+end
+local pos = 1
+while pos <= #text do
+local nl = text:find("\n", pos, true)
+local seg, has_nl
+if nl then
+seg = text:sub(pos, nl - 1)
+has_nl = true
+pos = nl + 1
+else
+seg = text:sub(pos)
+has_nl = false
+pos = #text + 1
+end
+local cx, cy = t.getCursorPos()
+local col = cx or 1
+if seg:find("\b", 1, true) then
+for i = 1, #seg do
+local ch = seg:sub(i, i)
+if ch == "\b" then
+col = col - 1
+if col < 1 then col = 1 end
+t.setCursorPos(col, cy)
+else
+t.write(ch)
+col = col + 1
+if col > w then
+cy = cy + 1
+if cy > h then
+t.scroll(1)
+cy = h
+end
+t.setCursorPos(1, cy)
+col = 1
+end
+end
+end
+else
+local i = 1
+while i <= #seg do
+local avail = w - col + 1
+if avail < 1 then avail = 1 end
+local chunk = seg:sub(i, i + avail - 1)
+t.write(chunk)
+i = i + #chunk
+col = col + #chunk
+if col > w then
+cy = cy + 1
+if cy > h then
+t.scroll(1)
+cy = h
+end
+t.setCursorPos(1, cy)
+col = 1
+end
+end
+end
+if has_nl then
+cy = cy + 1
+if cy > h then
+t.scroll(1)
+cy = h
+end
+t.setCursorPos(1, cy)
+end
+end
+end
+
+K.loader = loadfile("/lib/knuck/kernel/loader.lua", "t", K.env)()
+
+local diag = K.loader.load("/lib/knuck/kernel/diag.lua", K)
+K.diag = diag
+K.selfcheck = diag.run(K)
+
+K.sched = K.loader.load("/lib/knuck/kernel/sched.lua", K)
+K.syscall = K.loader.load("/lib/knuck/kernel/syscall.lua", K)
+K.proc = K.loader.load("/lib/knuck/kernel/proc.lua", K)
+K.fs = K.loader.load("/lib/knuck/kernel/fs.lua", K)
+K.vfs = K.loader.load("/lib/knuck/kernel/vfs.lua", K)
+K.ipc = K.loader.load("/lib/knuck/kernel/ipc.lua", K)
+K.net = K.loader.load("/lib/knuck/kernel/net.lua", K)
+K.net_transport = K.loader.load("/lib/knuck/kernel/net_transport.lua", K)
+K.auth = K.loader.load("/lib/knuck/kernel/auth.lua", K)
+K.tty = K.loader.load("/lib/knuck/kernel/tty.lua", K)
+
+K.syscall.init(K)
+K.proc.init(K)
+K.vfs.init(K)
+K.sched.init(K)
+
+K.vfs.mount_root()
+
+local ndrives = K.vfs.mount_drives()
+if ndrives > 0 then
+print("  mounted " .. ndrives .. " disk drive(s)")
+end
+
+local init_path = "/sbin/init.lua"
+local ok_conf, conf = pcall(K.fs.read_all, "/boot/knuck.conf")
+if ok_conf and conf then
+for line in (conf .. "\n"):gmatch("([^\n]*)\n") do
+line = line:gsub("^%s+", ""):gsub("%s+$", "")
+if line ~= "" and not line:match("^#") then
+local cmd, arg = line:match("^(%S+)%s+(.+)$")
+if cmd == "module" and arg then
+local okm, mod = pcall(K.loader.load, arg, K)
+if okm then
+local name = arg:match("([^/]+)%.lua$") or arg
+K.modules[name] = mod
+K.module_paths = K.module_paths or {}
+K.module_paths[name] = arg
+end
+elseif cmd == "init" and arg then
+init_path = arg
+end
+end
+end
+end
+
+K.net.init()
+K.net_transport.init()
+
+K.auth.init(K)
+
+K.tty.init(K)
+
+term.clear()
+term.setCursorPos(1, 1)
+term.setTextColor(colors.green)
+print("KNUCK " .. (K.selfcheck.craftos or "?") .. " boot")
+term.setTextColor(colors.white)
+if K.selfcheck.preempt then
+print("  scheduler: preemptive")
+else
+print("  scheduler: cooperative (no yield-from-hook)")
+end
+if not K.selfcheck.collectgarbage then
+print("  memory: soft mode (no collectgarbage)")
+end
+
+local init_pid = K.proc.spawn("/sbin/init.lua", 0, 0, 0, {})
+if init_pid then
+K.proc.set_init(init_pid)
+print("  init pid " .. init_pid)
+else
+print("  ERROR: failed to spawn init")
+end
+
+K.sched.start()---FILE /lib/knuck/kernel/auth.lua 0755 1819 5c3ca9c2 src---
 
 
 return function(K)
@@ -320,7 +522,7 @@ return M.write_all(dst, data)
 end
 
 return M
-end---FILE /lib/knuck/kernel/ipc.lua 0755 17487 5c43cc68 src---
+end---FILE /lib/knuck/kernel/ipc.lua 0755 16747 c1d73656 src---
 
 
 return function(K)
@@ -491,44 +693,22 @@ end
 end
 end
 
-local function normalize_domain(domain)
-if domain == "icmp" then
-if K.log then K.log("ipc: AF_ICMP deprecated, use AF_MODEM4 + IPPROTO_ICMP") end
-return "modem4", true
-elseif domain == "modem" then
-return "modem4", false
-elseif domain == "inet" then
-return "modem4", false
-elseif domain == "inet6" then
-return "modem6", false
-end
-return domain, false
-end
-
-local function is_icmp_socket(domain, proto)
-return (domain == "modem4" or domain == "modem6")
-and (proto == 1 or proto == "icmp")
-end
-
 function M.socket(domain, socktype, proto)
-local norm_domain
-norm_domain, _ = normalize_domain(domain or "unix")
-
 local s = {
 id = next_sock,
-domain = norm_domain,
-domain_input = domain,            socktype = socktype or "stream",
+domain = domain or "unix",
+socktype = socktype or "stream",
 proto = proto or 0,
 state = "unbound",              path = nil,
 backlog = {},
 conn = nil,                     queue = {},                     peer = nil,
 closed = false,
 port = nil,                     broadcast = false,              url = nil,                      response = nil,                       tcp_conn = nil,                 tcp_listener = false,                 http_request = nil,             http_response = nil,            http_error = nil,               http_method = "GET",            http_headers = {},              http_body = nil,                      icmp_sock = nil,                dest_ip = nil,                }
-if is_icmp_socket(norm_domain, proto) then
+if domain == "icmp" then
 if not K.net_icmp then
 error("ICMP module not loaded")
 end
-s.icmp_sock = K.net_icmp.socket_create(norm_domain, socktype, proto)
+s.icmp_sock = K.net_icmp.socket_create(domain, socktype, proto)
 s.icmp_sock.id = s.id      end
 next_sock = next_sock + 1
 return { type = "socket", sock = s }
@@ -536,21 +716,7 @@ end
 
 function M.socket_bind(proc, fd, path)
 local s = fd.sock
-if s.domain == "modem4" or s.domain == "modem6" then
-if s.icmp_sock then
-if not K.net_icmp then return nil, "ICMP not available" end
-return K.net_icmp.socket_bind(proc, s.icmp_sock, path)
-elseif s.socktype == "stream" then
-if proc.uid ~= 0 then return nil, "permission denied" end
-local port = tonumber(path)
-if not port then return nil, "invalid port" end
-local ok, err = K.net_transport.tcp_listen(port)
-if not ok then return nil, err end
-s.state = "listening"
-s.port = port
-s.tcp_listener = true
-return true
-else
+if s.domain == "modem" then
 if proc.uid ~= 0 then return nil, "permission denied" end
 local port = tonumber(path)
 if not port then return nil, "invalid port" end
@@ -560,6 +726,20 @@ s.state = "bound"
 s.port = port
 return true
 end
+if s.domain == "modem" and s.socktype == "stream" then
+if proc.uid ~= 0 then return nil, "permission denied" end
+local port = tonumber(path)
+if not port then return nil, "invalid port" end
+local ok, err = K.net_transport.tcp_listen(port)
+if not ok then return nil, err end
+s.state = "listening"
+s.port = port
+s.tcp_listener = true
+return true
+end
+if s.domain == "icmp" then
+if not K.net_icmp then return nil, "ICMP not available" end
+return K.net_icmp.socket_bind(proc, s.icmp_sock, path)
 end
 if s.domain ~= "unix" then return nil, "invalid argument" end
 if unix_sockets[path] then return nil, "address in use" end
@@ -584,7 +764,7 @@ if s.tcp_listener then
 local on_conn_fn = function(conn)
 local cs = {
 id = next_sock,
-domain = s.domain,
+domain = "modem",
 socktype = "stream",
 state = "connected",
 tcp_conn = conn,
@@ -626,7 +806,7 @@ s.url = path
 s.peer = path
 return true
 end
-if (s.domain == "modem4" or s.domain == "modem6") and s.socktype == "stream" then
+if s.domain == "modem" and s.socktype == "stream" then
 local ip_str, port_str = path:match("^(%d+%.%d+%.%d+%.%d+):(%d+)$")
 if not ip_str then return nil, "invalid address" end
 local dest_ip = K.net.str_to_ip(ip_str)
@@ -707,12 +887,12 @@ http_pending[req] = { proc = proc, socket = s }
 K.sched.wait(proc, "http_response", proc.pid)
 return true
 end
-if (s.domain == "modem4" or s.domain == "modem6") and s.tcp_conn then
+if s.domain == "modem" and s.tcp_conn then
 if s.closed then return nil, "closed" end
 if s.tcp_conn.state ~= "ESTABLISHED" then return nil, "not connected" end
 return K.net_transport.tcp_send(proc, s.tcp_conn, data)
 end
-if s.icmp_sock then
+if s.domain == "icmp" then
 if not K.net_icmp then return nil, "ICMP not available" end
 return K.net_icmp.socket_send(proc, s.icmp_sock, data)
 end
@@ -749,11 +929,11 @@ return nil, e
 end
 return nil
 end
-if (s.domain == "modem4" or s.domain == "modem6") and s.tcp_conn then
+if s.domain == "modem" and s.tcp_conn then
 if s.closed then return nil end
 return K.net_transport.tcp_recv(proc, s.tcp_conn)
 end
-if s.icmp_sock then
+if s.domain == "icmp" then
 if not K.net_icmp then return nil end
 return K.net_icmp.socket_recv(proc, s.icmp_sock, n, flags)
 end
@@ -791,7 +971,7 @@ end
 function M.socket_sendto(proc, fd, data, dest_ip, dest_port)
 local s = fd.sock
 if s.closed then return nil, "closed" end
-if s.icmp_sock then
+if s.domain == "icmp" then
 if not K.net_icmp then return nil, "ICMP not available" end
 local ip4 = K.net.str_to_ip(dest_ip)
 if not ip4 then return nil, "invalid address" end
@@ -799,7 +979,7 @@ s.icmp_sock.dest_ip = ip4
 s.icmp_sock.state = "bound"
 return K.net_icmp.socket_sendto(proc, s.icmp_sock, data, ip4, dest_port)
 end
-if s.domain ~= "modem4" and s.domain ~= "modem6" then return nil, "invalid argument" end
+if s.domain ~= "modem" then return nil, "invalid argument" end
 if s.state ~= "bound" then return nil, "not bound" end
 if dest_ip == string.char(255, 255, 255, 255) and not s.broadcast then
 return nil, "permission denied"      end
@@ -809,11 +989,11 @@ end
 function M.socket_recvfrom(proc, fd)
 local s = fd.sock
 if s.closed then return nil end
-if s.icmp_sock then
+if s.domain == "icmp" then
 if not K.net_icmp then return nil end
 return K.net_icmp.socket_recv(proc, s.icmp_sock, nil, nil)
 end
-if s.domain ~= "modem4" and s.domain ~= "modem6" then return nil, "invalid argument" end
+if s.domain ~= "modem" then return nil, "invalid argument" end
 if s.state ~= "bound" then return nil, "not bound" end
 return K.net_transport.udp_recv(proc, s.port)
 end
@@ -863,7 +1043,7 @@ s.closed = true
 if s.tcp_conn and not s.tcp_conn.closed then
 K.net_transport.tcp_close(s.tcp_conn)
 end
-if s.icmp_sock and K.net_icmp then
+if s.domain == "icmp" and s.icmp_sock and K.net_icmp then
 K.net_icmp.socket_close(s.icmp_sock)
 end
 if s.path and unix_sockets[s.path] == s then
@@ -881,7 +1061,7 @@ end
 
 function M.socket_readable(s)
 if s.closed then return true end
-if s.domain == "modem4" or s.domain == "modem6" then
+if s.domain == "modem" then
 if s.tcp_conn then
 return #s.tcp_conn.recv_queue > 0
 or s.tcp_conn.state == "CLOSE_WAIT"
@@ -892,7 +1072,7 @@ end
 if s.domain == "http" then
 return s.http_response ~= nil or s.http_error ~= nil
 end
-if s.icmp_sock then
+if s.domain == "icmp" then
 if K.net_icmp then return K.net_icmp.socket_readable(s.icmp_sock) end
 return false
 end
@@ -907,7 +1087,7 @@ end
 
 function M.socket_writable(s)
 if s.closed then return false end
-if s.domain == "modem4" or s.domain == "modem6" then
+if s.domain == "modem" then
 if s.tcp_conn then
 return s.tcp_conn.state == "ESTABLISHED" and #s.tcp_conn.send_queue == 0
 end
@@ -991,7 +1171,7 @@ function M.unload(path)
 loaded[path] = nil
 end
 
-return M---FILE /lib/knuck/kernel/net.lua 0755 11714 0cf8ea3a src---
+return M---FILE /lib/knuck/kernel/net.lua 0755 11349 7ff3d6cd src---
 
 
 return function(K)
@@ -1030,22 +1210,12 @@ local function bshl(a, n) return a * (2 ^ n) end
 local function bshr(a, n) return math.floor(a / (2 ^ n)) end
 M.bxor = bxor
 
-M.AF_UNIX   = 1       M.AF_MODEM4 = 2       M.AF_INET   = 2       M.AF_ICMP   = 2       M.AF_HTTP   = 3       M.AF_MODEM6 = 10      M.AF_INET6  = 10
-M.SOCK_STREAM = 1
-M.SOCK_DGRAM  = 2
-M.SOCK_RAW    = 3
-
-M.IPPROTO_IP   = 0
-M.IPPROTO_ICMP = 1
-M.IPPROTO_TCP  = 6
-M.IPPROTO_UDP  = 17
-
 M.enabled = false
 M.modem = nil
 M.side = nil
 M.mac = nil
 M.channel = 0
-M.family = M.AF_MODEM4                 M.ip = string.char(0, 0, 0, 0)            M.netmask = string.char(255, 255, 255, 0)
+M.ip = string.char(0, 0, 0, 0)            M.netmask = string.char(255, 255, 255, 0)
 M.gateway = string.char(0, 0, 0, 0)
 M.arp_cache = {}                          M.arp_pending = {}                        M.protos = {}                             M.frag_buf = {}                           M.timers = {}                             M.rx_queue = {}                           M.ip_id = 1
 M.routes = {}
@@ -1414,9 +1584,9 @@ modem.open(M.channel)
 M.enabled = true
 K.log("net: enabled on " .. tostring(M.side) .. " mac " .. M.mac_to_str(M.mac))
 if M.gateway ~= string.char(0, 0, 0, 0) then
-M.routes[1] = { dest = string.char(0, 0, 0, 0), mask = string.char(0, 0, 0, 0), gw = M.gateway, metric = 0, family = M.AF_MODEM4 }
+M.routes[1] = { dest = string.char(0, 0, 0, 0), mask = string.char(0, 0, 0, 0), gw = M.gateway, metric = 0 }
 end
-M.routes[#M.routes + 1] = { dest = ip_band(M.ip, M.netmask), mask = M.netmask, gw = string.char(0, 0, 0, 0), metric = 0, family = M.AF_MODEM4 }
+M.routes[#M.routes + 1] = { dest = ip_band(M.ip, M.netmask), mask = M.netmask, gw = string.char(0, 0, 0, 0), metric = 0 }
 K.vfs.register_device("modem0", {
 mode = 0x180,
 read = function(n)
@@ -1431,7 +1601,7 @@ end,
 end
 
 return M
-end---FILE /lib/knuck/kernel/net_icmp.lua 0755 4555 0fe66fd9 src---
+end---FILE /lib/knuck/kernel/net_icmp.lua 0755 4460 e718ae0b src---
 
 
 return function(K)
@@ -1485,7 +1655,7 @@ stats.received = stats.received + 1
 if typ == ICMP_ECHO_REQUEST then
 stats.echo_requests = stats.echo_requests + 1
 local reply_payload = data:sub(9)        local reply_rest = data:sub(5, 8)        local reply = build_icmp(ICMP_ECHO_REPLY, 0, reply_rest, reply_payload)
-net.send_ip(src_ip, net.IPPROTO_ICMP, reply)
+net.send_ip(src_ip, 1, reply)
 stats.sent = stats.sent + 1
 elseif typ == ICMP_ECHO_REPLY then
 stats.echo_replies = stats.echo_replies + 1
@@ -1558,7 +1728,7 @@ local packet = data:sub(1, 2)
 .. string.char(math.floor(cs / 256), cs % 256)
 .. data:sub(5)
 
-local ok, err = net.send_ip(dest_ip, net.IPPROTO_ICMP, packet)
+local ok, err = net.send_ip(dest_ip, 1, packet)
 if ok then
 stats.sent = stats.sent + 1
 return #data
@@ -1578,7 +1748,7 @@ local packet = data:sub(1, 2)
 .. string.char(math.floor(cs / 256), cs % 256)
 .. data:sub(5)
 
-local ok, err = net.send_ip(dest_ip, net.IPPROTO_ICMP, packet)
+local ok, err = net.send_ip(dest_ip, 1, packet)
 if ok then
 stats.sent = stats.sent + 1
 return #data
@@ -1636,13 +1806,13 @@ end
 
 function M.init()
 net = K.net
-net.register_proto(net.IPPROTO_ICMP, M.handle)
-K.log("net_icmp: loaded, ICMP protocol handler registered (proto=" .. net.IPPROTO_ICMP .. ")")
+net.register_proto(1, M.handle)
+K.log("net_icmp: loaded, ICMP protocol handler registered")
 end
 
 return M
 end
----FILE /lib/knuck/kernel/net_transport.lua 0755 12640 2593613e src---
+---FILE /lib/knuck/kernel/net_transport.lua 0755 12566 9ee91775 src---
 
 
 return function(K)
@@ -1675,7 +1845,7 @@ local len = 8 + #data
 local header = string.char(
 math.floor(src_port / 256), src_port % 256,
 math.floor(dest_port / 256), dest_port % 256,
-math.floor(len / 256), len % 256, 0, 0)      return K.net.send_ip(dest_ip, K.net.IPPROTO_UDP, header .. data)
+math.floor(len / 256), len % 256, 0, 0)      return K.net.send_ip(dest_ip, 17, header .. data)
 end
 
 function M.udp_recv(proc, port)
@@ -1749,7 +1919,7 @@ end
 
 local function tcp_checksum(src_ip, dest_ip, payload)
 local len = #payload
-local pseudo = src_ip .. dest_ip .. string.char(0, K.net.IPPROTO_TCP,
+local pseudo = src_ip .. dest_ip .. string.char(0, 6,
 math.floor(len / 256), len % 256)
 local seg = pseudo .. payload
 local sum = 0
@@ -1782,7 +1952,7 @@ end
 
 local function send_segment(conn, flags, seq, ack, data)
 local seg = build_tcp(conn, flags, seq, ack, data)
-K.net.send_ip(conn.remote_ip, K.net.IPPROTO_TCP, seg)
+K.net.send_ip(conn.remote_ip, 6, seg)
 end
 
 local function schedule_retransmit(conn)
@@ -2094,12 +2264,12 @@ end
 
 function M.init()
 net = K.net
-net.register_proto(net.IPPROTO_TCP, M.tcp_handle)
-net.register_proto(net.IPPROTO_UDP, M.udp_handle)
+net.register_proto(6, M.tcp_handle)
+net.register_proto(17, M.udp_handle)
 end
 
 return M
-end---FILE /lib/knuck/kernel/proc.lua 0755 6903 26597334 src---
+end---FILE /lib/knuck/kernel/proc.lua 0755 6575 060e8b50 src---
 
 
 return function(K)
@@ -2156,15 +2326,6 @@ env.signals = {
 HUP = 1, INT = 2, QUIT = 3, KILL = 9, USR1 = 10, USR2 = 12,
 PIPE = 13, ALRM = 14, TERM = 15, CHLD = 17, CONT = 18, STOP = 19,
 }
-env.AF_UNIX   = 1
-env.AF_MODEM4 = 2         env.AF_INET   = 2         env.AF_ICMP   = 2         env.AF_HTTP   = 3
-env.AF_MODEM6 = 10        env.AF_INET6  = 10        env.SOCK_STREAM = 1
-env.SOCK_DGRAM  = 2
-env.SOCK_RAW    = 3
-env.IPPROTO_IP   = 0
-env.IPPROTO_ICMP = 1
-env.IPPROTO_TCP  = 6
-env.IPPROTO_UDP  = 17
 if system then
 env.load = load
 if _G.loadstring then env.loadstring = _G.loadstring end
@@ -2217,7 +2378,7 @@ priority = 0,
 sched_policy = "other",        cwd = "/",
 root = "/",
 umask = 0x12,        state = "ready",
-tty = (tty == nil and 1 or tty),
+tty = tty or 1,
 console_mode = "cooked",        env = env,
 environ = {},        fds = { [0] = { type = "console", mode = "r" }, [1] = { type = "console", mode = "w" }, [2] = { type = "console", mode = "w" } },
 children = {},
@@ -2395,7 +2556,7 @@ return out
 end
 
 return M
-end---FILE /lib/knuck/kernel/sched.lua 0755 4309 945c1792 src---
+end---FILE /lib/knuck/kernel/sched.lua 0755 4089 6efd3a85 src---
 
 
 return function(K)
@@ -2518,20 +2679,11 @@ end
 
 function M.start()
 running = true
-local runs_since_idle = 0
 while true do
 local proc = M.dequeue()
 if proc then
 run(proc)
-runs_since_idle = runs_since_idle + 1
-if runs_since_idle >= 256 then
-runs_since_idle = 0
-K.env.os.startTimer(0)
-local ev = { K.env.os.pullEvent() }
-K.events.dispatch(ev)
-end
 else
-runs_since_idle = 0
 local ev = { K.env.os.pullEvent() }
 K.events.dispatch(ev)
 end
@@ -2584,7 +2736,7 @@ end,
 }
 
 return M
-end---FILE /lib/knuck/kernel/syscall.lua 0755 19344 10a92198 src---
+end---FILE /lib/knuck/kernel/syscall.lua 0755 18848 fcb4bdad src---
 
 
 return function(K)
@@ -3260,20 +3412,10 @@ return nil
 end)
 
 M.register("ioctl", function(proc, fdnum, request, arg)
-if request == "VT_ACTIVATE" or request == "tty_switch" then
+if request == "tty_switch" then
 return K.tty.switch(arg)
-elseif request == "TCSETS" or request == "console_mode" then
+elseif request == "console_mode" then
 proc.console_mode = (arg == "raw") and "raw" or "cooked"
-return true
-elseif request == "TIOCSCTTY" then
-local fd = proc.fds[fdnum]
-if not fd then return nil, "bad fd" end
-if proc.uid ~= 0 then return nil, "permission denied" end
-local id = (type(arg) == "number" and arg > 0) and arg or nil
-if not id and fd.path then id = tonumber(fd.path:match("tty(%d+)")) end
-if not id and fd.tty_id then id = fd.tty_id end
-if not id or id < 1 or id > K.tty.count() then return nil, "invalid tty" end
-proc.tty = id
 return true
 end
 return nil
@@ -3312,7 +3454,7 @@ return true
 end)
 
 return M
-end---FILE /lib/knuck/kernel/tty.lua 0755 1981 80f93224 src---
+end---FILE /lib/knuck/kernel/tty.lua 0755 1784 c0b787a5 src---
 
 
 return function(K)
@@ -3332,10 +3474,8 @@ function M.count() return N end
 function M.active_id() return active end
 
 function M.write(proc, data)
-local id = (proc and proc.tty)
-if not id or id == 0 then return #(tostring(data or "")) end
+local id = (proc and proc.tty) or 1
 local t = ttys[id]
-if not t then return #(tostring(data or "")) end
 local s = tostring(data or "")
 t.buffer = t.buffer .. s
 if id == active then
@@ -3345,9 +3485,7 @@ return #s
 end
 
 function M.read(proc, n)
-local id = (proc and proc.tty)
-if not id or id == 0 then return nil, "no tty" end
-if not ttys[id] then return nil, "no tty" end
+local id = (proc and proc.tty) or 1
 if proc and proc.console_mode == "raw" then
 K.sched.wait(proc, "tty_input", id)
 return proc.pending_result
@@ -3411,7 +3549,7 @@ end,
 end
 
 return M
-end---FILE /lib/knuck/kernel/vfs.lua 0755 23799 5a10e039 src---
+end---FILE /lib/knuck/kernel/vfs.lua 0755 23755 6066fc73 src---
 
 
 return function(K)
@@ -3432,7 +3570,7 @@ M.register_device("devctl", {
 mode = 0x1B6,
 write = function(data)
 local s = tostring(data or "")
-local id = s:match("VT_ACTIVATE%s+(%d+)") or s:match("tty_switch%s+(%d+)")
+local id = s:match("tty_switch%s+(%d+)")
 if id and K.tty then
 return K.tty.switch(tonumber(id)) and #s or 0
 end
@@ -3975,7 +4113,7 @@ return { type = "device", device = ino.device, driver = make_periph_driver(side)
 end
 local drv = devices[ino.device]
 if not drv then return nil, "no such device" end
-return { type = "device", device = ino.device, driver = drv, mode = flags or "r", path = p }
+return { type = "device", device = ino.device, driver = drv, mode = flags or "r" }
 end
 
 if ino.type == "fifo" then
