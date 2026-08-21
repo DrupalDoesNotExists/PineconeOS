@@ -3,7 +3,7 @@ name=man
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=man (1.0.0)
+description=Manual page reader for PineconeOS syscalls (man <name>)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,95 +15,105 @@ prerem=
 postrem=
 files=1
 ---END MANIFEST---
----FILE /usr/bin/man.lua 0755 1828 16c6c29b src---
+---FILE /usr/bin/man.lua 0755 2664 8f1a7be3 src---
+-- man: display man pages for PineconeOS syscalls
+-- Usage: man <page>
+--        man -l (list all available pages)
+-- Reads /usr/share/man/man2/<name>.2 and prints with simple paging.
 
 local function read_file(path)
-local fd = open(path, "r")
-if not fd then return nil end
-local chunks = {}
-while true do
-local data = read(fd, 4096)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-return table.concat(chunks)
+    local fd = open(path, "r")
+    if not fd then return nil end
+    local chunks = {}
+    while true do
+        local data = read(fd, 4096)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    return table.concat(chunks)
 end
 
 local function list_pages()
-local dir = "/usr/share/man/man2"
-local fd = readdir(dir)
-if not fd or #fd == 0 then
-print("man: no manual pages found in " .. dir)
-return
-end
-local pages = {}
-for _, entry in ipairs(fd) do
-if entry.name and entry.name:match("%.2$") then
-pages[#pages+1] = entry.name:gsub("%.2$", "")
-end
-end
-table.sort(pages)
-print("PineconeOS man pages (section 2):")
-print("")
-for _, name in ipairs(pages) do
-print("  " .. name .. "(2)")
-end
-print("")
-print(#pages .. " pages available. Use: man <name>")
+    local dir = "/usr/share/man/man2"
+    local fd = readdir(dir)
+    if not fd or #fd == 0 then
+        print("man: no manual pages found in " .. dir)
+        return
+    end
+    -- Collect .2 files and strip extension
+    local pages = {}
+    for _, entry in ipairs(fd) do
+        if entry.name and entry.name:match("%.2$") then
+            pages[#pages+1] = entry.name:gsub("%.2$", "")
+        end
+    end
+    table.sort(pages)
+    print("PineconeOS man pages (section 2):")
+    print("")
+    for _, name in ipairs(pages) do
+        print("  " .. name .. "(2)")
+    end
+    print("")
+    print(#pages .. " pages available. Use: man <name>")
 end
 
 local function simple_pager(text)
-local lines = {}
-for line in text:gmatch("([^\n]*)\n?") do
-lines[#lines+1] = line
-end
-local PAGE = 23
-local i = 1
-while i <= #lines do
-local stop = math.min(i + PAGE - 1, #lines)
-for j = i, stop do
-write(1, lines[j] .. "\n")
-end
-i = stop + 1
-if i <= #lines then
-write(1, "--More-- (press Enter, q to quit) ")
-local input = read(0, 256)
-if input and input:match("^q") then
-return
-end
-end
-end
+    -- Simple line-by-line pager: show text, wait for Enter to advance,
+    -- 'q' to quit. 23 lines per page (leave room for prompt).
+    local lines = {}
+    for line in text:gmatch("([^\n]*)\n?") do
+        lines[#lines+1] = line
+    end
+    local PAGE = 23
+    local i = 1
+    while i <= #lines do
+        local stop = math.min(i + PAGE - 1, #lines)
+        for j = i, stop do
+            write(1, lines[j] .. "\n")
+        end
+        i = stop + 1
+        if i <= #lines then
+            write(1, "--More-- (press Enter, q to quit) ")
+            local input = read(0, 256)
+            if input and input:match("^q") then
+                return
+            end
+        end
+    end
 end
 
+-- Main
 local args = {}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
 if #args < 1 then
-print("usage: man <page>")
-print("       man -l    (list available pages)")
-exit(1)
+    print("usage: man <page>")
+    print("       man -l    (list available pages)")
+    exit(1)
 end
 
 local page = args[1]
 
 if page == "-l" or page == "--list" then
-list_pages()
-exit(0)
+    list_pages()
+    exit(0)
 end
 
+-- Try the page name as-is first, then append section
 local path = "/usr/share/man/man2/" .. page .. ".2"
 local content = read_file(path)
 
 if not content then
-path = "/usr/share/man/man2/" .. page
-content = read_file(path)
+    -- Try without .2 in case user passed "name.2"
+    path = "/usr/share/man/man2/" .. page
+    content = read_file(path)
 end
 
 if not content or content == "" then
-print("No manual entry for " .. page)
-print("Use 'man -l' to list available pages.")
-exit(1)
+    print("No manual entry for " .. page)
+    print("Use 'man -l' to list available pages.")
+    exit(1)
 end
 
 simple_pager(content)

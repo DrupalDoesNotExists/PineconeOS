@@ -3,7 +3,7 @@ name=authutils
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=authutils (1.0.0)
+description=User management utilities (adduser, deluser, su)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,13 +15,18 @@ prerem=
 postrem=
 files=3
 ---END MANIFEST---
----FILE /usr/bin/adduser.lua 0755 1838 35e47d48 src---
+---FILE /usr/bin/adduser.lua 0755 2587 f7c56edf src---
+-- adduser: create a new user account
+-- Usage: adduser <username> [uid] [gid]
+-- Reads/writes /etc/passwd (name:pass:uid:gid:gecos:home:shell)
+-- Requires root (uid 0).
 
 local function usage()
-print("usage: adduser <username> [uid] [gid]")
-exit(1)
+    print("usage: adduser <username> [uid] [gid]")
+    exit(1)
 end
 
+-- Parse args
 local args = {}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
@@ -31,81 +36,101 @@ local username = args[1]
 local uid = tonumber(args[2])
 local gid = tonumber(args[3])
 
+-- Require root
 local myuid = getuid()
 if myuid ~= 0 then
-print("adduser: must be root")
-exit(1)
+    print("adduser: must be root")
+    exit(1)
 end
 
+-- Read /etc/passwd
 local PASSWD = "/etc/passwd"
 local fd = open(PASSWD, 0)
 if not fd then
-print("adduser: cannot open " .. PASSWD)
-exit(1)
+    print("adduser: cannot open " .. PASSWD)
+    exit(1)
 end
 local data = ""
 while true do
-local chunk = read(fd, 65536)
-if not chunk or #chunk == 0 then break end
-data = data .. chunk
+    local chunk = read(fd, 65536)
+    if not chunk or #chunk == 0 then break end
+    data = data .. chunk
 end
 close(fd)
 
+-- Parse existing entries
 local entries = {}
-local max_uid = 999  for line in data:gmatch("[^\r\n]+") do
-local name, pass, euid, egid = line:match("([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
-if name and name ~= "" then
-entries[#entries + 1] = line
-local nuid = tonumber(euid)
-if nuid and nuid > max_uid then max_uid = nuid end
-end
+local max_uid = 999  -- start UIDs above 999
+for line in data:gmatch("[^\r\n]+") do
+    local name, pass, euid, egid = line:match("([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
+    if name and name ~= "" then
+        entries[#entries + 1] = line
+        local nuid = tonumber(euid)
+        if nuid and nuid > max_uid then max_uid = nuid end
+    end
 end
 
+-- Check if user already exists
 for _, line in ipairs(entries) do
-local name = line:match("^([^:]+):")
-if name == username then
-print("adduser: user '" .. username .. "' already exists")
-exit(1)
-end
+    local name = line:match("^([^:]+):")
+    if name == username then
+        print("adduser: user '" .. username .. "' already exists")
+        exit(1)
+    end
 end
 
+-- Assign uid if not given
 if not uid then
-uid = max_uid + 1
+    uid = max_uid + 1
 end
+-- Default gid = uid
 if not gid then
-gid = uid
+    gid = uid
 end
 
 local home = "/home/" .. username
 local shell = "/usr/bin/sh.lua"
 local gecos = username
 
+-- Build passwd line: name:pass:uid:gid:gecos:home:shell
+-- Password is "x" (locked) by default — user must set via passwd or su
 local newline = username .. ":x:" .. uid .. ":" .. gid .. ":" .. gecos .. ":" .. home .. ":" .. shell
 
-fd = open(PASSWD, 1) if not fd then
-print("adduser: cannot open " .. PASSWD .. " for writing")
-exit(1)
+-- Append to /etc/passwd
+fd = open(PASSWD, 1) -- write
+if not fd then
+    print("adduser: cannot open " .. PASSWD .. " for writing")
+    exit(1)
 end
+-- If existing data, ensure trailing newline
 if #data > 0 and data:sub(-1) ~= "\n" then
-write(fd, "\n")
+    write(fd, "\n")
 end
 write(fd, newline .. "\n")
 close(fd)
 
-mkdir(home, 493)
+-- Create home directory
+mkdir(home, 493) -- 0755
+
+-- Try to chown home directory
 local ok, err = chown(home, uid, gid)
 if not ok then
-print("adduser: warning: chown " .. home .. " failed: " .. (err or "unknown"))
+    print("adduser: warning: chown " .. home .. " failed: " .. (err or "unknown"))
 end
 
 print("adduser: created user '" .. username .. "' (uid=" .. uid .. " gid=" .. gid .. ")")
----FILE /usr/bin/deluser.lua 0755 1604 0b98f3c6 src---
+---FILE /usr/bin/deluser.lua 0755 2283 b4fd5b32 src---
+-- deluser: remove a user account
+-- Usage: deluser <username>
+-- Removes entry from /etc/passwd, optionally removes home directory.
+-- Requires root (uid 0).
 
 local function usage()
-print("usage: deluser <username>")
-exit(1)
+    print("usage: deluser <username>")
+    exit(1)
 end
 
+-- Parse args
 local args = {}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
@@ -113,162 +138,185 @@ if #args < 1 then usage() end
 
 local username = args[1]
 
+-- Require root
 local myuid = getuid()
 if myuid ~= 0 then
-print("deluser: must be root")
-exit(1)
+    print("deluser: must be root")
+    exit(1)
 end
 
+-- Prevent deleting root
 if username == "root" then
-print("deluser: cannot delete root")
-exit(1)
+    print("deluser: cannot delete root")
+    exit(1)
 end
 
+-- Read /etc/passwd
 local PASSWD = "/etc/passwd"
 local fd = open(PASSWD, 0)
 if not fd then
-print("deluser: cannot open " .. PASSWD)
-exit(1)
+    print("deluser: cannot open " .. PASSWD)
+    exit(1)
 end
 local data = ""
 while true do
-local chunk = read(fd, 65536)
-if not chunk or #chunk == 0 then break end
-data = data .. chunk
+    local chunk = read(fd, 65536)
+    if not chunk or #chunk == 0 then break end
+    data = data .. chunk
 end
 close(fd)
 
+-- Parse and filter
 local found = false
 local home = nil
 local new_lines = {}
 for line in data:gmatch("[^\r\n]+") do
-local name = line:match("^([^:]+):")
-if name == username then
-found = true
-home = line:match("([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
-_, _, _, _, _, home = line:match("([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
-else
-new_lines[#new_lines + 1] = line
-end
+    local name = line:match("^([^:]+):")
+    if name == username then
+        found = true
+        -- Extract home dir for potential cleanup
+        home = line:match("([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
+        -- home is 6th field
+        _, _, _, _, _, home = line:match("([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
+    else
+        new_lines[#new_lines + 1] = line
+    end
 end
 
 if not found then
-print("deluser: user '" .. username .. "' not found")
-exit(1)
+    print("deluser: user '" .. username .. "' not found")
+    exit(1)
 end
 
-fd = open(PASSWD, 1) if not fd then
-print("deluser: cannot open " .. PASSWD .. " for writing")
-exit(1)
+-- Write back filtered /etc/passwd
+fd = open(PASSWD, 1) -- write (truncate)
+if not fd then
+    print("deluser: cannot open " .. PASSWD .. " for writing")
+    exit(1)
 end
 write(fd, table.concat(new_lines, "\n") .. "\n")
 close(fd)
 
+-- Remove home directory if it exists and is under /home/
 if home and home:match("^/home/") then
-local st = stat(home)
-if st and st.type == "directory" then
-local ok, err = unlink(home)
-if not ok then
-ok, err = rmdir(home)
-end
-if not ok then
-print("deluser: warning: could not remove " .. home .. ": " .. (err or "unknown"))
-end
-end
+    local st = stat(home)
+    if st and st.type == "directory" then
+        local ok, err = unlink(home)
+        if not ok then
+            -- Try rmdir if unlink fails on dirs
+            ok, err = rmdir(home)
+        end
+        if not ok then
+            print("deluser: warning: could not remove " .. home .. ": " .. (err or "unknown"))
+        end
+    end
 end
 
 print("deluser: removed user '" .. username .. "'")
----FILE /usr/bin/su.lua 0755 1746 16872e39 src---
+---FILE /usr/bin/su.lua 0755 2639 f04b898d src---
+-- su: substitute user identity
+-- Usage: su [username]
+-- Switches to target user via setuid/setgid, then spawns a shell.
+-- Default: switch to root. Password check for non-root callers.
 
 local PASSWD = "/etc/passwd"
 
 local function read_passwd()
-local fd = open(PASSWD, 0)
-if not fd then return nil end
-local data = ""
-while true do
-local chunk = read(fd, 65536)
-if not chunk or #chunk == 0 then break end
-data = data .. chunk
-end
-close(fd)
-return data
+    local fd = open(PASSWD, 0)
+    if not fd then return nil end
+    local data = ""
+    while true do
+        local chunk = read(fd, 65536)
+        if not chunk or #chunk == 0 then break end
+        data = data .. chunk
+    end
+    close(fd)
+    return data
 end
 
 local function lookup_user(data, name)
-for line in data:gmatch("[^\r\n]+") do
-local uname, pass, uid, gid, gecos, home, shell = line:match(
-"([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
-if uname == name then
-return {
-name = uname,
-pass = pass,
-uid = tonumber(uid),
-gid = tonumber(gid),
-home = home or "/",
-shell = shell or "/usr/bin/sh.lua",
-}
-end
-end
-return nil
+    for line in data:gmatch("[^\r\n]+") do
+        local uname, pass, uid, gid, gecos, home, shell = line:match(
+            "([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
+        if uname == name then
+            return {
+                name = uname,
+                pass = pass,
+                uid = tonumber(uid),
+                gid = tonumber(gid),
+                home = home or "/",
+                shell = shell or "/usr/bin/sh.lua",
+            }
+        end
+    end
+    return nil
 end
 
+-- Parse args
 local args = {}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
 local target = args[1] or "root"
 
+-- Read passwd database
 local data = read_passwd()
 if not data then
-print("su: cannot read " .. PASSWD)
-exit(1)
+    print("su: cannot read " .. PASSWD)
+    exit(1)
 end
 
 local entry = lookup_user(data, target)
 if not entry then
-print("su: unknown user '" .. target .. "'")
-exit(1)
+    print("su: unknown user '" .. target .. "'")
+    exit(1)
 end
 
+-- Non-root callers must authenticate
 local myuid = getuid()
 if myuid ~= 0 then
-if entry.pass == "" or entry.pass == "x" then
-print("su: account '" .. target .. "' is locked")
-exit(1)
-end
-if entry.pass ~= "x" and entry.pass ~= "" then
-print("Password for " .. target .. ":")
-local input = read(0, 256)
-if input then
-input = input:gsub("\r?\n$", "")
-end
-if input ~= entry.pass then
-print("su: authentication failure")
-exit(1)
-end
-end
+    -- Check if target account is locked
+    if entry.pass == "" or entry.pass == "x" then
+        print("su: account '" .. target .. "' is locked")
+        exit(1)
+    end
+    -- Simple password check (plaintext, debug kernel)
+    if entry.pass ~= "x" and entry.pass ~= "" then
+        print("Password for " .. target .. ":")
+        -- Read password from stdin (cooked mode)
+        local input = read(0, 256)
+        if input then
+            input = input:gsub("\r?\n$", "")
+        end
+        if input ~= entry.pass then
+            print("su: authentication failure")
+            exit(1)
+        end
+    end
 end
 
+-- Switch identity
 if entry.gid ~= getgid() then
-local ok, err = setgid(entry.gid)
-if not ok then
-print("su: setgid failed: " .. (err or "unknown"))
-exit(1)
-end
+    local ok, err = setgid(entry.gid)
+    if not ok then
+        print("su: setgid failed: " .. (err or "unknown"))
+        exit(1)
+    end
 end
 
 if entry.uid ~= getuid() then
-local ok, err = setuid(entry.uid)
-if not ok then
-print("su: setuid failed: " .. (err or "unknown"))
-exit(1)
-end
+    local ok, err = setuid(entry.uid)
+    if not ok then
+        print("su: setuid failed: " .. (err or "unknown"))
+        exit(1)
+    end
 end
 
+-- Change to target's home directory
 chdir(entry.home)
 
+-- Spawn shell
 local pid = spawn(entry.shell)
 if pid then
-waitpid(pid)
+    waitpid(pid)
 end
 ---END PKG---

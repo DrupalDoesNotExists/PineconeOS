@@ -3,7 +3,7 @@ name=knuck-icmp
 version=1.0.0
 arch=any
 maintainer=kernel@knuck.dev
-description=knuck-icmp (1.0.0)
+description=KNUCK ICMP kernel module and ping utility
 license=MIT
 essential=no
 deps=knuck@>=0.1.0
@@ -15,369 +15,445 @@ prerem=
 postrem=
 files=2
 ---END MANIFEST---
----FILE /lib/knuck/kernel/net_icmp.lua 0755 4460 e718ae0b src---
+---FILE /lib/knuck/kernel/net_icmp.lua 0755 7456 82d169f6 src---
+--[[
+  KNUCK ICMP module
+  =================
+  Loadable kernel module implementing ICMP (Internet Control Message Protocol,
+  RFC 792). Replaces the hardcoded _icmp_handle in net.lua.
 
+  Provides:
+    - Protocol handler registered via K.net.register_proto(1, handler)
+    - AF_ICMP socket domain for userland ping/traceroute
+    - Per-socket receive queues with blocking recv
+    - ICMP statistics (sent/received/errors)
+
+  ICMP types handled:
+    0  echo reply
+    3  destination unreachable
+    11 time exceeded
+    8  echo request (handled by kernel, also forwarded to sockets)
+
+  Socket model:
+    socket("icmp", "dgram", 1)  -- AF_ICMP, SOCK_DGRAM, IPPROTO_ICMP
+    bind(fd, "0.0.0.0")        -- optional, binds to filter
+    sendto(fd, data, dest_ip)   -- sends ICMP with auto-ident/seq
+    recvfrom(fd)                -- blocks until ICMP packet arrives
+]]
 
 return function(K)
-local M = {}
+  local M = {}
 
-local net = nil
+  local net = nil               -- set in init()
 
-local ICMP_ECHO_REPLY    = 0
-local ICMP_DEST_UNREACH  = 3
-local ICMP_TIME_EXCEED   = 11
-local ICMP_ECHO_REQUEST  = 8
+  -- ---- ICMP constants ----
 
-local sockets = {}             local ident_counter = 1        local stats = {
-sent = 0,
-received = 0,
-errors = 0,
-echo_requests = 0,
-echo_replies = 0,
-}
+  local ICMP_ECHO_REPLY    = 0
+  local ICMP_DEST_UNREACH  = 3
+  local ICMP_TIME_EXCEED   = 11
+  local ICMP_ECHO_REQUEST  = 8
 
-local function icmp_checksum(data)
-local sum = 0
-for i = 1, #data, 2 do
-local hi = data:byte(i) or 0
-local lo = data:byte(i + 1) or 0
-sum = sum + hi * 256 + lo
-end
-while sum > 0xFFFF do
-sum = (sum % 0x10000) + math.floor(sum / 0x10000)
-end
-return K.net.bxor(sum, 0xFFFF)
-end
+  -- ---- state ----
 
-local function build_icmp(type, code, rest, payload)
-payload = payload or ""
-local header = string.char(type, code, 0, 0) .. rest .. payload
-local cs = icmp_checksum(header)
-header = string.char(type, code, math.floor(cs / 256), cs % 256) .. rest .. payload
-return header
-end
+  local sockets = {}           -- all ICMP sockets (fd.sock references)
+  local ident_counter = 1      -- auto-incrementing ICMP ident
+  local stats = {
+    sent = 0,
+    received = 0,
+    errors = 0,
+    echo_requests = 0,
+    echo_replies = 0,
+  }
 
-function M.handle(data, src_ip)
-if #data < 8 then
-stats.errors = stats.errors + 1
-return
-end
+  -- ---- ICMP checksum (RFC 1071) ----
 
-local typ = data:byte(1)
-stats.received = stats.received + 1
+  local function icmp_checksum(data)
+    local sum = 0
+    for i = 1, #data, 2 do
+      local hi = data:byte(i) or 0
+      local lo = data:byte(i + 1) or 0
+      sum = sum + hi * 256 + lo
+    end
+    while sum > 0xFFFF do
+      sum = (sum % 0x10000) + math.floor(sum / 0x10000)
+    end
+    return K.net.bxor(sum, 0xFFFF)
+  end
 
-if typ == ICMP_ECHO_REQUEST then
-stats.echo_requests = stats.echo_requests + 1
-local reply_payload = data:sub(9)        local reply_rest = data:sub(5, 8)        local reply = build_icmp(ICMP_ECHO_REPLY, 0, reply_rest, reply_payload)
-net.send_ip(src_ip, 1, reply)
-stats.sent = stats.sent + 1
-elseif typ == ICMP_ECHO_REPLY then
-stats.echo_replies = stats.echo_replies + 1
-end
+  -- Build ICMP header: type(1) + code(1) + checksum(2) + rest(4) + payload
+  local function build_icmp(type, code, rest, payload)
+    -- rest is 4 bytes (e.g. ident+seq for echo, or unused for error)
+    payload = payload or ""
+    local header = string.char(type, code, 0, 0) .. rest .. payload
+    local cs = icmp_checksum(header)
+    header = string.char(type, code, math.floor(cs / 256), cs % 256) .. rest .. payload
+    return header
+  end
 
-for _, s in ipairs(sockets) do
-if not s.closed then
-local ident = nil
-if #data >= 5 then
-ident = data:byte(5) * 256 + data:byte(6)
-end
-local deliver = true
-if s.bound_ident and ident and s.bound_ident ~= ident then
-deliver = false
-end
-if deliver then
-s.queue[#s.queue + 1] = {
-data = data,
-src_ip = src_ip,
-typ = typ,
-}
-if s.recv_waiters then
-for w in pairs(s.recv_waiters) do
-s.recv_waiters[w] = nil
-K.sched.wake("icmp_recv", s, true)
-break
-end
-end
-K.ipc.wake_fd_ready()
-end
-end
-end
-end
+  -- ---- protocol handler (called by net._demux for proto=1) ----
 
-function M.socket_create(domain, socktype, proto)
-local s = {
-id = nil,                       domain = domain,
-socktype = socktype,
-proto = proto,
-state = "unbound",
-closed = false,
-queue = {},                     recv_waiters = {},
-bound_ident = nil,            }
-sockets[#sockets + 1] = s
-return s
-end
+  function M.handle(data, src_ip)
+    if #data < 8 then
+      stats.errors = stats.errors + 1
+      return
+    end
 
-function M.socket_bind(proc, s, addr)
-if proc.uid ~= 0 then return nil, "permission denied" end
-if addr and addr ~= "0.0.0.0" then
-local ident = tonumber(addr)
-if ident then
-s.bound_ident = ident
-end
-end
-s.state = "bound"
-return true
-end
+    local typ = data:byte(1)
+    stats.received = stats.received + 1
 
-function M.socket_send(proc, s, data)
-if s.closed then return nil, "closed" end
-if s.state ~= "bound" then return nil, "not bound" end
-if #data < 8 then return nil, "invalid argument" end
+    -- Echo request: kernel responds AND forwards to sockets
+    if typ == ICMP_ECHO_REQUEST then
+      stats.echo_requests = stats.echo_requests + 1
+      -- Kernel auto-reply: type 8 -> type 0
+      local reply_payload = data:sub(9)  -- everything after 8-byte ICMP header
+      local reply_rest = data:sub(5, 8)  -- ident + sequence
+      local reply = build_icmp(ICMP_ECHO_REPLY, 0, reply_rest, reply_payload)
+      net.send_ip(src_ip, 1, reply)
+      stats.sent = stats.sent + 1
+    elseif typ == ICMP_ECHO_REPLY then
+      stats.echo_replies = stats.echo_replies + 1
+    end
 
-local dest_ip = s.dest_ip
-if not dest_ip then return nil, "no destination" end
+    -- Forward to all matching ICMP sockets
+    for _, s in ipairs(sockets) do
+      if not s.closed then
+        -- Filter: if bound to a specific ident, only deliver matching
+        local ident = nil
+        if #data >= 5 then
+          ident = data:byte(5) * 256 + data:byte(6)
+        end
+        local deliver = true
+        if s.bound_ident and ident and s.bound_ident ~= ident then
+          deliver = false
+        end
+        if deliver then
+          s.queue[#s.queue + 1] = {
+            data = data,
+            src_ip = src_ip,
+            typ = typ,
+          }
+          -- Wake a waiting recv
+          if s.recv_waiters then
+            for w in pairs(s.recv_waiters) do
+              s.recv_waiters[w] = nil
+              K.sched.wake("icmp_recv", s, true)
+              break
+            end
+          end
+          K.ipc.wake_fd_ready()
+        end
+      end
+    end
+  end
 
-local cs = icmp_checksum(data)
-local packet = data:sub(1, 2)
-.. string.char(math.floor(cs / 256), cs % 256)
-.. data:sub(5)
+  -- ---- socket operations ----
 
-local ok, err = net.send_ip(dest_ip, 1, packet)
-if ok then
-stats.sent = stats.sent + 1
-return #data
+  function M.socket_create(domain, socktype, proto)
+    local s = {
+      id = nil,                 -- set by ipc.socket()
+      domain = domain,
+      socktype = socktype,
+      proto = proto,
+      state = "unbound",
+      closed = false,
+      queue = {},               -- inbound ICMP packets
+      recv_waiters = {},
+      bound_ident = nil,        -- nil = accept all, number = filter by ident
+    }
+    sockets[#sockets + 1] = s
+    return s
+  end
+
+  function M.socket_bind(proc, s, addr)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    -- addr can be "0.0.0.0" (any) or a specific ident to filter
+    if addr and addr ~= "0.0.0.0" then
+      local ident = tonumber(addr)
+      if ident then
+        s.bound_ident = ident
+      end
+    end
+    s.state = "bound"
+    return true
+  end
+
+  function M.socket_send(proc, s, data)
+    if s.closed then return nil, "closed" end
+    if s.state ~= "bound" then return nil, "not bound" end
+    -- data should be a raw ICMP packet or at least 8+ bytes
+    if #data < 8 then return nil, "invalid argument" end
+
+    local dest_ip = s.dest_ip
+    if not dest_ip then return nil, "no destination" end
+
+    -- Compute checksum and send
+    local cs = icmp_checksum(data)
+    local packet = data:sub(1, 2)
+      .. string.char(math.floor(cs / 256), cs % 256)
+      .. data:sub(5)
+
+    local ok, err = net.send_ip(dest_ip, 1, packet)
+    if ok then
+      stats.sent = stats.sent + 1
+      return #data
+    end
+    return nil, err
+  end
+
+  function M.socket_sendto(proc, s, data, dest_ip, dest_port)
+    if s.closed then return nil, "closed" end
+    if #data < 8 then return nil, "invalid argument" end
+
+    s.dest_ip = dest_ip
+    s.state = "bound"
+
+    local cs = icmp_checksum(data)
+    local packet = data:sub(1, 2)
+      .. string.char(math.floor(cs / 256), cs % 256)
+      .. data:sub(5)
+
+    local ok, err = net.send_ip(dest_ip, 1, packet)
+    if ok then
+      stats.sent = stats.sent + 1
+      return #data
+    end
+    return nil, err
+  end
+
+  function M.socket_recv(proc, s, n, flags)
+    if s.closed then return nil end
+    local dontwait = flags and (flags % 2 == 1) or false
+
+    if #s.queue > 0 then
+      local pkt = table.remove(s.queue, 1)
+      -- Return: data + src_ip as a table for recvfrom semantics
+      return pkt.data, pkt.src_ip
+    end
+
+    if dontwait then return nil end
+
+    -- Block until ICMP packet arrives
+    s.recv_waiters[proc] = true
+    K.sched.wait(proc, "icmp_recv", s, function()
+      s.recv_waiters[proc] = nil
+      if #s.queue > 0 then
+        local pkt = table.remove(s.queue, 1)
+        return pkt.data, pkt.src_ip
+      end
+      return nil
+    end)
+  end
+
+  function M.socket_readable(s)
+    if s.closed then return true end  -- EOF
+    return #s.queue > 0
+  end
+
+  function M.socket_close(s)
+    if s.closed then return true end
+    s.closed = true
+    -- Remove from sockets list
+    for i, sock in ipairs(sockets) do
+      if sock == s then
+        table.remove(sockets, i)
+        break
+      end
+    end
+    return true
+  end
+
+  -- ---- stats ----
+
+  function M.stats()
+    return {
+      sent = stats.sent,
+      received = stats.received,
+      errors = stats.errors,
+      echo_requests = stats.echo_requests,
+      echo_replies = stats.echo_replies,
+    }
+  end
+
+  -- ---- init ----
+
+  function M.init()
+    net = K.net
+    -- Register ICMP protocol handler
+    net.register_proto(1, M.handle)
+    K.log("net_icmp: loaded, ICMP protocol handler registered")
+  end
+
+  return M
 end
-return nil, err
-end
-
-function M.socket_sendto(proc, s, data, dest_ip, dest_port)
-if s.closed then return nil, "closed" end
-if #data < 8 then return nil, "invalid argument" end
-
-s.dest_ip = dest_ip
-s.state = "bound"
-
-local cs = icmp_checksum(data)
-local packet = data:sub(1, 2)
-.. string.char(math.floor(cs / 256), cs % 256)
-.. data:sub(5)
-
-local ok, err = net.send_ip(dest_ip, 1, packet)
-if ok then
-stats.sent = stats.sent + 1
-return #data
-end
-return nil, err
-end
-
-function M.socket_recv(proc, s, n, flags)
-if s.closed then return nil end
-local dontwait = flags and (flags % 2 == 1) or false
-
-if #s.queue > 0 then
-local pkt = table.remove(s.queue, 1)
-return pkt.data, pkt.src_ip
-end
-
-if dontwait then return nil end
-
-s.recv_waiters[proc] = true
-K.sched.wait(proc, "icmp_recv", s, function()
-s.recv_waiters[proc] = nil
-if #s.queue > 0 then
-local pkt = table.remove(s.queue, 1)
-return pkt.data, pkt.src_ip
-end
-return nil
-end)
-end
-
-function M.socket_readable(s)
-if s.closed then return true end      return #s.queue > 0
-end
-
-function M.socket_close(s)
-if s.closed then return true end
-s.closed = true
-for i, sock in ipairs(sockets) do
-if sock == s then
-table.remove(sockets, i)
-break
-end
-end
-return true
-end
-
-function M.stats()
-return {
-sent = stats.sent,
-received = stats.received,
-errors = stats.errors,
-echo_requests = stats.echo_requests,
-echo_replies = stats.echo_replies,
-}
-end
-
-function M.init()
-net = K.net
-net.register_proto(1, M.handle)
-K.log("net_icmp: loaded, ICMP protocol handler registered")
-end
-
-return M
-end
----FILE /usr/bin/ping.lua 0755 5031 9e08e284 src---
+---FILE /usr/bin/ping.lua 0755 6556 145e4305 src---
+-- ping: send ICMP echo requests and measure RTT
+-- Usage: ping [-c count] [-i interval] host
+-- Uses AF_ICMP socket for real ICMP echo requests/replies.
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- bxor via pure arithmetic (no bit32 in sandbox)
 local function bxor(a, b)
-local r, bit = 0, 1
-while a > 0 or b > 0 do
-local abit, bbit = a % 2, b % 2
-if abit ~= bbit then r = r + bit end
-a = math.floor(a / 2)
-b = math.floor(b / 2)
-bit = bit * 2
-end
-return r
+  local r, bit = 0, 1
+  while a > 0 or b > 0 do
+    local abit, bbit = a % 2, b % 2
+    if abit ~= bbit then r = r + bit end
+    a = math.floor(a / 2)
+    b = math.floor(b / 2)
+    bit = bit * 2
+  end
+  return r
 end
 
-local count = nil       local interval = 1.0    local host = nil
+-- Parse arguments
+local count = nil       -- -c count: stop after count replies
+local interval = 1.0    -- -i interval: seconds between pings
+local host = nil
 
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-c" and i < #args then
-count = tonumber(args[i+1])
-if not count or count < 1 then
-print("ping: invalid count")
-exit(1)
-end
-i = i + 2
-elseif a == "-i" and i < #args then
-interval = tonumber(args[i+1])
-if not interval or interval < 0.1 then
-print("ping: invalid interval")
-exit(1)
-end
-i = i + 2
-elseif a:sub(1,2) == "-c" then
-count = tonumber(a:sub(3))
-if not count or count < 1 then
-print("ping: invalid count")
-exit(1)
-end
-i = i + 1
-elseif a:sub(1,2) == "-i" then
-interval = tonumber(a:sub(3))
-if not interval or interval < 0.1 then
-print("ping: invalid interval")
-exit(1)
-end
-i = i + 1
-elseif a == "-h" or a == "--help" then
-print("usage: ping [-c count] [-i interval] host")
-exit(0)
-elseif a:sub(1,1) == "-" then
-print("ping: unknown option: " .. a)
-exit(1)
-else
-host = a
-i = i + 1
-end
+  local a = args[i]
+  if a == "-c" and i < #args then
+    count = tonumber(args[i+1])
+    if not count or count < 1 then
+      print("ping: invalid count")
+      exit(1)
+    end
+    i = i + 2
+  elseif a == "-i" and i < #args then
+    interval = tonumber(args[i+1])
+    if not interval or interval < 0.1 then
+      print("ping: invalid interval")
+      exit(1)
+    end
+    i = i + 2
+  elseif a:sub(1,2) == "-c" then
+    count = tonumber(a:sub(3))
+    if not count or count < 1 then
+      print("ping: invalid count")
+      exit(1)
+    end
+    i = i + 1
+  elseif a:sub(1,2) == "-i" then
+    interval = tonumber(a:sub(3))
+    if not interval or interval < 0.1 then
+      print("ping: invalid interval")
+      exit(1)
+    end
+    i = i + 1
+  elseif a == "-h" or a == "--help" then
+    print("usage: ping [-c count] [-i interval] host")
+    exit(0)
+  elseif a:sub(1,1) == "-" then
+    print("ping: unknown option: " .. a)
+    exit(1)
+  else
+    host = a
+    i = i + 1
+  end
 end
 
 if not host then
-print("usage: ping [-c count] [-i interval] host")
-exit(1)
+  print("usage: ping [-c count] [-i interval] host")
+  exit(1)
 end
 
+-- Resolve host to IP (try /etc/hosts first, then treat as IP)
 local dest_ip = nil
 local function resolve_host(name)
-local fd = open("/etc/hosts", 0)
-if fd then
-local data = ""
-while true do
-local chunk = read(fd, 4096)
-if not chunk or #chunk == 0 then break end
-data = data .. chunk
-end
-close(fd)
-for line in data:gmatch("[^\n]+") do
-if not line:match("^#") then
-local ip, hostnames = line:match("^(%d+%.%d+%.%d+%.%d+)%s+(.+)$")
-if ip then
-for h in hostnames:gmatch("%S+") do
-if h == name then return ip end
-end
-end
-end
-end
-end
-if name:match("^%d+%.%d+%.%d+%.%d+$") then
-return name
-end
-return nil
+  -- Check /etc/hosts
+  local fd = open("/etc/hosts", 0)
+  if fd then
+    local data = ""
+    while true do
+      local chunk = read(fd, 4096)
+      if not chunk or #chunk == 0 then break end
+      data = data .. chunk
+    end
+    close(fd)
+    for line in data:gmatch("[^\n]+") do
+      if not line:match("^#") then
+        local ip, hostnames = line:match("^(%d+%.%d+%.%d+%.%d+)%s+(.+)$")
+        if ip then
+          for h in hostnames:gmatch("%S+") do
+            if h == name then return ip end
+          end
+        end
+      end
+    end
+  end
+  -- Treat as literal IP
+  if name:match("^%d+%.%d+%.%d+%.%d+$") then
+    return name
+  end
+  return nil
 end
 
 dest_ip = resolve_host(host)
 if not dest_ip then
-print("ping: unknown host " .. host)
-exit(1)
+  print("ping: unknown host " .. host)
+  exit(1)
 end
 
+-- Create ICMP socket
 local fd = socket("icmp", "dgram", 1)
 if not fd then
-print("ping: failed to create ICMP socket")
-exit(1)
+  print("ping: failed to create ICMP socket")
+  exit(1)
 end
 
+-- Bind to receive all ICMP
 local ok, err = bind(fd, "0.0.0.0")
 if not ok then
-print("ping: bind failed: " .. (err or "unknown"))
-exit(1)
+  print("ping: bind failed: " .. (err or "unknown"))
+  exit(1)
 end
 
+-- ICMP echo request helpers
 local function build_echo(ident, seq, payload)
-local header = string.char(8, 0, 0, 0,
-math.floor(ident / 256), ident % 256,
-math.floor(seq / 256), seq % 256)
-local data = header .. payload
-local sum = 0
-for i = 1, #data, 2 do
-local hi = data:byte(i) or 0
-local lo = data:byte(i + 1) or 0
-sum = sum + hi * 256 + lo
-end
-while sum > 0xFFFF do
-sum = (sum % 0x10000) + math.floor(sum / 0x10000)
-end
-local cs = bxor(sum, 0xFFFF)
-return string.char(8, 0, math.floor(cs / 256), cs % 256,
-math.floor(ident / 256), ident % 256,
-math.floor(seq / 256), seq % 256) .. payload
+  -- type=8 (echo request), code=0, checksum=0 (computed later), ident, seq
+  local header = string.char(8, 0, 0, 0,
+    math.floor(ident / 256), ident % 256,
+    math.floor(seq / 256), seq % 256)
+  local data = header .. payload
+  -- Compute ICMP checksum
+  local sum = 0
+  for i = 1, #data, 2 do
+    local hi = data:byte(i) or 0
+    local lo = data:byte(i + 1) or 0
+    sum = sum + hi * 256 + lo
+  end
+  while sum > 0xFFFF do
+    sum = (sum % 0x10000) + math.floor(sum / 0x10000)
+  end
+  local cs = bxor(sum, 0xFFFF)
+  return string.char(8, 0, math.floor(cs / 256), cs % 256,
+    math.floor(ident / 256), ident % 256,
+    math.floor(seq / 256), seq % 256) .. payload
 end
 
 local function parse_icmp(data)
-if #data < 8 then return nil end
-local typ = data:byte(1)
-local code = data:byte(2)
-local ident = data:byte(5) * 256 + data:byte(6)
-local seq = data:byte(7) * 256 + data:byte(8)
-return typ, code, ident, seq
+  if #data < 8 then return nil end
+  local typ = data:byte(1)
+  local code = data:byte(2)
+  local ident = data:byte(5) * 256 + data:byte(6)
+  local seq = data:byte(7) * 256 + data:byte(8)
+  return typ, code, ident, seq
 end
 
+-- Generate a timestamp payload (8 bytes: seconds since boot as float approximation)
 local function make_payload()
-local t = os.clock()
-local sec = math.floor(t)
-local usec = math.floor((t - sec) * 1000000)
-return string.char(
-math.floor(sec / 256) % 256, sec % 256,
-math.floor(usec / 256) % 256, usec % 256,
-0, 0, 0, 0)
+  local t = os.clock()
+  local sec = math.floor(t)
+  local usec = math.floor((t - sec) * 1000000)
+  return string.char(
+    math.floor(sec / 256) % 256, sec % 256,
+    math.floor(usec / 256) % 256, usec % 256,
+    0, 0, 0, 0)
 end
 
+-- Main ping loop
 local ident = math.random(1, 65535)
 local seq = 0
 local sent = 0
@@ -389,70 +465,78 @@ local sum_rtt = 0
 print("PING " .. host .. " (" .. dest_ip .. ") 56(84) bytes of data.")
 
 while true do
-if count and sent >= count then break end
+  if count and sent >= count then break end
 
-seq = seq + 1
-local payload = make_payload()
-local pkt = build_echo(ident, seq, payload)
-local send_time = os.clock()
+  -- Build and send echo request
+  seq = seq + 1
+  local payload = make_payload()
+  local pkt = build_echo(ident, seq, payload)
+  local send_time = os.clock()
 
-local ok, err = sendto(fd, pkt, dest_ip, 0)
-if not ok then
-print("ping: sendto failed: " .. (err or "unknown"))
-break
-end
-sent = sent + 1
+  local ok, err = sendto(fd, pkt, dest_ip, 0)
+  if not ok then
+    print("ping: sendto failed: " .. (err or "unknown"))
+    break
+  end
+  sent = sent + 1
 
-local reply = nil
-local reply_ip = nil
-local deadline = os.clock() + 2.0
-while os.clock() < deadline do
-reply, reply_ip = recvfrom(fd)
-if reply then
-local rtyp, rcode, rident, rseq = parse_icmp(reply)
-if rtyp == 0 and rident == ident and rseq == seq then
-break
-end
-reply = nil
-end
+  -- Wait for reply (with timeout)
+  local reply = nil
+  local reply_ip = nil
+  local deadline = os.clock() + 2.0  -- 2 second timeout
+
+  while os.clock() < deadline do
+    reply, reply_ip = recvfrom(fd)
+    if reply then
+      local rtyp, rcode, rident, rseq = parse_icmp(reply)
+      if rtyp == 0 and rident == ident and rseq == seq then
+        break
+      end
+      -- Not our reply, keep waiting
+      reply = nil
+    end
+  end
+
+  local rtt = (os.clock() - send_time) * 1000  -- ms
+
+  if reply then
+    received = received + 1
+    sum_rtt = sum_rtt + rtt
+    if not min_rtt or rtt < min_rtt then min_rtt = rtt end
+    if not max_rtt or rtt > max_rtt then max_rtt = rtt end
+    print(#reply .. " bytes from " .. (reply_ip or dest_ip) ..
+          ": icmp_seq=" .. seq .. " ttl=64 time=" ..
+          string.format("%.3f", rtt) .. " ms")
+  else
+    print("Request timeout for icmp_seq " .. seq)
+  end
+
+  -- Wait for interval between pings
+  if not count or sent < count then
+    local wait_until = os.clock() + interval
+    while os.clock() < wait_until do
+      -- Small sleep to avoid busy-waiting
+      sleep(0.05)
+    end
+  end
 end
 
-local rtt = (os.clock() - send_time) * 1000
-if reply then
-received = received + 1
-sum_rtt = sum_rtt + rtt
-if not min_rtt or rtt < min_rtt then min_rtt = rtt end
-if not max_rtt or rtt > max_rtt then max_rtt = rtt end
-print(#reply .. " bytes from " .. (reply_ip or dest_ip) ..
-": icmp_seq=" .. seq .. " ttl=64 time=" ..
-string.format("%.3f", rtt) .. " ms")
-else
-print("Request timeout for icmp_seq " .. seq)
-end
-
-if not count or sent < count then
-local wait_until = os.clock() + interval
-while os.clock() < wait_until do
-sleep(0.05)
-end
-end
-end
-
+-- Print statistics
 print("")
 print("--- " .. host .. " ping statistics ---")
 local loss = 0
 if sent > 0 then
-loss = math.floor((1 - received / sent) * 100 + 0.5)
+  loss = math.floor((1 - received / sent) * 100 + 0.5)
 end
 print(sent .. " packets transmitted, " .. received .. " received, " ..
-loss .. "% packet loss")
+      loss .. "% packet loss")
 
 if received > 0 then
-local avg = sum_rtt / received
-print("rtt min/avg/max = " ..
-string.format("%.3f", min_rtt) .. "/" ..
-string.format("%.3f", avg) .. "/" ..
-string.format("%.3f", max_rtt) .. " ms")
+  local avg = sum_rtt / received
+  print("rtt min/avg/max = " ..
+        string.format("%.3f", min_rtt) .. "/" ..
+        string.format("%.3f", avg) .. "/" ..
+        string.format("%.3f", max_rtt) .. " ms")
 end
 
 close(fd)

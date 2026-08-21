@@ -3,7 +3,7 @@ name=coreutils
 version=1.0.0
 arch=any
 maintainer=pine@pineconeos.dev
-description=coreutils (1.0.0)
+description=Basic file utilities
 license=MIT
 deps=
 provides=
@@ -14,44 +14,49 @@ prerem=
 postrem=
 files=10
 ---END MANIFEST---
----FILE /usr/bin/cat.lua 0755 60 709c31f9 src---
+---FILE /usr/bin/cat.lua 0755 93 98b50e65 src---
+-- cat: read stdin, write stdout
 local data = read(0, 65536)
 if data then write(1, data) end
----FILE /usr/bin/cp.lua 0755 1444 419be3f8 src---
+---FILE /usr/bin/cp.lua 0755 1968 12c79012 src---
+-- cp: copy files
+-- Usage: cp <src> <dst>  OR  cp <src...> <dir>
 local function usage()
-print("usage: cp <source> <dest>")
-print("       cp <source...> <dir>")
-exit(1)
+    print("usage: cp <source> <dest>")
+    print("       cp <source...> <dir>")
+    exit(1)
 end
 
 local function read_file(path)
-local fd, err = open(path, 0)      if not fd then
-print("cp: cannot open '"..path.."': "..err)
-exit(1)
-end
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data then break end
-if #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-return table.concat(chunks)
+    local fd, err = open(path, 0)  -- O_RDONLY
+    if not fd then
+        print("cp: cannot open '"..path.."': "..err)
+        exit(1)
+    end
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data then break end
+        if #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    return table.concat(chunks)
 end
 
 local function write_file(path, data)
-local fd, err = open(path, 577)      if not fd then
-print("cp: cannot create '"..path.."': "..err)
-exit(1)
-end
-local off = 1
-while off <= #data do
-local chunk = data:sub(off, off + 65535)
-write(fd, chunk)
-off = off + 65536
-end
-close(fd)
+    local fd, err = open(path, 577)  -- O_WRONLY|O_CREAT|O_TRUNC = 0x241 = 577
+    if not fd then
+        print("cp: cannot create '"..path.."': "..err)
+        exit(1)
+    end
+    local off = 1
+    while off <= #data do
+        local chunk = data:sub(off, off + 65535)
+        write(fd, chunk)
+        off = off + 65536
+    end
+    close(fd)
 end
 
 local args = {}
@@ -62,63 +67,69 @@ local dst = args[#args]
 local srcs = {}
 for i=1,#args-1 do srcs[#srcs+1] = args[i] end
 
+-- Check if dst is a directory
 local dst_st = stat(dst)
 if #srcs > 1 then
-if not dst_st or dst_st.type ~= "directory" then
-print("cp: target '"..dst.."' is not a directory")
-exit(1)
-end
+    -- multiple sources: dst must be a directory (or we can't handle file->file multiple)
+    if not dst_st or dst_st.type ~= "directory" then
+        print("cp: target '"..dst.."' is not a directory")
+        exit(1)
+    end
 end
 
 for _, src in ipairs(srcs) do
-local src_st = stat(src)
-if not src_st then
-print("cp: cannot stat '"..src.."': No such file or directory")
-exit(1)
+    local src_st = stat(src)
+    if not src_st then
+        print("cp: cannot stat '"..src.."': No such file or directory")
+        exit(1)
+    end
+    local dest_path
+    if #srcs > 1 or (dst_st and dst_st.type == "directory") then
+        -- copy into directory
+        local base = src:match("([^/]+)$") or src
+        dest_path = dst.."/"..base
+    else
+        dest_path = dst
+    end
+    local data = read_file(src)
+    write_file(dest_path, data)
 end
-local dest_path
-if #srcs > 1 or (dst_st and dst_st.type == "directory") then
-local base = src:match("([^/]+)$") or src
-dest_path = dst.."/"..base
-else
-dest_path = dst
-end
-local data = read_file(src)
-write_file(dest_path, data)
-end
----FILE /usr/bin/echo.lua 0755 113 cfadd00b src---
+---FILE /usr/bin/echo.lua 0755 133 b76aa6ec src---
+-- echo: print args
 local out = {}
 for i = 1, select("#", ...) do out[i] = tostring(select(i, ...)) end
-print(table.concat(out, " "))---FILE /usr/bin/head.lua 0755 1409 f5feba14 src---
+print(table.concat(out, " "))---FILE /usr/bin/head.lua 0755 1939 502150e8 src---
+-- head: output first N lines
+-- Usage: head [-n N] [file]
 local function usage()
-print("usage: head [-n lines] [file]")
-exit(1)
+    print("usage: head [-n lines] [file]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function head_lines(data, n)
-local count = 0
-local pos = 1
-while count < n and pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-write(1, data:sub(pos, nl))
-pos = nl + 1
-else
-write(1, data:sub(pos))
-pos = #data + 1
-end
-count = count + 1
-end
+    local count = 0
+    local pos = 1
+    while count < n and pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            write(1, data:sub(pos, nl))
+            pos = nl + 1
+        else
+            write(1, data:sub(pos))
+            pos = #data + 1
+        end
+        count = count + 1
+    end
 end
 
 local args = {}
@@ -129,101 +140,110 @@ local file = nil
 
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-n" then
-i = i + 1
-if i > #args then usage() end
-nlines = tonumber(args[i])
-if not nlines then
-print("head: invalid number: '"..args[i].."'")
-usage()
-end
-elseif a:sub(1,2) == "-n" then
-nlines = tonumber(a:sub(3))
-if not nlines then
-print("head: invalid number: '"..a:sub(3).."'")
-usage()
-end
-elseif a == "-" then
-file = file      elseif a:sub(1,1) == "-" and #a > 1 then
-local num = tonumber(a:sub(2))
-if num then
-nlines = num
-else
-print("head: unknown option: "..a)
-usage()
-end
-else
-file = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-n" then
+        i = i + 1
+        if i > #args then usage() end
+        nlines = tonumber(args[i])
+        if not nlines then
+            print("head: invalid number: '"..args[i].."'")
+            usage()
+        end
+    elseif a:sub(1,2) == "-n" then
+        nlines = tonumber(a:sub(3))
+        if not nlines then
+            print("head: invalid number: '"..a:sub(3).."'")
+            usage()
+        end
+    elseif a == "-" then
+        file = file  -- stdin, already nil
+    elseif a:sub(1,1) == "-" and #a > 1 then
+        -- combine flags like -5
+        local num = tonumber(a:sub(2))
+        if num then
+            nlines = num
+        else
+            print("head: unknown option: "..a)
+            usage()
+        end
+    else
+        file = a
+    end
+    i = i + 1
 end
 
 local data
 if file then
-local fd, err = open(file, 0)
-if not fd then
-print("head: "..file..": "..err)
-exit(1)
-end
-data = read_all(fd)
-close(fd)
+    local fd, err = open(file, 0)
+    if not fd then
+        print("head: "..file..": "..err)
+        exit(1)
+    end
+    data = read_all(fd)
+    close(fd)
 else
-data = read_all(0)
+    data = read_all(0)
 end
 
 head_lines(data, nlines)
----FILE /usr/bin/ls.lua 0755 1989 5ba23fa6 src---
+---FILE /usr/bin/ls.lua 0755 2918 46c3fec1 src---
+-- ls: list directory contents
+-- Usage: ls [-l] [-a] [path...]
 local function parse_args(args)
-local flags = {long=false, all=false}
-local paths = {}
-for i=1,#args do
-local a = args[i]
-if a == "-l" then
-flags.long = true
-elseif a == "-a" then
-flags.all = true
-elseif a == "-la" or a == "-al" then
-flags.long = true
-flags.all = true
-elseif a:sub(1,1) == "-" and #a > 1 then
-for j=2,#a do
-local c = a:sub(j,j)
-if c == "l" then flags.long = true
-elseif c == "a" then flags.all = true
-else
-print("ls: unknown option: -"..c)
-exit(1)
-end
-end
-else
-paths[#paths+1] = a
-end
-end
-if #paths == 0 then paths[1] = "." end
-return flags, paths
+    local flags = {long=false, all=false}
+    local paths = {}
+    for i=1,#args do
+        local a = args[i]
+        if a == "-l" then
+            flags.long = true
+        elseif a == "-a" then
+            flags.all = true
+        elseif a == "-la" or a == "-al" then
+            flags.long = true
+            flags.all = true
+        elseif a:sub(1,1) == "-" and #a > 1 then
+            for j=2,#a do
+                local c = a:sub(j,j)
+                if c == "l" then flags.long = true
+                elseif c == "a" then flags.all = true
+                else
+                    print("ls: unknown option: -"..c)
+                    exit(1)
+                end
+            end
+        else
+            paths[#paths+1] = a
+        end
+    end
+    if #paths == 0 then paths[1] = "." end
+    return flags, paths
 end
 
 local function format_mode(mode)
-local t = "?"
-local ft = math.floor(mode / 4096) % 16
-if ft == 8 then t = "-"
-elseif ft == 4 then t = "d"
-elseif ft == 10 then t = "l"
-elseif ft == 6 then t = "b"
-elseif ft == 2 then t = "c"
-elseif ft == 1 then t = "p"
-end
-local s = {}
-local function rwx8(v)
-s[#s+1] = (v >= 4) and "r" or "-"
-s[#s+1] = (v >= 2) and "w" or "-"
-s[#s+1] = ((v % 2) == 1) and "x" or "-"
-end
-rwx8(math.floor(mode / 64) % 8)
-rwx8(math.floor(mode / 8) % 8)
-rwx8(mode % 8)
-return t..table.concat(s)
+    local t = "?"
+    -- extract file type from mode (bits 12-15)
+    local ft = math.floor(mode / 4096) % 16
+    if ft == 8 then t = "-"
+    elseif ft == 4 then t = "d"
+    elseif ft == 10 then t = "l"
+    elseif ft == 6 then t = "b"
+    elseif ft == 2 then t = "c"
+    elseif ft == 1 then t = "p"
+    end
+    -- permissions (lower 9 bits)
+    local s = {}
+    local function rwx8(v)
+        s[#s+1] = (v >= 4) and "r" or "-"
+        s[#s+1] = (v >= 2) and "w" or "-"
+        s[#s+1] = ((v % 2) == 1) and "x" or "-"
+    end
+    -- owner (bits 6-8)
+    rwx8(math.floor(mode / 64) % 8)
+    -- group (bits 3-5)
+    rwx8(math.floor(mode / 8) % 8)
+    -- other (bits 0-2)
+    rwx8(mode % 8)
+    return t..table.concat(s)
 end
 
 local args = {}
@@ -231,62 +251,70 @@ for i=1,select("#",...) do args[i]=select(i,...) end
 local flags, paths = parse_args(args)
 
 local function ls_dir(path)
-local entries = readdir(path)
-if not entries then
-print("ls: cannot access '"..path.."': No such file or directory")
-exit(1)
-end
-table.sort(entries, function(a,b) return a.name < b.name end)
-for _, e in ipairs(entries) do
-local name = e.name
-if not flags.all and name:sub(1,1) == "." then
-else
-if flags.long then
-local m = format_mode(e.mode)
-local sz = e.size or 0
-local suffix = ""
-if e.is_dir then suffix = "/" end
-print(m.."  "..sz.."\t"..name..suffix)
-else
-local suffix = ""
-if e.is_dir then suffix = "/" end
-print(name..suffix)
-end
-end
-end
+    local entries = readdir(path)
+    if not entries then
+        print("ls: cannot access '"..path.."': No such file or directory")
+        exit(1)
+    end
+    -- sort entries by name
+    table.sort(entries, function(a,b) return a.name < b.name end)
+    for _, e in ipairs(entries) do
+        local name = e.name
+        if not flags.all and name:sub(1,1) == "." then
+            -- skip hidden
+        else
+            if flags.long then
+                local m = format_mode(e.mode)
+                local sz = e.size or 0
+                local suffix = ""
+                if e.is_dir then suffix = "/" end
+                print(m.."  "..sz.."\t"..name..suffix)
+            else
+                local suffix = ""
+                if e.is_dir then suffix = "/" end
+                print(name..suffix)
+            end
+        end
+    end
 end
 
 for _, p in ipairs(paths) do
-local st = stat(p)
-if not st then
-print("ls: cannot access '"..p.."': No such file or directory")
-exit(1)
+    local st = stat(p)
+    if not st then
+        print("ls: cannot access '"..p.."': No such file or directory")
+        exit(1)
+    end
+    if st.type == "directory" and (#paths > 1) then
+        print(p..":")
+    end
+    ls_dir(p)
 end
-if st.type == "directory" and (#paths > 1) then
-print(p..":")
-end
-ls_dir(p)
-end
----FILE /usr/bin/mkdir.lua 0755 1036 5a8b6f80 src---
+---FILE /usr/bin/mkdir.lua 0755 1463 eedeb0cb src---
+-- mkdir: create directories
+-- Usage: mkdir [-p] <path...>
 local function usage()
-print("usage: mkdir [-p] <directory...>")
-exit(1)
+    print("usage: mkdir [-p] <directory...>")
+    exit(1)
 end
 
 local function mkdir_p(path)
-local ok = mkdir(path, 493)      if ok then return true end
-local st = stat(path)
-if st and st.type == "directory" then return true end
-return false
+    -- try mkdir first
+    local ok = mkdir(path, 493)  -- 0755
+    if ok then return true end
+    -- check if already exists
+    local st = stat(path)
+    if st and st.type == "directory" then return true end
+    return false
 end
 
 local function mkdir_parents(path)
-local parts = {}
-local cur = ""
-for part in (path .. "/"):gmatch("([^/]+)") do
-cur = cur .. "/" .. part
-mkdir_p(cur)
-end
+    -- build path components, skip empty strings
+    local parts = {}
+    local cur = ""
+    for part in (path .. "/"):gmatch("([^/]+)") do
+        cur = cur .. "/" .. part
+        mkdir_p(cur)
+    end
 end
 
 local args = {}
@@ -296,75 +324,77 @@ local parents = false
 local paths = {}
 
 for i=1,#args do
-local a = args[i]
-if a == "-p" then
-parents = true
-elseif a:sub(1,1) == "-" and #a > 1 then
-for j=2,#a do
-local c = a:sub(j,j)
-if c == "p" then parents = true
-else
-print("mkdir: unknown option: -"..c)
-usage()
-end
-end
-else
-paths[#paths+1] = a
-end
+    local a = args[i]
+    if a == "-p" then
+        parents = true
+    elseif a:sub(1,1) == "-" and #a > 1 then
+        for j=2,#a do
+            local c = a:sub(j,j)
+            if c == "p" then parents = true
+            else
+                print("mkdir: unknown option: -"..c)
+                usage()
+            end
+        end
+    else
+        paths[#paths+1] = a
+    end
 end
 
 if #paths == 0 then usage() end
 
 for _, p in ipairs(paths) do
-if parents then
-mkdir_parents(p)
-else
-local ok, err = mkdir(p, 493)
-if not ok then
-print("mkdir: cannot create directory '"..p.."': "..(err or "failed"))
-exit(1)
+    if parents then
+        mkdir_parents(p)
+    else
+        local ok, err = mkdir(p, 493)
+        if not ok then
+            print("mkdir: cannot create directory '"..p.."': "..(err or "failed"))
+            exit(1)
+        end
+    end
 end
-end
-end
----FILE /usr/bin/mv.lua 0755 1511 ae37ffd0 src---
+---FILE /usr/bin/mv.lua 0755 1896 791afc00 src---
+-- mv: move files
+-- Usage: mv <src> <dst>  OR  mv <src...> <dir>
 local function usage()
-print("usage: mv <source> <dest>")
-print("       mv <source...> <dir>")
-exit(1)
+    print("usage: mv <source> <dest>")
+    print("       mv <source...> <dir>")
+    exit(1)
 end
 
 local function read_file(path)
-local fd, err = open(path, 0)
-if not fd then
-print("mv: cannot open '"..path.."': "..err)
-exit(1)
-end
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-return table.concat(chunks)
+    local fd, err = open(path, 0)
+    if not fd then
+        print("mv: cannot open '"..path.."': "..err)
+        exit(1)
+    end
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    return table.concat(chunks)
 end
 
 local function write_file(path, data)
-local fd, err = open(path, 577)
-if not fd then
-print("mv: cannot create '"..path.."': "..err)
-exit(1)
-end
-local off = 1
-while off <= #data do
-write(fd, data:sub(off, off + 65535))
-off = off + 65536
-end
-close(fd)
+    local fd, err = open(path, 577)
+    if not fd then
+        print("mv: cannot create '"..path.."': "..err)
+        exit(1)
+    end
+    local off = 1
+    while off <= #data do
+        write(fd, data:sub(off, off + 65535))
+        off = off + 65536
+    end
+    close(fd)
 end
 
 local function rm_file(path)
-unlink(path)
+    unlink(path)
 end
 
 local args = {}
@@ -377,34 +407,38 @@ for i=1,#args-1 do srcs[#srcs+1] = args[i] end
 
 local dst_st = stat(dst)
 if #srcs > 1 and (not dst_st or dst_st.type ~= "directory") then
-print("mv: target '"..dst.."' is not a directory")
-exit(1)
+    print("mv: target '"..dst.."' is not a directory")
+    exit(1)
 end
 
 for _, src in ipairs(srcs) do
-local src_st = stat(src)
-if not src_st then
-print("mv: cannot stat '"..src.."': No such file or directory")
-exit(1)
+    local src_st = stat(src)
+    if not src_st then
+        print("mv: cannot stat '"..src.."': No such file or directory")
+        exit(1)
+    end
+    local dest_path
+    if #srcs > 1 or (dst_st and dst_st.type == "directory") then
+        local base = src:match("([^/]+)$") or src
+        dest_path = dst.."/"..base
+    else
+        dest_path = dst
+    end
+    -- try rename first
+    local ok, err = rename(src, dest_path)
+    if not ok then
+        -- fallback: copy + remove
+        local data = read_file(src)
+        write_file(dest_path, data)
+        rm_file(src)
+    end
 end
-local dest_path
-if #srcs > 1 or (dst_st and dst_st.type == "directory") then
-local base = src:match("([^/]+)$") or src
-dest_path = dst.."/"..base
-else
-dest_path = dst
-end
-local ok, err = rename(src, dest_path)
-if not ok then
-local data = read_file(src)
-write_file(dest_path, data)
-rm_file(src)
-end
-end
----FILE /usr/bin/rm.lua 0755 1385 a7dce4d0 src---
+---FILE /usr/bin/rm.lua 0755 1932 c7a9a6d9 src---
+-- rm: remove files/directories
+-- Usage: rm [-r] [-f] <path...>
 local function usage()
-print("usage: rm [-r] [-f] <file...>")
-exit(1)
+    print("usage: rm [-r] [-f] <file...>")
+    exit(1)
 end
 
 local args = {}
@@ -415,97 +449,100 @@ local force = false
 local paths = {}
 
 for i=1,#args do
-local a = args[i]
-if a == "-r" or a == "-rf" or a == "-fr" then
-recursive = true
-force = true
-elseif a == "-f" then
-force = true
-elseif a:sub(1,1) == "-" and #a > 1 then
-for j=2,#a do
-local c = a:sub(j,j)
-if c == "r" then recursive = true
-elseif c == "f" then force = true
-else
-print("rm: unknown option: -"..c)
-usage()
-end
-end
-else
-paths[#paths+1] = a
-end
+    local a = args[i]
+    if a == "-r" or a == "-rf" or a == "-fr" then
+        recursive = true
+        force = true
+    elseif a == "-f" then
+        force = true
+    elseif a:sub(1,1) == "-" and #a > 1 then
+        for j=2,#a do
+            local c = a:sub(j,j)
+            if c == "r" then recursive = true
+            elseif c == "f" then force = true
+            else
+                print("rm: unknown option: -"..c)
+                usage()
+            end
+        end
+    else
+        paths[#paths+1] = a
+    end
 end
 
 if #paths == 0 then usage() end
 
 local function rm_path(p, recursive, force)
-local st = stat(p)
-if not st then
-if not force then
-print("rm: cannot remove '"..p.."': No such file or directory")
-end
-return
-end
-if st.type == "directory" then
-if not recursive then
-print("rm: cannot remove '"..p.."': Is a directory")
-exit(1)
-end
-local entries = readdir(p)
-if entries then
-for _, e in ipairs(entries) do
-if e.name ~= "." and e.name ~= ".." then
-rm_path(p.."/"..e.name, true, force)
-end
-end
-end
-local ok, err = rmdir(p)
-if not ok and not force then
-print("rm: cannot remove '"..p.."': "..(err or "failed"))
-end
-else
-local ok, err = unlink(p)
-if not ok and not force then
-print("rm: cannot remove '"..p.."': "..(err or "failed"))
-end
-end
+    local st = stat(p)
+    if not st then
+        if not force then
+            print("rm: cannot remove '"..p.."': No such file or directory")
+        end
+        return
+    end
+    if st.type == "directory" then
+        if not recursive then
+            print("rm: cannot remove '"..p.."': Is a directory")
+            exit(1)
+        end
+        -- recurse into directory
+        local entries = readdir(p)
+        if entries then
+            for _, e in ipairs(entries) do
+                if e.name ~= "." and e.name ~= ".." then
+                    rm_path(p.."/"..e.name, true, force)
+                end
+            end
+        end
+        local ok, err = rmdir(p)
+        if not ok and not force then
+            print("rm: cannot remove '"..p.."': "..(err or "failed"))
+        end
+    else
+        local ok, err = unlink(p)
+        if not ok and not force then
+            print("rm: cannot remove '"..p.."': "..(err or "failed"))
+        end
+    end
 end
 
 for _, p in ipairs(paths) do
-rm_path(p, recursive, force)
+    rm_path(p, recursive, force)
 end
----FILE /usr/bin/tail.lua 0755 1534 8f8e6a43 src---
+---FILE /usr/bin/tail.lua 0755 2049 870fe679 src---
+-- tail: output last N lines
+-- Usage: tail [-n N] [file]
 local function usage()
-print("usage: tail [-n lines] [file]")
-exit(1)
+    print("usage: tail [-n lines] [file]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function split_lines(data)
-local lines = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-lines[#lines+1] = data:sub(pos, nl - 1)
-pos = nl + 1
-else
-if pos <= #data then
-lines[#lines+1] = data:sub(pos)
-end
-break
-end
-end
-return lines
+    local lines = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            lines[#lines+1] = data:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            if pos <= #data then
+                lines[#lines+1] = data:sub(pos)
+            end
+            break
+        end
+    end
+    return lines
 end
 
 local args = {}
@@ -516,113 +553,118 @@ local file = nil
 
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-n" then
-i = i + 1
-if i > #args then usage() end
-nlines = tonumber(args[i])
-if not nlines then
-print("tail: invalid number: '"..args[i].."'")
-usage()
-end
-elseif a:sub(1,2) == "-n" then
-nlines = tonumber(a:sub(3))
-if not nlines then
-print("tail: invalid number: '"..a:sub(3).."'")
-usage()
-end
-elseif a == "-" then
-elseif a:sub(1,1) == "-" and #a > 1 then
-local num = tonumber(a:sub(2))
-if num then
-nlines = num
-else
-print("tail: unknown option: "..a)
-usage()
-end
-else
-file = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-n" then
+        i = i + 1
+        if i > #args then usage() end
+        nlines = tonumber(args[i])
+        if not nlines then
+            print("tail: invalid number: '"..args[i].."'")
+            usage()
+        end
+    elseif a:sub(1,2) == "-n" then
+        nlines = tonumber(a:sub(3))
+        if not nlines then
+            print("tail: invalid number: '"..a:sub(3).."'")
+            usage()
+        end
+    elseif a == "-" then
+        -- stdin
+    elseif a:sub(1,1) == "-" and #a > 1 then
+        local num = tonumber(a:sub(2))
+        if num then
+            nlines = num
+        else
+            print("tail: unknown option: "..a)
+            usage()
+        end
+    else
+        file = a
+    end
+    i = i + 1
 end
 
 local data
 if file then
-local fd, err = open(file, 0)
-if not fd then
-print("tail: "..file..": "..err)
-exit(1)
-end
-data = read_all(fd)
-close(fd)
+    local fd, err = open(file, 0)
+    if not fd then
+        print("tail: "..file..": "..err)
+        exit(1)
+    end
+    data = read_all(fd)
+    close(fd)
 else
-data = read_all(0)
+    data = read_all(0)
 end
 
 local lines = split_lines(data)
 local start = #lines - nlines + 1
 if start < 1 then start = 1 end
 for j = start, #lines do
-write(1, lines[j].."\n")
+    write(1, lines[j].."\n")
 end
----FILE /usr/bin/wc.lua 0755 1239 6f7bbc0a src---
+---FILE /usr/bin/wc.lua 0755 1682 fc75260c src---
+-- wc: word, line, byte count
+-- Usage: wc [file...]
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function wc(data)
-local lines = 0
-local words = 0
-local bytes = #data
-local in_word = false
-for i = 1, #data do
-local c = data:sub(i, i)
-if c == "\n" then
-lines = lines + 1
-end
-if c == " " or c == "\t" or c == "\n" or c == "\r" then
-in_word = false
-else
-if not in_word then
-words = words + 1
-in_word = true
-end
-end
-end
-return lines, words, bytes
+    local lines = 0
+    local words = 0
+    local bytes = #data
+    local in_word = false
+    for i = 1, #data do
+        local c = data:sub(i, i)
+        if c == "\n" then
+            lines = lines + 1
+        end
+        if c == " " or c == "\t" or c == "\n" or c == "\r" then
+            in_word = false
+        else
+            if not in_word then
+                words = words + 1
+                in_word = true
+            end
+        end
+    end
+    return lines, words, bytes
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- no flags in simple wc, just files
 if #args == 0 then
-local data = read_all(0)
-local lines, words, bytes = wc(data)
-print(string.format("%7d %7d %7d", lines, words, bytes))
+    -- stdin
+    local data = read_all(0)
+    local lines, words, bytes = wc(data)
+    print(string.format("%7d %7d %7d", lines, words, bytes))
 else
-local total_l, total_w, total_b = 0, 0, 0
-for _, path in ipairs(args) do
-local fd, err = open(path, 0)
-if not fd then
-print("wc: "..path..": "..err)
-exit(1)
-end
-local data = read_all(fd)
-close(fd)
-local lines, words, bytes = wc(data)
-total_l = total_l + lines
-total_w = total_w + words
-total_b = total_b + bytes
-print(string.format("%7d %7d %7d %s", lines, words, bytes, path))
-end
-if #args > 1 then
-print(string.format("%7d %7d %7d total", total_l, total_w, total_b))
-end
+    local total_l, total_w, total_b = 0, 0, 0
+    for _, path in ipairs(args) do
+        local fd, err = open(path, 0)
+        if not fd then
+            print("wc: "..path..": "..err)
+            exit(1)
+        end
+        local data = read_all(fd)
+        close(fd)
+        local lines, words, bytes = wc(data)
+        total_l = total_l + lines
+        total_w = total_w + words
+        total_b = total_b + bytes
+        print(string.format("%7d %7d %7d %s", lines, words, bytes, path))
+    end
+    if #args > 1 then
+        print(string.format("%7d %7d %7d total", total_l, total_w, total_b))
+    end
 end
 ---END PKG---

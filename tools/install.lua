@@ -648,7 +648,7 @@ local function write_startup()
 -- /lib/knuck/boot.lua missing, so the system won't boot — pine refuses
 -- to remove it without --force.
 local function try_load(path)
-  local f, err = loadfile(path, "bt", _G)
+  local f, err = loadfile(path, "t", _G)
   if f then return f end
   return nil, err
 end

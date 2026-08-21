@@ -3,7 +3,7 @@ name=nano
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=nano (1.0.0)
+description=Nano-style non-modal text editor
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,240 +15,302 @@ prerem=
 postrem=
 files=1
 ---END MANIFEST---
----FILE /usr/bin/nano.lua 0755 5536 f1d637e9 src---
+---FILE /usr/bin/nano.lua 0755 9236 de4b221a src---
+-- nano: minimal non-modal text editor for PineconeOS
+-- Usage: nano [file]
+-- Sandbox globals: open, read, write, close, stat, print, exit, select
 
+-- Collect args
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
-local buf = {""}        local row, col = 1, 0   local dirty = false      local file = args[1]     local msg = ""           local running = true
-local confirm_quit = false
+-- State
+local buf = {""}        -- lines of text
+local row, col = 1, 0   -- cursor: row (1-based), col (0-based byte offset)
+local dirty = false      -- buffer modified flag
+local file = args[1]     -- filename (nil = new buffer)
+local msg = ""           -- status message
+local running = true
+local confirm_quit = false -- awaiting Y/N after ^X with dirty buffer
+
+---------------------------------------------------------------------------
+-- File I/O
+---------------------------------------------------------------------------
 
 local function load_file(path)
-local fd = open(path, "r")
-if not fd then return false end
-local chunks = {}
-while true do
-local d = read(fd, 65536)
-if not d or #d == 0 then break end
-chunks[#chunks+1] = d
-end
-close(fd)
-local data = table.concat(chunks)
-if #data == 0 then return true end
-buf = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-buf[#buf+1] = data:sub(pos, nl - 1)
-pos = nl + 1
-else
-buf[#buf+1] = data:sub(pos)
-pos = #data + 1
-end
-end
-if #buf == 0 then buf = {""} end
-return true
+    local fd = open(path, "r")
+    if not fd then return false end
+    local chunks = {}
+    while true do
+        local d = read(fd, 65536)
+        if not d or #d == 0 then break end
+        chunks[#chunks+1] = d
+    end
+    close(fd)
+    local data = table.concat(chunks)
+    if #data == 0 then return true end
+    buf = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            buf[#buf+1] = data:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            buf[#buf+1] = data:sub(pos)
+            pos = #data + 1
+        end
+    end
+    if #buf == 0 then buf = {""} end
+    return true
 end
 
 local function save_file(path)
-local fd = open(path, "w")
-if not fd then return false, "cannot open " .. path end
-for i, line in ipairs(buf) do
-write(fd, line)
-if i < #buf then write(fd, "\n") end
-end
-close(fd)
-dirty = false
-return true
+    local fd = open(path, "w")
+    if not fd then return false, "cannot open " .. path end
+    for i, line in ipairs(buf) do
+        write(fd, line)
+        if i < #buf then write(fd, "\n") end
+    end
+    close(fd)
+    dirty = false
+    return true
 end
 
+---------------------------------------------------------------------------
+-- Buffer editing primitives
+---------------------------------------------------------------------------
+
 local function insert_char(ch)
-local l = buf[row]
-buf[row] = l:sub(1, col) .. ch .. l:sub(col + 1)
-col = col + 1
-dirty = true
+    local l = buf[row]
+    buf[row] = l:sub(1, col) .. ch .. l:sub(col + 1)
+    col = col + 1
+    dirty = true
 end
 
 local function insert_newline()
-local l = buf[row]
-buf[row] = l:sub(1, col)
-table.insert(buf, row + 1, l:sub(col + 1))
-row = row + 1
-col = 0
-dirty = true
+    local l = buf[row]
+    buf[row] = l:sub(1, col)
+    table.insert(buf, row + 1, l:sub(col + 1))
+    row = row + 1
+    col = 0
+    dirty = true
 end
 
 local function backspace()
-if col > 0 then
-local l = buf[row]
-buf[row] = l:sub(1, col - 1) .. l:sub(col + 1)
-col = col - 1
-dirty = true
-elseif row > 1 then
-local prev_len = #buf[row - 1]
-buf[row - 1] = buf[row - 1] .. buf[row]
-table.remove(buf, row)
-row = row - 1
-col = prev_len
-dirty = true
-end
+    if col > 0 then
+        local l = buf[row]
+        buf[row] = l:sub(1, col - 1) .. l:sub(col + 1)
+        col = col - 1
+        dirty = true
+    elseif row > 1 then
+        local prev_len = #buf[row - 1]
+        buf[row - 1] = buf[row - 1] .. buf[row]
+        table.remove(buf, row)
+        row = row - 1
+        col = prev_len
+        dirty = true
+    end
 end
 
 local function clamp_cursor()
-if row < 1 then row = 1 end
-if row > #buf then row = #buf end
-if col < 0 then col = 0 end
-if col > #buf[row] then col = #buf[row] end
+    if row < 1 then row = 1 end
+    if row > #buf then row = #buf end
+    if col < 0 then col = 0 end
+    if col > #buf[row] then col = #buf[row] end
 end
+
+---------------------------------------------------------------------------
+-- Screen rendering (ANSI)
+---------------------------------------------------------------------------
 
 local function render()
-local out = {}
-out[#out+1] = "\27[2J\27[H"
+    local out = {}
+    -- Clear screen, cursor to home
+    out[#out+1] = "\27[2J\27[H"
 
-local title = file or "New Buffer"
-if dirty then title = title .. " [Modified]" end
-local pad = math.max(0, 62 - #title)
-out[#out+1] = "\27[1;7m " .. title .. string.rep(" ", pad) .. " \27[0m\n"
+    -- Title bar (inverse video)
+    local title = file or "New Buffer"
+    if dirty then title = title .. " [Modified]" end
+    local pad = math.max(0, 62 - #title)
+    out[#out+1] = "\27[1;7m " .. title .. string.rep(" ", pad) .. " \27[0m\n"
 
-local visible = 22
-for i = 1, math.min(#buf, visible) do
-out[#out+1] = buf[i] .. "\n"
+    -- Buffer content — show up to 22 lines, unused rows show "~"
+    local visible = 22
+    for i = 1, math.min(#buf, visible) do
+        out[#out+1] = buf[i] .. "\n"
+    end
+    for _ = #buf + 1, visible do
+        out[#out+1] = "~\n"
+    end
+
+    -- Status bar (inverse)
+    local status = string.format(" %d,%d ", row, col + 1)
+    if dirty then status = status .. "[Modified] " end
+    out[#out+1] = "\27[1;7m" .. status .. "\27[0m\n"
+
+    -- Message line
+    if #msg > 0 then out[#out+1] = msg .. "\n" end
+
+    -- Bottom menu bar (inverse)
+    out[#out+1] = "\27[1;7m ^G Help  ^O WriteOut  ^X Exit \27[0m"
+
+    -- Move cursor to editing position (row + 1 for title bar)
+    local scr_row = row + 1
+    if scr_row <= visible + 1 then
+        out[#out+1] = "\27[" .. scr_row .. ";" .. (col + 1) .. "H"
+    end
+
+    write(1, table.concat(out))
 end
-for _ = #buf + 1, visible do
-out[#out+1] = "~\n"
-end
 
-local status = string.format(" %d,%d ", row, col + 1)
-if dirty then status = status .. "[Modified] " end
-out[#out+1] = "\27[1;7m" .. status .. "\27[0m\n"
-
-if #msg > 0 then out[#out+1] = msg .. "\n" end
-
-out[#out+1] = "\27[1;7m ^G Help  ^O WriteOut  ^X Exit \27[0m"
-
-local scr_row = row + 1
-if scr_row <= visible + 1 then
-out[#out+1] = "\27[" .. scr_row .. ";" .. (col + 1) .. "H"
-end
-
-write(1, table.concat(out))
-end
+---------------------------------------------------------------------------
+-- Keystroke processing
+---------------------------------------------------------------------------
 
 local function process_byte(b)
-if confirm_quit then
-if b == 89 or b == 121 then                      if file then save_file(file) end
-running = false
-elseif b == 78 or b == 110 then                  running = false
-else
-msg = "Save modified buffer? (Y)es / (N)o"
-end
-return
+    -- If waiting for Y/N confirm quit, handle that first
+    if confirm_quit then
+        if b == 89 or b == 121 then          -- Y / y → save (if possible) & quit
+            if file then save_file(file) end
+            running = false
+        elseif b == 78 or b == 110 then      -- N / n → quit without saving
+            running = false
+        else
+            msg = "Save modified buffer? (Y)es / (N)o"
+        end
+        return
+    end
+
+    if b == 15 then            -- ^O — WriteOut (save)
+        if file then
+            local ok, err = save_file(file)
+            msg = ok and ("Saved " .. file) or ("Error: " .. (err or "write failed"))
+        else
+            msg = "No filename. Usage: nano <file>"
+        end
+    elseif b == 24 then        -- ^X — Exit
+        if dirty then
+            confirm_quit = true
+            msg = "Save modified buffer? (Y)es / (N)o"
+        else
+            running = false
+        end
+    elseif b == 7 then         -- ^G — Get Help
+        msg = "^O=Save  ^X=Quit  ^G=Help  BS=Del  Arrows=Move"
+    elseif b == 8 or b == 127 then  -- Backspace
+        backspace()
+        msg = ""
+    elseif b == 10 or b == 13 then  -- Enter
+        insert_newline()
+        msg = ""
+    elseif b == 27 then        -- Escape → possible arrow key sequence
+        local n1 = read(0, 1)
+        local n2 = read(0, 1)
+        if n1 == "[" and n2 then
+            if n2 == "A" and row > 1 then            -- Up
+                row = row - 1
+                clamp_cursor()
+            elseif n2 == "B" and row < #buf then     -- Down
+                row = row + 1
+                clamp_cursor()
+            elseif n2 == "C" then                     -- Right
+                if col < #buf[row] then
+                    col = col + 1
+                elseif row < #buf then
+                    row = row + 1; col = 0
+                end
+            elseif n2 == "D" then                     -- Left
+                if col > 0 then
+                    col = col - 1
+                elseif row > 1 then
+                    row = row - 1; col = #buf[row]
+                end
+            end
+        end
+    elseif b >= 32 and b <= 126 then  -- Printable ASCII
+        insert_char(string.char(b))
+        msg = ""
+    end
+    -- All other bytes: ignore
 end
 
-if b == 15 then                    if file then
-local ok, err = save_file(file)
-msg = ok and ("Saved " .. file) or ("Error: " .. (err or "write failed"))
-else
-msg = "No filename. Usage: nano <file>"
-end
-elseif b == 24 then                if dirty then
-confirm_quit = true
-msg = "Save modified buffer? (Y)es / (N)o"
-else
-running = false
-end
-elseif b == 7 then                 msg = "^O=Save  ^X=Quit  ^G=Help  BS=Del  Arrows=Move"
-elseif b == 8 or b == 127 then          backspace()
-msg = ""
-elseif b == 10 or b == 13 then          insert_newline()
-msg = ""
-elseif b == 27 then                local n1 = read(0, 1)
-local n2 = read(0, 1)
-if n1 == "[" and n2 then
-if n2 == "A" and row > 1 then                            row = row - 1
-clamp_cursor()
-elseif n2 == "B" and row < #buf then                     row = row + 1
-clamp_cursor()
-elseif n2 == "C" then                                     if col < #buf[row] then
-col = col + 1
-elseif row < #buf then
-row = row + 1; col = 0
-end
-elseif n2 == "D" then                                     if col > 0 then
-col = col - 1
-elseif row > 1 then
-row = row - 1; col = #buf[row]
-end
-end
-end
-elseif b >= 32 and b <= 126 then          insert_char(string.char(b))
-msg = ""
-end
-end
+---------------------------------------------------------------------------
+-- Line-by-line editing mode (fallback when char-by-char unavailable)
+---------------------------------------------------------------------------
 
 local function line_mode()
-write(1, "NANO LINE MODE\n")
-write(1, "Type text to append. Commands: :w [file]  :q  :wq\n\n")
-for i, l in ipairs(buf) do
-write(1, string.format(" %3d | %s\n", i, l))
-end
-while running do
-write(1, ":")
-local line = read(0, 4096)
-if not line or #line == 0 then break end
-line = line:gsub("[\r\n]+$", "")
+    write(1, "NANO LINE MODE\n")
+    write(1, "Type text to append. Commands: :w [file]  :q  :wq\n\n")
+    for i, l in ipairs(buf) do
+        write(1, string.format(" %3d | %s\n", i, l))
+    end
+    while running do
+        write(1, ":")
+        local line = read(0, 4096)
+        if not line or #line == 0 then break end
+        line = line:gsub("[\r\n]+$", "")
 
-if line == ":q" or line == "q" then
-running = false
-elseif line:sub(1, 3) == ":w " or line == ":w" then
-local p = line:sub(4):match("^%s*(.-)%s*$")
-if #p == 0 then p = file end
-if p then
-file = p
-local ok = save_file(p)
-write(1, ok and ("Saved " .. p .. "\n") or "Error saving\n")
-else
-write(1, "No filename\n")
-end
-elseif line:sub(1, 4) == ":wq" then
-local p = line:sub(5):match("^%s*(.-)%s*$")
-if #p == 0 then p = file end
-if p then file = p; save_file(p) end
-running = false
-elseif line:sub(1, 1) == ":" then
-write(1, "Unknown command — :q quit, :w save, :wq both\n")
-else
-buf[#buf+1] = line
-dirty = true
-write(1, string.format(" %3d | %s\n", #buf, line))
-end
-end
+        if line == ":q" or line == "q" then
+            running = false
+        elseif line:sub(1, 3) == ":w " or line == ":w" then
+            local p = line:sub(4):match("^%s*(.-)%s*$")
+            if #p == 0 then p = file end
+            if p then
+                file = p
+                local ok = save_file(p)
+                write(1, ok and ("Saved " .. p .. "\n") or "Error saving\n")
+            else
+                write(1, "No filename\n")
+            end
+        elseif line:sub(1, 4) == ":wq" then
+            local p = line:sub(5):match("^%s*(.-)%s*$")
+            if #p == 0 then p = file end
+            if p then file = p; save_file(p) end
+            running = false
+        elseif line:sub(1, 1) == ":" then
+            write(1, "Unknown command — :q quit, :w save, :wq both\n")
+        else
+            buf[#buf+1] = line
+            dirty = true
+            write(1, string.format(" %3d | %s\n", #buf, line))
+        end
+    end
 end
 
+---------------------------------------------------------------------------
+-- Main
+---------------------------------------------------------------------------
+
+-- Load file if specified (new buffer is fine for nano)
 if file then
-if not load_file(file) then
-msg = "New file: " .. file
-end
+    if not load_file(file) then
+        msg = "New file: " .. file
+    end
 end
 
+-- Render initial screen, then attempt char-by-char input
 render()
 local test = read(0, 1)
 
 if test and #test == 1 then
-msg = ""
-process_byte(string.byte(test))
-while running do
-render()
-msg = ""
-local c = read(0, 1)
-if not c or #c == 0 then break end
-process_byte(string.byte(c))
-end
+    -- Char-by-char mode (terminal in raw/cbreak or KNUCK supports it)
+    msg = ""
+    process_byte(string.byte(test))
+    while running do
+        render()
+        msg = ""
+        local c = read(0, 1)
+        if not c or #c == 0 then break end
+        process_byte(string.byte(c))
+    end
 else
-write(1, "\27[?25h")      line_mode()
+    -- Fallback: line-by-line mode
+    write(1, "\27[?25h")  -- show cursor
+    line_mode()
 end
 
+-- Cleanup: restore terminal state
 write(1, "\27[2J\27[H\27[?25h")
 if file then print("nano: " .. file) end
 ---END PKG---

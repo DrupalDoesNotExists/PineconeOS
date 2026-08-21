@@ -3,7 +3,7 @@ name=fileutils
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=fileutils (1.0.0)
+description=File manipulation utilities (touch, ln, chmod, chown, rmdir, basename, dirname, find)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,67 +15,77 @@ prerem=
 postrem=
 files=8
 ---END MANIFEST---
----FILE /usr/bin/basename.lua 0755 478 aa601fe4 src---
+---FILE /usr/bin/basename.lua 0755 646 ae2695da src---
+-- basename: strip directory from path
+-- Usage: basename <path> [suffix]
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 1 then
-write(2, "usage: basename <path> [suffix]\n")
-exit(1)
+    write(2, "usage: basename <path> [suffix]\n")
+    exit(1)
 end
 
 local path = args[1]
 local suffix = args[2]
 
+-- strip trailing slashes
 while #path > 1 and path:sub(-1) == "/" do
-path = path:sub(1, -2)
+    path = path:sub(1, -2)
 end
 
+-- extract basename
 local name = path
 local slash = path:find("/[^/]*$")
 if slash then
-name = path:sub(slash + 1)
+    name = path:sub(slash + 1)
 end
 
+-- strip suffix if provided
 if suffix and #suffix > 0 and name:sub(-#suffix) == suffix then
-name = name:sub(1, -(#suffix + 1))
+    name = name:sub(1, -(#suffix + 1))
 end
 
 print(name)
----FILE /usr/bin/chmod.lua 0755 518 9b99176b src---
+---FILE /usr/bin/chmod.lua 0755 649 cfdac29f src---
+-- chmod: change file mode
+-- Usage: chmod <mode> <path...>
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 2 then
-write(2, "usage: chmod <mode> <file...>\n")
-exit(1)
+    write(2, "usage: chmod <mode> <file...>\n")
+    exit(1)
 end
 
 local mode_str = args[1]
 local mode = tonumber(mode_str, 8)
 if not mode then
-mode = tonumber(mode_str)
+    -- try decimal
+    mode = tonumber(mode_str)
 end
 if not mode then
-write(2, "chmod: invalid mode: '"..mode_str.."'\n")
-exit(1)
+    write(2, "chmod: invalid mode: '"..mode_str.."'\n")
+    exit(1)
 end
 
 for i=2,#args do
-local path = args[i]
-local ok, err = chmod(path, mode)
-if not ok then
-write(2, "chmod: cannot change mode of '"..path.."': "..(err or "failed").."\n")
-exit(1)
+    local path = args[i]
+    local ok, err = chmod(path, mode)
+    if not ok then
+        write(2, "chmod: cannot change mode of '"..path.."': "..(err or "failed").."\n")
+        exit(1)
+    end
 end
-end
----FILE /usr/bin/chown.lua 0755 599 0e125957 src---
+---FILE /usr/bin/chown.lua 0755 727 3b0d06fa src---
+-- chown: change file owner
+-- Usage: chown <uid>[:<gid>] <path...>
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 2 then
-write(2, "usage: chown <uid>[:<gid>] <file...>\n")
-exit(1)
+    write(2, "usage: chown <uid>[:<gid>] <file...>\n")
+    exit(1)
 end
 
 local spec = args[1]
@@ -83,82 +93,92 @@ local uid, gid
 
 local colon = spec:find(":")
 if colon then
-uid = tonumber(spec:sub(1, colon-1))
-gid = tonumber(spec:sub(colon+1))
+    uid = tonumber(spec:sub(1, colon-1))
+    gid = tonumber(spec:sub(colon+1))
 else
-uid = tonumber(spec)
+    uid = tonumber(spec)
 end
 
 if not uid then
-write(2, "chown: invalid uid: '"..spec.."'\n")
-exit(1)
+    write(2, "chown: invalid uid: '"..spec.."'\n")
+    exit(1)
 end
 
 for i=2,#args do
-local path = args[i]
-local ok, err = chown(path, uid, gid)
-if not ok then
-write(2, "chown: cannot change owner of '"..path.."': "..(err or "failed").."\n")
-exit(1)
+    local path = args[i]
+    local ok, err = chown(path, uid, gid)
+    if not ok then
+        write(2, "chown: cannot change owner of '"..path.."': "..(err or "failed").."\n")
+        exit(1)
+    end
 end
-end
----FILE /usr/bin/dirname.lua 0755 430 9a3688a3 src---
+---FILE /usr/bin/dirname.lua 0755 628 1bd4527b src---
+-- dirname: print directory component of path
+-- Usage: dirname <path>
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 1 then
-write(2, "usage: dirname <path>\n")
-exit(1)
+    write(2, "usage: dirname <path>\n")
+    exit(1)
 end
 
 local path = args[1]
 
+-- strip trailing slashes
 while #path > 1 and path:sub(-1) == "/" do
-path = path:sub(1, -2)
+    path = path:sub(1, -2)
 end
 
+-- find last slash
 local last_slash = path:find("/[^/]*$")
 if not last_slash then
-print(".")
+    print(".")
 else
-local dir = path:sub(1, last_slash - 1)
-while #dir > 1 and dir:sub(-1) == "/" do
-dir = dir:sub(1, -2)
+    local dir = path:sub(1, last_slash - 1)
+    -- strip trailing slashes from result
+    while #dir > 1 and dir:sub(-1) == "/" do
+        dir = dir:sub(1, -2)
+    end
+    print(dir)
 end
-print(dir)
-end
----FILE /usr/bin/find.lua 0755 540 633467fa src---
+---FILE /usr/bin/find.lua 0755 791 f0aace59 src---
+-- find: recursively list files
+-- Usage: find <path> [path...]
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args == 0 then
-args[1] = "."
+    args[1] = "."
 end
 
 local function find_recursive(path)
-print(path)
+    -- print current entry
+    print(path)
 
-local st = stat(path)
-if not st then return end
+    local st = stat(path)
+    if not st then return end
 
-if st.type == "dir" then
-local entries = readdir(path)
-if entries then
-table.sort(entries, function(a,b) return a.name < b.name end)
-for _, e in ipairs(entries) do
-if e.name ~= "." and e.name ~= ".." then
-local child = path .. "/" .. e.name
-find_recursive(child)
-end
-end
-end
-end
+    if st.type == "dir" then
+        local entries = readdir(path)
+        if entries then
+            table.sort(entries, function(a,b) return a.name < b.name end)
+            for _, e in ipairs(entries) do
+                if e.name ~= "." and e.name ~= ".." then
+                    local child = path .. "/" .. e.name
+                    find_recursive(child)
+                end
+            end
+        end
+    end
 end
 
 for _, p in ipairs(args) do
-find_recursive(p)
+    find_recursive(p)
 end
----FILE /usr/bin/ln.lua 0755 757 bf994891 src---
+---FILE /usr/bin/ln.lua 0755 979 d6869462 src---
+-- ln: create links
+-- Usage: ln [-s] <src> <dst>
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
@@ -167,95 +187,101 @@ local src, dst
 
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-s" then
-symlink_mode = true
-elseif a:sub(1,1) == "-" and #a > 1 then
-for j=2,#a do
-local c = a:sub(j,j)
-if c == "s" then symlink_mode = true
-else
-write(2, "ln: unknown option: -"..c.."\n")
-exit(1)
-end
-end
-elseif not src then
-src = a
-elseif not dst then
-dst = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-s" then
+        symlink_mode = true
+    elseif a:sub(1,1) == "-" and #a > 1 then
+        for j=2,#a do
+            local c = a:sub(j,j)
+            if c == "s" then symlink_mode = true
+            else
+                write(2, "ln: unknown option: -"..c.."\n")
+                exit(1)
+            end
+        end
+    elseif not src then
+        src = a
+    elseif not dst then
+        dst = a
+    end
+    i = i + 1
 end
 
 if not src or not dst then
-write(2, "usage: ln [-s] <source> <target>\n")
-exit(1)
+    write(2, "usage: ln [-s] <source> <target>\n")
+    exit(1)
 end
 
 local ok, err
 if symlink_mode then
-ok, err = symlink(src, dst)
+    ok, err = symlink(src, dst)
 else
-ok, err = link(src, dst)
+    ok, err = link(src, dst)
 end
 
 if not ok then
-write(2, "ln: failed to link '"..src.."' -> '"..dst.."': "..(err or "unknown error").."\n")
-exit(1)
+    write(2, "ln: failed to link '"..src.."' -> '"..dst.."': "..(err or "unknown error").."\n")
+    exit(1)
 end
----FILE /usr/bin/rmdir.lua 0755 555 f48965c3 src---
+---FILE /usr/bin/rmdir.lua 0755 702 43a20d45 src---
+-- rmdir: remove empty directory
+-- Usage: rmdir <path...>
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args == 0 then
-write(2, "usage: rmdir <directory...>\n")
-exit(1)
+    write(2, "usage: rmdir <directory...>\n")
+    exit(1)
 end
 
 for _, path in ipairs(args) do
-local st = stat(path)
-if not st then
-write(2, "rmdir: failed to remove '"..path.."': No such file or directory\n")
-exit(1)
+    local st = stat(path)
+    if not st then
+        write(2, "rmdir: failed to remove '"..path.."': No such file or directory\n")
+        exit(1)
+    end
+    if st.type ~= "dir" then
+        write(2, "rmdir: failed to remove '"..path.."': Not a directory\n")
+        exit(1)
+    end
+    local ok, err = rmdir(path)
+    if not ok then
+        write(2, "rmdir: failed to remove '"..path.."': "..(err or "directory not empty").."\n")
+        exit(1)
+    end
 end
-if st.type ~= "dir" then
-write(2, "rmdir: failed to remove '"..path.."': Not a directory\n")
-exit(1)
-end
-local ok, err = rmdir(path)
-if not ok then
-write(2, "rmdir: failed to remove '"..path.."': "..(err or "directory not empty").."\n")
-exit(1)
-end
-end
----FILE /usr/bin/touch.lua 0755 485 a5fcfe34 src---
+---FILE /usr/bin/touch.lua 0755 796 ee6d97d7 src---
+-- touch: create empty file or update mtime
+-- Usage: touch <file...>
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args == 0 then
-write(2, "touch: missing operand\n")
-exit(1)
+    write(2, "touch: missing operand\n")
+    exit(1)
 end
 
 for _, path in ipairs(args) do
-local st = stat(path)
-if st then
-local fd = open(path, "a")
-if fd then
-write(fd, "")
-close(fd)
-else
-write(2, "touch: cannot touch '"..path.."'\n")
-exit(1)
-end
-else
-local fd, err = open(path, "w")
-if fd then
-close(fd)
-else
-write(2, "touch: cannot create '"..path.."': "..(err or "failed").."\n")
-exit(1)
-end
-end
+    local st = stat(path)
+    if st then
+        -- file exists: reopen to update mtime
+        local fd = open(path, "a")
+        if fd then
+            write(fd, "")
+            close(fd)
+        else
+            write(2, "touch: cannot touch '"..path.."'\n")
+            exit(1)
+        end
+    else
+        -- create new
+        local fd, err = open(path, "w")
+        if fd then
+            close(fd)
+        else
+            write(2, "touch: cannot create '"..path.."': "..(err or "failed").."\n")
+            exit(1)
+        end
+    end
 end
 ---END PKG---

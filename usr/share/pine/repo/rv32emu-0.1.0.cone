@@ -3,7 +3,7 @@ name=rv32emu
 version=0.1.0
 arch=any
 maintainer=pine@pinecone.dev
-description=rv32emu (0.1.0)
+description=RV32I/RV32E userspace emulator (Linux rv32 syscall ABI)
 license=MIT
 deps=
 provides=
@@ -14,8 +14,21 @@ prerem=
 postrem=
 files=1
 ---END MANIFEST---
----FILE /usr/bin/rv32emu.lua 0755 21466 ac953085 src---
+---FILE /usr/bin/rv32emu.lua 0755 30017 dd4d0701 src---
 #!/usr/bin/env lua
+--[[
+  rv32emu — RV32I/RV32E Userspace Emulator for PineconeOS
+  =======================================================
+  Runs statically-linked RV32 ELF binaries in the KNUCK sandbox.
+  Linux rv32 syscall ABI. Single-file, no require/loadfile.
+
+  ISA: RV32I base (40) + M extension (8) + Zicsr (6) = 54 instructions.
+  Flags: -e RV32E (16 regs), -b raw binary, -l ADDR, -s SIZE, -B BURST
+]]
+
+-- ============================================================
+-- 1. Bit utilities (CC:Tweaked sandbox: bit.band/bor/bxor/bnot/blshift/brshift)
+-- ============================================================
 
 local band = bit.band
 local bor  = bit.bor
@@ -23,774 +36,976 @@ local bxor = bit.bxor
 local bnot = bit.bnot
 local shl  = function(x, n) return bit.blshift(x % 0x100000000, n) % 0x100000000 end
 local shr  = function(x, n) return math.floor((x % 0x100000000) / (2^n)) % 0x100000000 end
+-- Arithmetic right shift (sign-extending)
 local function arshift(x, n)
-x = x % 0x100000000
-if x >= 0x80000000 then
-local shifted = shr(x, n)
-local fill = bnot(shl(0xFFFFFFFF, 32 - n)) % 0x100000000
-return bor(shifted, fill)
-end
-return shr(x, n)
+  x = x % 0x100000000
+  if x >= 0x80000000 then
+    local shifted = shr(x, n)
+    -- fill top n bits with 1s
+    local fill = bnot(shl(0xFFFFFFFF, 32 - n)) % 0x100000000
+    return bor(shifted, fill)
+  end
+  return shr(x, n)
 end
 
+-- Sign extend from width bits
 local function sx(v, w)
-v = v % (2^w)
-if v >= (2^(w-1)) then return v - (2^w) end
-return v
+  v = v % (2^w)
+  if v >= (2^(w-1)) then return v - (2^w) end
+  return v
 end
 local function sx32(v) return sx(v, 32) end
 local function ux(v) return v % 0x100000000 end
 
+-- 32x32 unsigned multiply, lower 32 bits (16-bit split to stay in double range)
 local function mul32lo(a, b)
-a = a % 0x100000000; b = b % 0x100000000
-local al = a % 0x10000; local ah = math.floor(a / 0x10000) % 0x10000
-local bl = b % 0x10000; local bh = math.floor(b / 0x10000) % 0x10000
-local lo = al * bl
-local mid = al * bh + ah * bl
-return (lo + (mid % 0x10000) * 0x10000) % 0x100000000
+  a = a % 0x100000000; b = b % 0x100000000
+  local al = a % 0x10000; local ah = math.floor(a / 0x10000) % 0x10000
+  local bl = b % 0x10000; local bh = math.floor(b / 0x10000) % 0x10000
+  local lo = al * bl
+  local mid = al * bh + ah * bl
+  return (lo + (mid % 0x10000) * 0x10000) % 0x100000000
 end
 
+-- 32x32 unsigned multiply, upper 32 bits of 64-bit result
 local function mul32hi_uu(a, b)
-a = a % 0x100000000; b = b % 0x100000000
-local al = a % 0x10000; local ah = math.floor(a / 0x10000) % 0x10000
-local bl = b % 0x10000; local bh = math.floor(b / 0x10000) % 0x10000
-local lo = al * bl
-local mid = al * bh + ah * bl
-local hi = ah * bh + math.floor(mid / 0x10000)
-return (hi + math.floor(lo / 0x100000000)) % 0x100000000
+  a = a % 0x100000000; b = b % 0x100000000
+  local al = a % 0x10000; local ah = math.floor(a / 0x10000) % 0x10000
+  local bl = b % 0x10000; local bh = math.floor(b / 0x10000) % 0x10000
+  local lo = al * bl
+  local mid = al * bh + ah * bl
+  local hi = ah * bh + math.floor(mid / 0x10000)
+  return (hi + math.floor(lo / 0x100000000)) % 0x100000000
 end
 
+-- Signed multiply upper 32 bits
 local function mul32hi_ss(a, b)
-a = sx32(a); b = sx32(b)
-local neg = (a < 0) ~= (b < 0)
-a = math.abs(a); b = math.abs(b)
-local al = a % 0x10000; local ah = math.floor(a / 0x10000)
-local bl = b % 0x10000; local bh = math.floor(b / 0x10000)
-local lo = al * bl; local mid = al * bh + ah * bl
-local hi = ah * bh + math.floor(mid / 0x10000) + math.floor(lo / 0x100000000)
-if neg then hi = (2^32 - hi) % (2^32) end
-return hi % 0x100000000
+  a = sx32(a); b = sx32(b)
+  local neg = (a < 0) ~= (b < 0)
+  a = math.abs(a); b = math.abs(b)
+  local al = a % 0x10000; local ah = math.floor(a / 0x10000)
+  local bl = b % 0x10000; local bh = math.floor(b / 0x10000)
+  local lo = al * bl; local mid = al * bh + ah * bl
+  local hi = ah * bh + math.floor(mid / 0x10000) + math.floor(lo / 0x100000000)
+  if neg then hi = (2^32 - hi) % (2^32) end
+  return hi % 0x100000000
 end
 
+-- Signed x unsigned multiply upper 32 bits
 local function mul32hi_su(a, b)
-local sa = sx32(a)
-local neg = (sa < 0)
-local apos = math.abs(sa)
-local bval = b % 0x100000000
-local al = apos % 0x10000; local ah = math.floor(apos / 0x10000)
-local bl = bval % 0x10000; local bh = math.floor(bval / 0x10000)
-local lo = al * bl; local mid = al * bh + ah * bl
-local hi = ah * bh + math.floor(mid / 0x10000) + math.floor(lo / 0x100000000)
-if neg then hi = (2^32 - hi) % (2^32) end
-return hi % 0x100000000
+  local sa = sx32(a)
+  local neg = (sa < 0)
+  local apos = math.abs(sa)
+  local bval = b % 0x100000000
+  local al = apos % 0x10000; local ah = math.floor(apos / 0x10000)
+  local bl = bval % 0x10000; local bh = math.floor(bval / 0x10000)
+  local lo = al * bl; local mid = al * bh + ah * bl
+  local hi = ah * bh + math.floor(mid / 0x10000) + math.floor(lo / 0x100000000)
+  if neg then hi = (2^32 - hi) % (2^32) end
+  return hi % 0x100000000
 end
+
+-- ============================================================
+-- 2. Argument parsing
+-- ============================================================
 
 local E_mode = false
 local raw_mode = false
 local load_addr = 0
-local ram_size = 4 * 1024 * 1024  local BURST = 4096
+local ram_size = 4 * 1024 * 1024  -- 4 MiB default
+local BURST = 4096
 local binary_path = nil
 local guest_args = {}
 
 local i = 1
 while i <= #arg do
-local a = arg[i]
-if a == "-e" then
-E_mode = true
-elseif a == "-b" then
-raw_mode = true
-elseif a == "-l" then
-i = i + 1; load_addr = tonumber(arg[i]) or 0
-elseif a == "-s" then
-i = i + 1; ram_size = tonumber(arg[i]) or 4*1024*1024
-elseif a == "-B" then
-i = i + 1; BURST = tonumber(arg[i]) or 4096
-elseif a == "-h" or a == "--help" then
-write(1, "Usage: rv32emu [-e] [-b] [-l ADDR] [-s SIZE] [-B BURST] <binary> [args...]\n")
-write(1, "  -e       RV32E mode (16 registers)\n")
-write(1, "  -b       raw binary (not ELF)\n")
-write(1, "  -l ADDR  load address for raw binary (default 0)\n")
-write(1, "  -s SIZE  RAM size in bytes (default 4194304)\n")
-write(1, "  -B N     burst between yields (default 4096)\n")
-exit(0)
-elseif not binary_path then
-binary_path = a
-else
-guest_args[#guest_args + 1] = a
-end
-i = i + 1
+  local a = arg[i]
+  if a == "-e" then
+    E_mode = true
+  elseif a == "-b" then
+    raw_mode = true
+  elseif a == "-l" then
+    i = i + 1; load_addr = tonumber(arg[i]) or 0
+  elseif a == "-s" then
+    i = i + 1; ram_size = tonumber(arg[i]) or 4*1024*1024
+  elseif a == "-B" then
+    i = i + 1; BURST = tonumber(arg[i]) or 4096
+  elseif a == "-h" or a == "--help" then
+    write(1, "Usage: rv32emu [-e] [-b] [-l ADDR] [-s SIZE] [-B BURST] <binary> [args...]\n")
+    write(1, "  -e       RV32E mode (16 registers)\n")
+    write(1, "  -b       raw binary (not ELF)\n")
+    write(1, "  -l ADDR  load address for raw binary (default 0)\n")
+    write(1, "  -s SIZE  RAM size in bytes (default 4194304)\n")
+    write(1, "  -B N     burst between yields (default 4096)\n")
+    exit(0)
+  elseif not binary_path then
+    binary_path = a
+  else
+    guest_args[#guest_args + 1] = a
+  end
+  i = i + 1
 end
 
 if not binary_path then
-write(2, "rv32emu: no binary specified\n")
-write(2, "Usage: rv32emu [-e] [-b] <binary> [args...]\n")
-exit(1)
+  write(2, "rv32emu: no binary specified\n")
+  write(2, "Usage: rv32emu [-e] [-b] <binary> [args...]\n")
+  exit(1)
 end
+
+-- ============================================================
+-- 3. Memory
+-- ============================================================
 
 local RAM = {}
 local ram_words = 0
 local ram_limit = math.floor(ram_size / 4)
 
 local function ram_init(size_bytes)
-ram_words = math.floor(size_bytes / 4)
-if ram_words > ram_limit then ram_words = ram_limit end
-RAM = {}
-for i = 0, ram_words - 1 do RAM[i] = 0 end
+  ram_words = math.floor(size_bytes / 4)
+  if ram_words > ram_limit then ram_words = ram_limit end
+  RAM = {}
+  for i = 0, ram_words - 1 do RAM[i] = 0 end
 end
 
 local function ram_read32(addr)
-local w = math.floor(addr / 4)
-if w < 0 or w >= ram_words then
-error("SEGFAULT: read32 at 0x" .. string.format("%08x", addr))
-end
-return RAM[w] or 0
+  local w = math.floor(addr / 4)
+  if w < 0 or w >= ram_words then
+    error("SEGFAULT: read32 at 0x" .. string.format("%08x", addr))
+  end
+  return RAM[w] or 0
 end
 
 local function ram_write32(addr, val)
-val = ux(val)
-local w = math.floor(addr / 4)
-if w < 0 or w >= ram_words then
-error("SEGFAULT: write32 at 0x" .. string.format("%08x", addr))
-end
-RAM[w] = val
+  val = ux(val)
+  local w = math.floor(addr / 4)
+  if w < 0 or w >= ram_words then
+    error("SEGFAULT: write32 at 0x" .. string.format("%08x", addr))
+  end
+  RAM[w] = val
 end
 
 local function ram_read8(addr)
-local w = math.floor(addr / 4)
-if w < 0 or w >= ram_words then
-error("SEGFAULT: read8 at 0x" .. string.format("%08x", addr))
-end
-local shift = (addr % 4) * 8
-return band(shr(RAM[w] or 0, shift), 0xFF)
+  local w = math.floor(addr / 4)
+  if w < 0 or w >= ram_words then
+    error("SEGFAULT: read8 at 0x" .. string.format("%08x", addr))
+  end
+  local shift = (addr % 4) * 8
+  return band(shr(RAM[w] or 0, shift), 0xFF)
 end
 
 local function ram_read16(addr)
-local w = math.floor(addr / 4)
-if w < 0 or w >= ram_words then
-error("SEGFAULT: read16 at 0x" .. string.format("%08x", addr))
-end
-local shift = (addr % 4) * 8
-local word = RAM[w] or 0
-if addr % 2 == 0 then
-return band(shr(word, shift), 0xFFFF)
-else
-local b0 = band(shr(word, shift), 0xFF)
-local shift2 = ((addr + 1) % 4) * 8
-local w2 = math.floor((addr + 1) / 4)
-if w2 >= ram_words then error("SEGFAULT: read16 misaligned at 0x" .. string.format("%08x", addr)) end
-local b1 = band(shr(RAM[w2] or 0, shift2), 0xFF)
-return band(bor(b0, shl(b1, 8)), 0xFFFF)
-end
+  local w = math.floor(addr / 4)
+  if w < 0 or w >= ram_words then
+    error("SEGFAULT: read16 at 0x" .. string.format("%08x", addr))
+  end
+  local shift = (addr % 4) * 8
+  local word = RAM[w] or 0
+  if addr % 2 == 0 then
+    return band(shr(word, shift), 0xFFFF)
+  else
+    -- misaligned halfword: assemble from two adjacent bytes
+    local b0 = band(shr(word, shift), 0xFF)
+    local shift2 = ((addr + 1) % 4) * 8
+    local w2 = math.floor((addr + 1) / 4)
+    if w2 >= ram_words then error("SEGFAULT: read16 misaligned at 0x" .. string.format("%08x", addr)) end
+    local b1 = band(shr(RAM[w2] or 0, shift2), 0xFF)
+    return band(bor(b0, shl(b1, 8)), 0xFFFF)
+  end
 end
 
 local function ram_write8(addr, val)
-local w = math.floor(addr / 4)
-if w < 0 or w >= ram_words then
-error("SEGFAULT: write8 at 0x" .. string.format("%08x", addr))
-end
-local shift = (addr % 4) * 8
-local mask = bnot(shl(0xFF, shift)) % 0x100000000
-RAM[w] = band(bor(RAM[w] or 0, shl(band(val, 0xFF), shift)), mask)
+  local w = math.floor(addr / 4)
+  if w < 0 or w >= ram_words then
+    error("SEGFAULT: write8 at 0x" .. string.format("%08x", addr))
+  end
+  local shift = (addr % 4) * 8
+  local mask = bnot(shl(0xFF, shift)) % 0x100000000
+  RAM[w] = band(bor(RAM[w] or 0, shl(band(val, 0xFF), shift)), mask)
 end
 
 local function ram_write16(addr, val)
-val = band(val, 0xFFFF)
-local w = math.floor(addr / 4)
-if w < 0 or w >= ram_words then
-error("SEGFAULT: write16 at 0x" .. string.format("%08x", addr))
-end
-local shift = (addr % 4) * 8
-local mask = bnot(shl(0xFFFF, shift)) % 0x100000000
-RAM[w] = band(bor(RAM[w] or 0, shl(val, shift)), mask)
+  val = band(val, 0xFFFF)
+  local w = math.floor(addr / 4)
+  if w < 0 or w >= ram_words then
+    error("SEGFAULT: write16 at 0x" .. string.format("%08x", addr))
+  end
+  local shift = (addr % 4) * 8
+  local mask = bnot(shl(0xFFFF, shift)) % 0x100000000
+  RAM[w] = band(bor(RAM[w] or 0, shl(val, shift)), mask)
 end
 
+-- Read string from guest memory (null-terminated)
 local function ram_readstr(addr, maxlen)
-maxlen = maxlen or 4096
-local chars = {}
-for i = 0, maxlen - 1 do
-local b = ram_read8(addr + i)
-if b == 0 then break end
-chars[#chars + 1] = string.char(b)
-end
-return table.concat(chars)
+  maxlen = maxlen or 4096
+  local chars = {}
+  for i = 0, maxlen - 1 do
+    local b = ram_read8(addr + i)
+    if b == 0 then break end
+    chars[#chars + 1] = string.char(b)
+  end
+  return table.concat(chars)
 end
 
+-- Write string to guest memory (with null terminator)
 local function ram_writestr(addr, str)
-for i = 1, #str do
-ram_write8(addr + i - 1, string.byte(str, i))
-end
-ram_write8(addr + #str, 0)
-return #str + 1
+  for i = 1, #str do
+    ram_write8(addr + i - 1, string.byte(str, i))
+  end
+  ram_write8(addr + #str, 0)
+  return #str + 1
 end
 
+-- Read N bytes from guest memory into Lua string
 local function ram_readbytes(addr, n)
-local t = {}
-for i = 0, n - 1 do
-t[i + 1] = string.char(ram_read8(addr + i))
-end
-return table.concat(t)
+  local t = {}
+  for i = 0, n - 1 do
+    t[i + 1] = string.char(ram_read8(addr + i))
+  end
+  return table.concat(t)
 end
 
+-- Write Lua string bytes into guest memory
 local function ram_writebytes(addr, data)
-for i = 1, #data do
-ram_write8(addr + i - 1, string.byte(data, i))
+  for i = 1, #data do
+    ram_write8(addr + i - 1, string.byte(data, i))
+  end
 end
-end
+
+-- ============================================================
+-- 4. CPU state
+-- ============================================================
 
 local NREGS = E_mode and 16 or 32
 local regs = {}
 for i = 0, NREGS - 1 do regs[i] = 0 end
 local pc = 0
 
+-- CSRs (minimal subset)
 local csr = {
-[0xC00] = 0,    [0xC01] = 0,    [0xC02] = 0,    [0xC80] = 0,    [0xC82] = 0,    [0xF14] = 0,    [0x300] = 0,  }
+  [0xC00] = 0,  -- cycle (low)
+  [0xC01] = 0,  -- time
+  [0xC02] = 0,  -- instret (low)
+  [0xC80] = 0,  -- cycle (high)
+  [0xC82] = 0,  -- instret (high)
+  [0xF14] = 0,  -- mhartid
+  [0x300] = 0,  -- mstatus
+}
 
 local function read_csr(addr)
-local v = csr[addr]
-if v ~= nil then return v end
-return 0
+  local v = csr[addr]
+  if v ~= nil then return v end
+  return 0
 end
 
 local function write_csr(addr, val)
-val = ux(val)
-if addr == 0xC00 or addr == 0xC80 or addr == 0xC02 or addr == 0xC82 or addr == 0xC01 then
-return
-end
-csr[addr] = val
+  val = ux(val)
+  -- cycle/time/instret: cycle and instret increment automatically; writes ignored
+  if addr == 0xC00 or addr == 0xC80 or addr == 0xC02 or addr == 0xC82 or addr == 0xC01 then
+    return
+  end
+  csr[addr] = val
 end
 
 local function set_reg(rd, val)
-if rd == 0 then return end
-if rd >= NREGS then error("ILLEGAL: write to x" .. rd .. " in RV32" .. (E_mode and "E" or "I")) end
-regs[rd] = ux(val)
+  if rd == 0 then return end
+  if rd >= NREGS then error("ILLEGAL: write to x" .. rd .. " in RV32" .. (E_mode and "E" or "I")) end
+  regs[rd] = ux(val)
 end
 
 local function get_reg(rs)
-if rs >= NREGS then error("ILLEGAL: read from x" .. rs .. " in RV32" .. (E_mode and "E" or "I")) end
-return regs[rs]
+  if rs >= NREGS then error("ILLEGAL: read from x" .. rs .. " in RV32" .. (E_mode and "E" or "I")) end
+  return regs[rs]
 end
 
 local function hex32(v) return string.format("0x%08x", v % 0x100000000) end
 
+-- ============================================================
+-- 5. ELF loader
+-- ============================================================
+
+-- u32 helper for phdr parsing (reads from LE phdr string)
 local function u32_from_phdr(s, pos)
-return string.byte(s, pos) + string.byte(s, pos+1) * 256
-+ string.byte(s, pos+2) * 65536 + string.byte(s, pos+3) * 16777216
+  return string.byte(s, pos) + string.byte(s, pos+1) * 256
+    + string.byte(s, pos+2) * 65536 + string.byte(s, pos+3) * 16777216
 end
 
 local elf_entry = 0
 
 local function elf_load(path)
-local fd = open(path, "r")
-if not fd then
-write(2, "rv32emu: cannot open " .. path .. "\n")
-exit(1)
+  local fd = open(path, "r")
+  if not fd then
+    write(2, "rv32emu: cannot open " .. path .. "\n")
+    exit(1)
+  end
+
+  -- Read ELF header (52 bytes for ELF32)
+  local function readn(n)
+    local parts = {}
+    local remaining = n
+    while remaining > 0 do
+      local chunk = read(fd, remaining)
+      if not chunk or #chunk == 0 then break end
+      parts[#parts + 1] = chunk
+      remaining = remaining - #chunk
+    end
+    return table.concat(parts)
+  end
+
+  local hdr = readn(52)
+  if not hdr or #hdr < 52 then
+    write(2, "rv32emu: truncated ELF header\n")
+    close(fd)
+    exit(1)
+  end
+
+  -- Validate magic
+  local magic = hdr:sub(1, 4)
+  if magic ~= "\127ELF" then
+    write(2, "rv32emu: not an ELF file\n")
+    close(fd); exit(1)
+  end
+
+  local ei_class = string.byte(hdr, 5)  -- 1=32-bit, 2=64-bit
+  local ei_data = string.byte(hdr, 6)   -- 1=LE, 2=BE
+
+  if ei_class ~= 1 then
+    write(2, "rv32emu: not a 32-bit ELF (class=" .. ei_class .. ")\n")
+    close(fd); exit(1)
+  end
+  if ei_data ~= 1 then
+    write(2, "rv32emu: not little-endian (data=" .. ei_data .. ")\n")
+    close(fd); exit(1)
+  end
+
+  -- Parse ELF32 header fields (little-endian)
+  local function u16(pos) return string.byte(hdr, pos) + string.byte(hdr, pos+1) * 256 end
+  local function u32(pos)
+    return string.byte(hdr, pos) + string.byte(hdr, pos+1) * 256
+      + string.byte(hdr, pos+2) * 65536 + string.byte(hdr, pos+3) * 16777216
+  end
+
+  local e_type = u16(17)       -- 2=ET_EXEC
+  local e_machine = u16(18)    -- 243=0xF3=RISC-V
+  local e_entry = u32(25)
+  local e_phoff = u32(29)      -- program header offset
+  local e_phnum = u16(45)      -- number of program headers
+  local e_phentsize = u16(43)  -- program header entry size
+
+  if e_type ~= 2 then
+    write(2, "rv32emu: not an executable ELF (type=" .. e_type .. ")\n")
+    close(fd); exit(1)
+  end
+  -- e_machine check: 0xF3=243 for RISC-V, but some toolchains may differ; accept any
+  if e_machine ~= 243 then
+    write(2, "rv32emu: warning: e_machine=" .. e_machine .. " (expected 243 for RISC-V)\n")
+  end
+
+  elf_entry = e_entry
+
+  -- Read program headers and load PT_LOAD segments
+  local max_addr = 0
+  for i = 0, e_phnum - 1 do
+    local off = e_phoff + i * e_phentsize
+    lseek(fd, off, "set")
+    local phdr = readn(e_phentsize)
+    if phdr and #phdr >= e_phentsize then
+      local p_type = u32_from_phdr(phdr, 1)
+      local p_offset = u32_from_phdr(phdr, 5)
+      local p_vaddr = u32_from_phdr(phdr, 9)
+      local p_filesz = u32_from_phdr(phdr, 17)
+      local p_memsz = u32_from_phdr(phdr, 21)
+
+      if p_type == 1 then  -- PT_LOAD
+        local seg_end = p_vaddr + p_memsz
+        if seg_end > max_addr then max_addr = seg_end end
+
+        -- Load segment from file
+        if p_filesz > 0 then
+          lseek(fd, p_offset, "set")
+          local segdata = readn(p_filesz)
+          if segdata and #segdata > 0 then
+            ram_writebytes(p_vaddr, segdata)
+          end
+        end
+        -- BSS: remaining p_memsz - p_filesz bytes already zero from ram_init
+      end
+    end
+  end
+
+  close(fd)
+
+  -- Ensure RAM covers loaded segments
+  if max_addr > ram_words * 4 then
+    local new_words = math.floor((max_addr + 4095) / 4096) * 1024  -- round up to 4K pages
+    if new_words > ram_limit then new_words = ram_limit end
+    for i = ram_words, new_words - 1 do RAM[i] = 0 end
+    ram_words = new_words
+  end
+
+  return elf_entry
 end
 
-local function readn(n)
-local parts = {}
-local remaining = n
-while remaining > 0 do
-local chunk = read(fd, remaining)
-if not chunk or #chunk == 0 then break end
-parts[#parts + 1] = chunk
-remaining = remaining - #chunk
-end
-return table.concat(parts)
-end
+-- ============================================================
+-- 6. Syscall shim (Linux rv32 ABI → KNUCK syscalls)
+-- ============================================================
 
-local hdr = readn(52)
-if not hdr or #hdr < 52 then
-write(2, "rv32emu: truncated ELF header\n")
-close(fd)
-exit(1)
-end
-
-local magic = hdr:sub(1, 4)
-if magic ~= "\127ELF" then
-write(2, "rv32emu: not an ELF file\n")
-close(fd); exit(1)
-end
-
-local ei_class = string.byte(hdr, 5)    local ei_data = string.byte(hdr, 6)
-if ei_class ~= 1 then
-write(2, "rv32emu: not a 32-bit ELF (class=" .. ei_class .. ")\n")
-close(fd); exit(1)
-end
-if ei_data ~= 1 then
-write(2, "rv32emu: not little-endian (data=" .. ei_data .. ")\n")
-close(fd); exit(1)
-end
-
-local function u16(pos) return string.byte(hdr, pos) + string.byte(hdr, pos+1) * 256 end
-local function u32(pos)
-return string.byte(hdr, pos) + string.byte(hdr, pos+1) * 256
-+ string.byte(hdr, pos+2) * 65536 + string.byte(hdr, pos+3) * 16777216
-end
-
-local e_type = u16(17)         local e_machine = u16(18)      local e_entry = u32(25)
-local e_phoff = u32(29)        local e_phnum = u16(45)        local e_phentsize = u16(43)
-if e_type ~= 2 then
-write(2, "rv32emu: not an executable ELF (type=" .. e_type .. ")\n")
-close(fd); exit(1)
-end
-if e_machine ~= 243 then
-write(2, "rv32emu: warning: e_machine=" .. e_machine .. " (expected 243 for RISC-V)\n")
-end
-
-elf_entry = e_entry
-
-local max_addr = 0
-for i = 0, e_phnum - 1 do
-local off = e_phoff + i * e_phentsize
-lseek(fd, off, "set")
-local phdr = readn(e_phentsize)
-if phdr and #phdr >= e_phentsize then
-local p_type = u32_from_phdr(phdr, 1)
-local p_offset = u32_from_phdr(phdr, 5)
-local p_vaddr = u32_from_phdr(phdr, 9)
-local p_filesz = u32_from_phdr(phdr, 17)
-local p_memsz = u32_from_phdr(phdr, 21)
-
-if p_type == 1 then          local seg_end = p_vaddr + p_memsz
-if seg_end > max_addr then max_addr = seg_end end
-
-if p_filesz > 0 then
-lseek(fd, p_offset, "set")
-local segdata = readn(p_filesz)
-if segdata and #segdata > 0 then
-ram_writebytes(p_vaddr, segdata)
-end
-end
-end
-end
-end
-
-close(fd)
-
-if max_addr > ram_words * 4 then
-local new_words = math.floor((max_addr + 4095) / 4096) * 1024      if new_words > ram_limit then new_words = ram_limit end
-for i = ram_words, new_words - 1 do RAM[i] = 0 end
-ram_words = new_words
-end
-
-return elf_entry
-end
-
+-- Syscall: write string to stderr
 local function stderr(msg)
-local s = tostring(msg)
-write(2, s)
+  local s = tostring(msg)
+  write(2, s)
 end
 
 local function do_syscall(nr, a0, a1, a2, a3, a4, a5)
-nr = nr % 0x100000000
-a0 = ux(a0); a1 = ux(a1); a2 = ux(a2)
-a3 = ux(a3); a4 = ux(a4); a5 = ux(a5)
+  nr = nr % 0x100000000
+  a0 = ux(a0); a1 = ux(a1); a2 = ux(a2)
+  a3 = ux(a3); a4 = ux(a4); a5 = ux(a5)
 
-if nr == 93 then
-exit(a0 % 256)
+  if nr == 93 then
+    -- exit(code)
+    exit(a0 % 256)
 
-elseif nr == 94 then
-exit(a0 % 256)
+  elseif nr == 94 then
+    -- exit_group(code)
+    exit(a0 % 256)
 
-elseif nr == 63 then
-local data = read(a0, a1)
-if data and #data > 0 then
-ram_writebytes(a2, data)
-return #data
+  elseif nr == 63 then
+    -- read(fd, buf, count) → bytes read
+    local data = read(a0, a1)
+    if data and #data > 0 then
+      ram_writebytes(a2, data)
+      return #data
+    end
+    return 0
+
+  elseif nr == 64 then
+    -- write(fd, buf, count) → bytes written
+    local data = ram_readbytes(a1, a2)
+    local n = write(a0, data)
+    return n or 0
+
+  elseif nr == 57 then
+    -- close(fd)
+    close(a0)
+    return 0
+
+  elseif nr == 56 then
+    -- openat(dirfd, path, flags, mode) → fd
+    local path = ram_readstr(a1)
+    -- Simplified: map Linux flags to KNUCK string modes
+    local flags_val = a2 % 0x100000000
+    local mode = "r"
+    local acc = flags_val % 8
+    if acc == 1 then mode = "w"
+    elseif acc == 2 then mode = "r"
+    end
+    local fd = open(path, mode)
+    if not fd then return -1 end  -- ENOENT
+    return fd
+
+  elseif nr == 62 then
+    -- lseek(fd, offset, whence)
+    local whence = "set"
+    if a2 == 1 then whence = "cur"
+    elseif a2 == 2 then whence = "end"
+    end
+    return lseek(a0, sx32(a1), whence)
+
+  elseif nr == 214 then
+    -- brk(addr) — grow heap
+    local new_end = a0
+    if new_end == 0 then
+      return ram_words * 4
+    end
+    if new_end > ram_words * 4 then
+      local new_words = math.floor((new_end + 4095) / 4096) * 1024
+      if new_words > ram_limit then new_words = ram_limit end
+      for i = ram_words, new_words - 1 do RAM[i] = 0 end
+      ram_words = new_words
+    end
+    return ram_words * 4
+
+  elseif nr == 172 then
+    -- getpid()
+    return getpid()
+
+  elseif nr == 174 then
+    return getuid()
+  elseif nr == 175 then
+    return geteuid()
+  elseif nr == 176 then
+    return getgid()
+  elseif nr == 177 then
+    return getegid()
+
+  elseif nr == 160 then
+    -- uname(buf) — write static info to guest memory
+    local names = { "KNUCK", "rv32emu", "1.0.0", "1", "RISC-V rv32" .. (E_mode and "e" or "i"), "" }
+    local offset = 0
+    for _, field in ipairs(names) do
+      local padded = field .. string.rep("\0", 65 - #field)
+      ram_writebytes(a0 + offset, padded)
+      offset = offset + 65
+    end
+    return 0
+
+  elseif nr == 113 then
+    -- clock_gettime(clk_id, tp)
+    local secs, nsecs = clock_gettime(a0)
+    -- Write struct timespec { tv_sec, tv_nsec } to guest memory
+    ram_write32(a1, secs)
+    ram_write32(a1 + 4, nsecs or 0)
+    return 0
+
+  elseif nr == 169 then
+    -- gettimeofday(tv, tz) — simplified
+    local secs = time()
+    ram_write32(a0, secs)
+    ram_write32(a0 + 4, 0)  -- usec
+    return 0
+
+  elseif nr == 124 then
+    -- sched_yield()
+    sched_yield()
+    return 0
+
+  elseif nr == 80 then
+    -- fstat(fd, statbuf) — minimal stub
+    local info = fstat(a0)
+    -- Write minimal stat: st_dev=0, st_ino=0, st_mode, st_nlink=1, st_uid, st_gid, st_rdev=0, st_size, ...
+    ram_write32(a1, 0)           -- st_dev
+    ram_write32(a1 + 4, 0)      -- st_ino
+    ram_write32(a1 + 8, 0x81A4) -- st_mode (S_IFREG | 0644)
+    ram_write32(a1 + 12, 1)     -- st_nlink
+    ram_write32(a1 + 16, getuid())  -- st_uid
+    ram_write32(a1 + 20, getgid())  -- st_gid
+    ram_write32(a1 + 24, 0)     -- st_rdev
+    ram_write32(a1 + 28, (info and info.size) or 0)  -- st_size
+    return 0
+
+  elseif nr == 78 then
+    -- readlinkat(dirfd, path, buf, bufsz)
+    local path = ram_readstr(a1)
+    local target = readlink(path)
+    if target then
+      local n = math.min(#target, a3)
+      ram_writebytes(a2, target:sub(1, n))
+      return n
+    end
+    return -2  -- ENOENT
+
+  elseif nr == 222 then
+    -- mmap — simplified: just bump brk
+    -- addr=a0, length=a1, prot=a2, flags=a3, fd=a4, off=a5
+    local len = a1
+    local old_end = ram_words * 4
+    local new_end = old_end + len
+    if new_end > ram_words * 4 then
+      local new_words = math.floor((new_end + 4095) / 4096) * 1024
+      if new_words > ram_limit then new_words = ram_limit end
+      for i = ram_words, new_words - 1 do RAM[i] = 0 end
+      ram_words = new_words
+    end
+    return old_end
+
+  else
+    -- Unknown syscall
+    stderr("rv32emu: unknown syscall " .. nr .. "\n")
+    return -38  -- ENOSYS
+  end
+
+  return 0
 end
-return 0
 
-elseif nr == 64 then
-local data = ram_readbytes(a1, a2)
-local n = write(a0, data)
-return n or 0
-
-elseif nr == 57 then
-close(a0)
-return 0
-
-elseif nr == 56 then
-local path = ram_readstr(a1)
-local flags_val = a2 % 0x100000000
-local mode = "r"
-local acc = flags_val % 8
-if acc == 1 then mode = "w"
-elseif acc == 2 then mode = "r"
-end
-local fd = open(path, mode)
-if not fd then return -1 end      return fd
-
-elseif nr == 62 then
-local whence = "set"
-if a2 == 1 then whence = "cur"
-elseif a2 == 2 then whence = "end"
-end
-return lseek(a0, sx32(a1), whence)
-
-elseif nr == 214 then
-local new_end = a0
-if new_end == 0 then
-return ram_words * 4
-end
-if new_end > ram_words * 4 then
-local new_words = math.floor((new_end + 4095) / 4096) * 1024
-if new_words > ram_limit then new_words = ram_limit end
-for i = ram_words, new_words - 1 do RAM[i] = 0 end
-ram_words = new_words
-end
-return ram_words * 4
-
-elseif nr == 172 then
-return getpid()
-
-elseif nr == 174 then
-return getuid()
-elseif nr == 175 then
-return geteuid()
-elseif nr == 176 then
-return getgid()
-elseif nr == 177 then
-return getegid()
-
-elseif nr == 160 then
-local names = { "KNUCK", "rv32emu", "1.0.0", "1", "RISC-V rv32" .. (E_mode and "e" or "i"), "" }
-local offset = 0
-for _, field in ipairs(names) do
-local padded = field .. string.rep("\0", 65 - #field)
-ram_writebytes(a0 + offset, padded)
-offset = offset + 65
-end
-return 0
-
-elseif nr == 113 then
-local secs, nsecs = clock_gettime(a0)
-ram_write32(a1, secs)
-ram_write32(a1 + 4, nsecs or 0)
-return 0
-
-elseif nr == 169 then
-local secs = time()
-ram_write32(a0, secs)
-ram_write32(a0 + 4, 0)      return 0
-
-elseif nr == 124 then
-sched_yield()
-return 0
-
-elseif nr == 80 then
-local info = fstat(a0)
-ram_write32(a1, 0)               ram_write32(a1 + 4, 0)          ram_write32(a1 + 8, 0x81A4)     ram_write32(a1 + 12, 1)         ram_write32(a1 + 16, getuid())      ram_write32(a1 + 20, getgid())      ram_write32(a1 + 24, 0)         ram_write32(a1 + 28, (info and info.size) or 0)      return 0
-
-elseif nr == 78 then
-local path = ram_readstr(a1)
-local target = readlink(path)
-if target then
-local n = math.min(#target, a3)
-ram_writebytes(a2, target:sub(1, n))
-return n
-end
-return -2
-elseif nr == 222 then
-local len = a1
-local old_end = ram_words * 4
-local new_end = old_end + len
-if new_end > ram_words * 4 then
-local new_words = math.floor((new_end + 4095) / 4096) * 1024
-if new_words > ram_limit then new_words = ram_limit end
-for i = ram_words, new_words - 1 do RAM[i] = 0 end
-ram_words = new_words
-end
-return old_end
-
-else
-stderr("rv32emu: unknown syscall " .. nr .. "\n")
-return -38    end
-
-return 0
-end
+-- ============================================================
+-- 7. Instruction decoder and execution
+-- ============================================================
 
 local function fetch32(addr)
-return ram_read32(addr)
+  return ram_read32(addr)
 end
 
 local function execute(insn)
-local opcode = band(insn, 0x7F)
-local rd     = band(shr(insn, 7), 0x1F)
-local funct3 = band(shr(insn, 12), 0x7)
-local rs1    = band(shr(insn, 15), 0x1F)
-local rs2    = band(shr(insn, 20), 0x1F)
-local funct7 = band(shr(insn, 25), 0x7F)
-local funct10 = bor(shl(funct7, 3), funct3)
-local imm_i = sx32(shr(insn, 20))    local imm_s = sx32(bor(
-band(shr(insn, 7), 0x1F),
-shl(band(shr(insn, 25), 0x7F), 5)
-))
-local imm_b = sx32(bor(
-shl(band(shr(insn, 8), 0xF), 1),
-shl(band(shr(insn, 25), 0x3F), 5),
-shl(band(shr(insn, 7), 0x1), 11),
-shl(band(shr(insn, 31), 0x1), 12)
-))
-local imm_u = shl(band(insn, 0xFFFFF000), 0)    imm_u = band(insn, 0xFFFFF000)
-local imm_j = sx32(bor(
-shl(band(shr(insn, 21), 0x3FF), 1),
-shl(band(shr(insn, 20), 0x1), 11),
-shl(band(shr(insn, 12), 0xFF), 12),
-shl(band(shr(insn, 31), 0x1), 20)
-))
+  local opcode = band(insn, 0x7F)
+  local rd     = band(shr(insn, 7), 0x1F)
+  local funct3 = band(shr(insn, 12), 0x7)
+  local rs1    = band(shr(insn, 15), 0x1F)
+  local rs2    = band(shr(insn, 20), 0x1F)
+  local funct7 = band(shr(insn, 25), 0x7F)
+  local funct10 = bor(shl(funct7, 3), funct3)  -- for R-type decode
 
-local rs1v = get_reg(rs1)
-local rs2v = get_reg(rs2)
-local next_pc = pc + 4
-if opcode == 0x37 then
-set_reg(rd, imm_u)
+  -- Immediate extraction
+  local imm_i = sx32(shr(insn, 20))  -- I-type: sign-extended
+  local imm_s = sx32(bor(
+    band(shr(insn, 7), 0x1F),
+    shl(band(shr(insn, 25), 0x7F), 5)
+  ))
+  local imm_b = sx32(bor(
+    shl(band(shr(insn, 8), 0xF), 1),
+    shl(band(shr(insn, 25), 0x3F), 5),
+    shl(band(shr(insn, 7), 0x1), 11),
+    shl(band(shr(insn, 31), 0x1), 12)
+  ))
+  local imm_u = shl(band(insn, 0xFFFFF000), 0)  -- upper 20 bits
+  imm_u = band(insn, 0xFFFFF000)
+  local imm_j = sx32(bor(
+    shl(band(shr(insn, 21), 0x3FF), 1),
+    shl(band(shr(insn, 20), 0x1), 11),
+    shl(band(shr(insn, 12), 0xFF), 12),
+    shl(band(shr(insn, 31), 0x1), 20)
+  ))
 
-elseif opcode == 0x17 then
-set_reg(rd, ux(pc + imm_u))
+  local rs1v = get_reg(rs1)
+  local rs2v = get_reg(rs2)
+  local next_pc = pc + 4  -- default: advance to next instruction
 
-elseif opcode == 0x6F then
-set_reg(rd, next_pc)
-next_pc = ux(pc + imm_j)
+  if opcode == 0x37 then
+    -- LUI: rd = imm_u
+    set_reg(rd, imm_u)
 
-elseif opcode == 0x67 then
-set_reg(rd, next_pc)
-next_pc = band(ux(rs1v + imm_i), bnot(1)) % 0x100000000
+  elseif opcode == 0x17 then
+    -- AUIPC: rd = pc + imm_u
+    set_reg(rd, ux(pc + imm_u))
 
-elseif opcode == 0x63 then
-local take = false
-if funct3 == 0x0 then             take = (rs1v == rs2v)
-elseif funct3 == 0x1 then         take = (rs1v ~= rs2v)
-elseif funct3 == 0x4 then         take = (sx32(rs1v) < sx32(rs2v))
-elseif funct3 == 0x5 then         take = (sx32(rs1v) >= sx32(rs2v))
-elseif funct3 == 0x6 then         take = (rs1v < rs2v)
-elseif funct3 == 0x7 then         take = (rs1v >= rs2v)
+  elseif opcode == 0x6F then
+    -- JAL: rd = pc+4; pc = pc + imm_j
+    set_reg(rd, next_pc)
+    next_pc = ux(pc + imm_j)
+
+  elseif opcode == 0x67 then
+    -- JALR: rd = pc+4; pc = (rs1 + imm_i) & ~1
+    set_reg(rd, next_pc)
+    next_pc = band(ux(rs1v + imm_i), bnot(1)) % 0x100000000
+
+  elseif opcode == 0x63 then
+    -- Branch instructions
+    local take = false
+    if funct3 == 0x0 then       -- BEQ
+      take = (rs1v == rs2v)
+    elseif funct3 == 0x1 then   -- BNE
+      take = (rs1v ~= rs2v)
+    elseif funct3 == 0x4 then   -- BLT
+      take = (sx32(rs1v) < sx32(rs2v))
+    elseif funct3 == 0x5 then   -- BGE
+      take = (sx32(rs1v) >= sx32(rs2v))
+    elseif funct3 == 0x6 then   -- BLTU
+      take = (rs1v < rs2v)
+    elseif funct3 == 0x7 then   -- BGEU
+      take = (rs1v >= rs2v)
+    end
+    if take then next_pc = ux(pc + imm_b) end
+
+  elseif opcode == 0x03 then
+    -- Load instructions
+    local addr = ux(rs1v + imm_i)
+    if funct3 == 0x0 then       -- LB
+      set_reg(rd, sx(ram_read8(addr), 8))
+    elseif funct3 == 0x1 then   -- LH
+      set_reg(rd, sx(ram_read16(addr), 16))
+    elseif funct3 == 0x2 then   -- LW
+      set_reg(rd, ram_read32(addr))
+    elseif funct3 == 0x4 then   -- LBU
+      set_reg(rd, ram_read8(addr))
+    elseif funct3 == 0x5 then   -- LHU
+      set_reg(rd, ram_read16(addr))
+    end
+
+  elseif opcode == 0x23 then
+    -- Store instructions
+    local addr = ux(rs1v + imm_s)
+    if funct3 == 0x0 then       -- SB
+      ram_write8(addr, rs2v)
+    elseif funct3 == 0x1 then   -- SH
+      ram_write16(addr, rs2v)
+    elseif funct3 == 0x2 then   -- SW
+      ram_write32(addr, rs2v)
+    end
+
+  elseif opcode == 0x13 then
+    -- ALU immediate
+    local shamt = band(shr(insn, 20), 0x1F)
+    if funct3 == 0x0 then       -- ADDI
+      set_reg(rd, ux(rs1v + imm_i))
+    elseif funct3 == 0x1 then   -- SLLI
+      set_reg(rd, shl(rs1v, shamt))
+    elseif funct3 == 0x2 then   -- SLTI
+      set_reg(rd, (sx32(rs1v) < sx32(imm_i)) and 1 or 0)
+    elseif funct3 == 0x3 then   -- SLTIU
+      set_reg(rd, (rs1v < ux(imm_i)) and 1 or 0)
+    elseif funct3 == 0x4 then   -- XORI
+      set_reg(rd, bxor(rs1v, ux(imm_i)))
+    elseif funct3 == 0x5 then   -- SRLI / SRAI
+      if funct7 == 0x00 then    -- SRLI
+        set_reg(rd, shr(rs1v, shamt))
+      elseif funct7 == 0x20 then -- SRAI
+        set_reg(rd, arshift(rs1v, shamt))
+      end
+    elseif funct3 == 0x6 then   -- ORI
+      set_reg(rd, bor(rs1v, ux(imm_i)))
+    elseif funct3 == 0x7 then   -- ANDI
+      set_reg(rd, band(rs1v, ux(imm_i)))
+    end
+
+  elseif opcode == 0x33 then
+    -- Register-register ALU / M extension
+    if funct7 == 0x00 then
+      -- Base RV32I register ops
+      if funct3 == 0x0 then       -- ADD
+        set_reg(rd, ux(rs1v + rs2v))
+      elseif funct3 == 0x1 then   -- SLL
+        set_reg(rd, shl(rs1v, band(rs2v, 0x1F)))
+      elseif funct3 == 0x2 then   -- SLT
+        set_reg(rd, (sx32(rs1v) < sx32(rs2v)) and 1 or 0)
+      elseif funct3 == 0x3 then   -- SLTU
+        set_reg(rd, (rs1v < rs2v) and 1 or 0)
+      elseif funct3 == 0x4 then   -- XOR
+        set_reg(rd, bxor(rs1v, rs2v))
+      elseif funct3 == 0x5 then   -- SRL
+        set_reg(rd, shr(rs1v, band(rs2v, 0x1F)))
+      elseif funct3 == 0x6 then   -- OR
+        set_reg(rd, bor(rs1v, rs2v))
+      elseif funct3 == 0x7 then   -- AND
+        set_reg(rd, band(rs1v, rs2v))
+      end
+
+    elseif funct7 == 0x20 then
+      -- SUB / SRA
+      if funct3 == 0x0 then       -- SUB
+        set_reg(rd, ux(rs1v - rs2v))
+      elseif funct3 == 0x5 then   -- SRA
+        set_reg(rd, arshift(rs1v, band(rs2v, 0x1F)))
+      end
+
+    elseif funct7 == 0x01 then
+      -- M extension
+      if funct3 == 0x0 then       -- MUL
+        set_reg(rd, mul32lo(rs1v, rs2v))
+      elseif funct3 == 0x1 then   -- MULH (signed x signed, upper 32)
+        set_reg(rd, mul32hi_ss(rs1v, rs2v))
+      elseif funct3 == 0x2 then   -- MULHSU (signed x unsigned, upper 32)
+        set_reg(rd, mul32hi_su(rs1v, rs2v))
+      elseif funct3 == 0x3 then   -- MULHU (unsigned x unsigned, upper 32)
+        set_reg(rd, mul32hi_uu(rs1v, rs2v))
+      elseif funct3 == 0x4 then   -- DIV
+        local dividend = sx32(rs1v)
+        local divisor = sx32(rs2v)
+        local quot
+        if divisor == 0 then
+          quot = -1  -- 0xFFFFFFFF
+        elseif dividend == -2147483648 and divisor == -1 then
+          quot = -2147483648  -- overflow
+        else
+          quot = math.floor(dividend / divisor)
+        end
+        set_reg(rd, ux(quot))
+      elseif funct3 == 0x5 then   -- DIVU
+        if rs2v == 0 then
+          set_reg(rd, 0xFFFFFFFF)
+        else
+          set_reg(rd, math.floor(rs1v / rs2v))
+        end
+      elseif funct3 == 0x6 then   -- REM
+        local dividend = sx32(rs1v)
+        local divisor = sx32(rs2v)
+        local rem
+        if divisor == 0 then
+          rem = dividend
+        elseif dividend == -2147483648 and divisor == -1 then
+          rem = 0
+        else
+          rem = dividend - math.floor(dividend / divisor) * divisor
+        end
+        set_reg(rd, ux(rem))
+      elseif funct3 == 0x7 then   -- REMU
+        if rs2v == 0 then
+          set_reg(rd, rs1v)
+        else
+          set_reg(rd, rs1v % rs2v)
+        end
+      end
+    end
+
+  elseif opcode == 0x0F then
+    -- FENCE / FENCE.I — no-op on single-hart emulator
+    -- (could add memory barrier semantics if needed)
+
+  elseif opcode == 0x73 then
+    -- System instructions
+    if funct3 == 0x0 then
+      -- ECALL / EBREAK / CSR instructions
+      if funct7 == 0x00 and rs2 == 0 then
+        -- ECALL
+        local a7 = get_reg(17)
+        local a0_val = get_reg(10)
+        local a1_val = get_reg(11)
+        local a2_val = get_reg(12)
+        local a3_val = get_reg(13)
+        local a4_val = get_reg(14)
+        local a5_val = get_reg(15)
+        local result = do_syscall(a7, a0_val, a1_val, a2_val, a3_val, a4_val, a5_val)
+        set_reg(10, ux(result))
+      elseif funct7 == 0x01 then
+        -- EBREAK
+        stderr(string.format("rv32emu: EBREAK at pc=%s insn=%s\n", hex32(pc), hex32(insn)))
+        exit(133)
+      elseif funct7 == 0x09 then
+        -- SRET — return from supervisor mode trap (treat as NOP or error)
+        stderr("rv32emu: SRET not implemented\n")
+        exit(133)
+      elseif funct7 == 0x11 then
+        -- MRET — return from machine mode trap (treat as NOP for now)
+        stderr("rv32emu: MRET not implemented\n")
+        exit(133)
+      end
+
+    elseif funct3 == 0x1 then
+      -- CSRRW
+      local old = read_csr(imm_i % 0x1000)
+      write_csr(imm_i % 0x1000, rs1v)
+      set_reg(rd, old)
+
+    elseif funct3 == 0x2 then
+      -- CSRRS
+      local old = read_csr(imm_i % 0x1000)
+      if rs ~= 0 then write_csr(imm_i % 0x1000, bor(old, rs1v)) end
+      set_reg(rd, old)
+
+    elseif funct3 == 0x3 then
+      -- CSRRC
+      local old = read_csr(imm_i % 0x1000)
+      if rs1 ~= 0 then write_csr(imm_i % 0x1000, band(old, bnot(rs1v))) end
+      set_reg(rd, old)
+
+    elseif funct3 == 0x5 then
+      -- CSRRWI
+      local old = read_csr(imm_i % 0x1000)
+      write_csr(imm_i % 0x1000, rs1)
+      set_reg(rd, old)
+
+    elseif funct3 == 0x6 then
+      -- CSRRSI
+      local old = read_csr(imm_i % 0x1000)
+      if rs1 ~= 0 then write_csr(imm_i % 0x1000, bor(old, rs1)) end
+      set_reg(rd, old)
+
+    elseif funct3 == 0x7 then
+      -- CSRRCI
+      local old = read_csr(imm_i % 0x1000)
+      if rs1 ~= 0 then write_csr(imm_i % 0x1000, band(old, bnot(rs1))) end
+      set_reg(rd, old)
+    end
+
+  else
+    stderr(string.format("rv32emu: illegal opcode 0x%02x at pc=%s\n", opcode, hex32(pc)))
+    exit(132)
+  end
+
+  -- Increment cycle counters
+  csr[0xC00] = (csr[0xC00] + 1) % 0x100000000
+  csr[0xC02] = (csr[0xC02] + 1) % 0x100000000
+  if csr[0xC00] == 0 then csr[0xC80] = (csr[0xC80] + 1) % 0x100000000 end
+  if csr[0xC02] == 0 then csr[0xC82] = (csr[0xC82] + 1) % 0x100000000 end
+
+  return next_pc
 end
-if take then next_pc = ux(pc + imm_b) end
 
-elseif opcode == 0x03 then
-local addr = ux(rs1v + imm_i)
-if funct3 == 0x0 then             set_reg(rd, sx(ram_read8(addr), 8))
-elseif funct3 == 0x1 then         set_reg(rd, sx(ram_read16(addr), 16))
-elseif funct3 == 0x2 then         set_reg(rd, ram_read32(addr))
-elseif funct3 == 0x4 then         set_reg(rd, ram_read8(addr))
-elseif funct3 == 0x5 then         set_reg(rd, ram_read16(addr))
-end
+-- ============================================================
+-- 8. Main execution loop
+-- ============================================================
 
-elseif opcode == 0x23 then
-local addr = ux(rs1v + imm_s)
-if funct3 == 0x0 then             ram_write8(addr, rs2v)
-elseif funct3 == 0x1 then         ram_write16(addr, rs2v)
-elseif funct3 == 0x2 then         ram_write32(addr, rs2v)
-end
-
-elseif opcode == 0x13 then
-local shamt = band(shr(insn, 20), 0x1F)
-if funct3 == 0x0 then             set_reg(rd, ux(rs1v + imm_i))
-elseif funct3 == 0x1 then         set_reg(rd, shl(rs1v, shamt))
-elseif funct3 == 0x2 then         set_reg(rd, (sx32(rs1v) < sx32(imm_i)) and 1 or 0)
-elseif funct3 == 0x3 then         set_reg(rd, (rs1v < ux(imm_i)) and 1 or 0)
-elseif funct3 == 0x4 then         set_reg(rd, bxor(rs1v, ux(imm_i)))
-elseif funct3 == 0x5 then         if funct7 == 0x00 then            set_reg(rd, shr(rs1v, shamt))
-elseif funct7 == 0x20 then         set_reg(rd, arshift(rs1v, shamt))
-end
-elseif funct3 == 0x6 then         set_reg(rd, bor(rs1v, ux(imm_i)))
-elseif funct3 == 0x7 then         set_reg(rd, band(rs1v, ux(imm_i)))
-end
-
-elseif opcode == 0x33 then
-if funct7 == 0x00 then
-if funct3 == 0x0 then               set_reg(rd, ux(rs1v + rs2v))
-elseif funct3 == 0x1 then           set_reg(rd, shl(rs1v, band(rs2v, 0x1F)))
-elseif funct3 == 0x2 then           set_reg(rd, (sx32(rs1v) < sx32(rs2v)) and 1 or 0)
-elseif funct3 == 0x3 then           set_reg(rd, (rs1v < rs2v) and 1 or 0)
-elseif funct3 == 0x4 then           set_reg(rd, bxor(rs1v, rs2v))
-elseif funct3 == 0x5 then           set_reg(rd, shr(rs1v, band(rs2v, 0x1F)))
-elseif funct3 == 0x6 then           set_reg(rd, bor(rs1v, rs2v))
-elseif funct3 == 0x7 then           set_reg(rd, band(rs1v, rs2v))
-end
-
-elseif funct7 == 0x20 then
-if funct3 == 0x0 then               set_reg(rd, ux(rs1v - rs2v))
-elseif funct3 == 0x5 then           set_reg(rd, arshift(rs1v, band(rs2v, 0x1F)))
-end
-
-elseif funct7 == 0x01 then
-if funct3 == 0x0 then               set_reg(rd, mul32lo(rs1v, rs2v))
-elseif funct3 == 0x1 then           set_reg(rd, mul32hi_ss(rs1v, rs2v))
-elseif funct3 == 0x2 then           set_reg(rd, mul32hi_su(rs1v, rs2v))
-elseif funct3 == 0x3 then           set_reg(rd, mul32hi_uu(rs1v, rs2v))
-elseif funct3 == 0x4 then           local dividend = sx32(rs1v)
-local divisor = sx32(rs2v)
-local quot
-if divisor == 0 then
-quot = -1          elseif dividend == -2147483648 and divisor == -1 then
-quot = -2147483648          else
-quot = math.floor(dividend / divisor)
-end
-set_reg(rd, ux(quot))
-elseif funct3 == 0x5 then           if rs2v == 0 then
-set_reg(rd, 0xFFFFFFFF)
-else
-set_reg(rd, math.floor(rs1v / rs2v))
-end
-elseif funct3 == 0x6 then           local dividend = sx32(rs1v)
-local divisor = sx32(rs2v)
-local rem
-if divisor == 0 then
-rem = dividend
-elseif dividend == -2147483648 and divisor == -1 then
-rem = 0
-else
-rem = dividend - math.floor(dividend / divisor) * divisor
-end
-set_reg(rd, ux(rem))
-elseif funct3 == 0x7 then           if rs2v == 0 then
-set_reg(rd, rs1v)
-else
-set_reg(rd, rs1v % rs2v)
-end
-end
-end
-
-elseif opcode == 0x0F then
-
-elseif opcode == 0x73 then
-if funct3 == 0x0 then
-if funct7 == 0x00 and rs2 == 0 then
-local a7 = get_reg(17)
-local a0_val = get_reg(10)
-local a1_val = get_reg(11)
-local a2_val = get_reg(12)
-local a3_val = get_reg(13)
-local a4_val = get_reg(14)
-local a5_val = get_reg(15)
-local result = do_syscall(a7, a0_val, a1_val, a2_val, a3_val, a4_val, a5_val)
-set_reg(10, ux(result))
-elseif funct7 == 0x01 then
-stderr(string.format("rv32emu: EBREAK at pc=%s insn=%s\n", hex32(pc), hex32(insn)))
-exit(133)
-elseif funct7 == 0x09 then
-stderr("rv32emu: SRET not implemented\n")
-exit(133)
-elseif funct7 == 0x11 then
-stderr("rv32emu: MRET not implemented\n")
-exit(133)
-end
-
-elseif funct3 == 0x1 then
-local old = read_csr(imm_i % 0x1000)
-write_csr(imm_i % 0x1000, rs1v)
-set_reg(rd, old)
-
-elseif funct3 == 0x2 then
-local old = read_csr(imm_i % 0x1000)
-if rs ~= 0 then write_csr(imm_i % 0x1000, bor(old, rs1v)) end
-set_reg(rd, old)
-
-elseif funct3 == 0x3 then
-local old = read_csr(imm_i % 0x1000)
-if rs1 ~= 0 then write_csr(imm_i % 0x1000, band(old, bnot(rs1v))) end
-set_reg(rd, old)
-
-elseif funct3 == 0x5 then
-local old = read_csr(imm_i % 0x1000)
-write_csr(imm_i % 0x1000, rs1)
-set_reg(rd, old)
-
-elseif funct3 == 0x6 then
-local old = read_csr(imm_i % 0x1000)
-if rs1 ~= 0 then write_csr(imm_i % 0x1000, bor(old, rs1)) end
-set_reg(rd, old)
-
-elseif funct3 == 0x7 then
-local old = read_csr(imm_i % 0x1000)
-if rs1 ~= 0 then write_csr(imm_i % 0x1000, band(old, bnot(rs1))) end
-set_reg(rd, old)
-end
-
-else
-stderr(string.format("rv32emu: illegal opcode 0x%02x at pc=%s\n", opcode, hex32(pc)))
-exit(132)
-end
-
-csr[0xC00] = (csr[0xC00] + 1) % 0x100000000
-csr[0xC02] = (csr[0xC02] + 1) % 0x100000000
-if csr[0xC00] == 0 then csr[0xC80] = (csr[0xC80] + 1) % 0x100000000 end
-if csr[0xC02] == 0 then csr[0xC82] = (csr[0xC82] + 1) % 0x100000000 end
-
-return next_pc
-end
-
+-- Initialize memory
 ram_init(ram_size)
 
+-- Load binary
 if raw_mode then
-local fd = open(binary_path, "r")
-if not fd then
-write(2, "rv32emu: cannot open " .. binary_path .. "\n")
-exit(1)
-end
-local data = read(fd, 0)    close(fd)
-if data and #data > 0 then
-ram_writebytes(load_addr, data)
-local end_addr = load_addr + #data
-if end_addr > ram_words * 4 then
-local new_words = math.floor((end_addr + 4095) / 4096) * 1024
-if new_words > ram_limit then new_words = ram_limit end
-for i = ram_words, new_words - 1 do RAM[i] = 0 end
-ram_words = new_words
-end
-end
-elf_entry = load_addr
+  -- Raw binary mode: load at load_addr
+  local fd = open(binary_path, "r")
+  if not fd then
+    write(2, "rv32emu: cannot open " .. binary_path .. "\n")
+    exit(1)
+  end
+  local data = read(fd, 0)  -- read all
+  close(fd)
+  if data and #data > 0 then
+    ram_writebytes(load_addr, data)
+    -- Ensure RAM covers the loaded data
+    local end_addr = load_addr + #data
+    if end_addr > ram_words * 4 then
+      local new_words = math.floor((end_addr + 4095) / 4096) * 1024
+      if new_words > ram_limit then new_words = ram_limit end
+      for i = ram_words, new_words - 1 do RAM[i] = 0 end
+      ram_words = new_words
+    end
+  end
+  elf_entry = load_addr
 else
-elf_entry = elf_load(binary_path)
+  -- ELF mode
+  elf_entry = elf_load(binary_path)
 end
 
+-- Set up initial state
 pc = elf_entry
 
-local stack_base = ram_words * 4 - 256  regs[2] = stack_base + 256
-local str_area = stack_base + 128  local argv_ptrs = {}
+-- Place argc/argv on stack (RISC-V calling convention)
+-- Stack grows down; place at top of RAM
+local stack_base = ram_words * 4 - 256  -- reserve 256 bytes for stack setup
+regs[2] = stack_base + 256  -- sp (x2) = top of stack
 
+-- Push program name and args as strings, build argv array
+local str_area = stack_base + 128  -- strings go here
+local argv_ptrs = {}
+
+-- argv[0] = program name
 local name_str = binary_path:match("([^/]+)$") or binary_path
 local name_ptr = str_area
 ram_writestr(name_ptr, name_str)
 argv_ptrs[#argv_ptrs + 1] = name_ptr
 str_area = str_area + #name_str + 1
 
+-- remaining guest_args
 for _, ga in ipairs(guest_args) do
-local ptr = str_area
-ram_writestr(ptr, ga)
-argv_ptrs[#argv_ptrs + 1] = ptr
-str_area = str_area + #ga + 1
+  local ptr = str_area
+  ram_writestr(ptr, ga)
+  argv_ptrs[#argv_ptrs + 1] = ptr
+  str_area = str_area + #ga + 1
 end
 
-ram_write32(stack_base, #argv_ptrs)  for i, ptr in ipairs(argv_ptrs) do
-ram_write32(stack_base + 4 + (i - 1) * 4, ptr)
+-- Place argc and argv pointers on stack
+ram_write32(stack_base, #argv_ptrs)  -- argc
+for i, ptr in ipairs(argv_ptrs) do
+  ram_write32(stack_base + 4 + (i - 1) * 4, ptr)
 end
-ram_write32(stack_base + 4 + #argv_ptrs * 4, 0)
-set_reg(10, #argv_ptrs)   set_reg(11, stack_base + 4)
+ram_write32(stack_base + 4 + #argv_ptrs * 4, 0)  -- NULL terminator for argv
+
+-- a0 = argc, a1 = argv (for main)
+set_reg(10, #argv_ptrs)   -- a0 = argc
+set_reg(11, stack_base + 4)  -- a1 = &argv[0]
+
+-- Execute
 local running = true
 local count = 0
 
 while running do
-local ok, err = pcall(function()
-local burst_count = 0
-while burst_count < BURST do
-local insn = fetch32(pc)
-if insn == 0 then
-stderr(string.format("rv32emu: execution ended at pc=%s (zero insn)\n", hex32(pc)))
-running = false
-return
-end
-pc = execute(insn)
-burst_count = burst_count + 1
-count = count + 1
-end
-sched_yield()
-end)
-if not ok then
-stderr("rv32emu: " .. tostring(err) .. "\n")
-exit(132)
-end
+  local ok, err = pcall(function()
+    local burst_count = 0
+    while burst_count < BURST do
+      local insn = fetch32(pc)
+      if insn == 0 then
+        -- NOP or end of code — could be zero padding or halt
+        stderr(string.format("rv32emu: execution ended at pc=%s (zero insn)\n", hex32(pc)))
+        running = false
+        return
+      end
+      pc = execute(insn)
+      burst_count = burst_count + 1
+      count = count + 1
+    end
+    -- Yield to scheduler
+    sched_yield()
+  end)
+  if not ok then
+    stderr("rv32emu: " .. tostring(err) .. "\n")
+    exit(132)
+  end
 end
 
 exit(0)

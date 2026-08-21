@@ -1,128 +1,146 @@
 ---PINEINDEX v1---
-pkg:libbase
-version:1.0.0
-arch:any
-deps:
-desc:libbase (1.0.0)
-size:5774
-sha:f4c3f486
-file:libbase-1.0.0.cone
----
 pkg:authutils
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:authutils (1.0.0)
-size:5612
-sha:d4aca305
+desc:User management utilities (adduser, deluser, su)
+size:7964
+sha:2891bf0f
 file:authutils-1.0.0.cone
 ---
 pkg:chroot
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:chroot (1.0.0)
-size:1259
-sha:eeadb3a9
+desc:chroot utility - run command with changed root
+size:1952
+sha:6c6db32b
 file:chroot-1.0.0.cone
 ---
 pkg:coreutils
 version:1.0.0
 arch:any
 deps:
-desc:coreutils (1.0.0)
-size:12493
-sha:0545636f
+desc:Basic file utilities
+size:16849
+sha:985cc183
 file:coreutils-1.0.0.cone
 ---
 pkg:dhcp
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:dhcp (1.0.0)
-size:7260
-sha:85170416
+desc:DHCP client - obtain IP configuration via UDP broadcast
+size:10072
+sha:132b7752
 file:dhcp-1.0.0.cone
 ---
 pkg:fileutils
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:fileutils (1.0.0)
-size:5043
-sha:41446aed
+desc:File manipulation utilities (touch, ln, chmod, chown, rmdir, basename, dirname, find)
+size:6667
+sha:dce78293
 file:fileutils-1.0.0.cone
 ---
 pkg:kmod
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:kmod (1.0.0)
-size:1753
-sha:dfb4daad
+desc:Kernel module utilities (insmod, rmmod, lsmod)
+size:2397
+sha:ef6f1dbc
 file:kmod-1.0.0.cone
 ---
 pkg:knuck
 version:0.1.1
 arch:any
 deps:
-desc:KNUCK microkernel (includes all kernel modules)
+desc:KNUCK microkernel (Lua 5.2)
 size:112594
 sha:ed7b7c2b
 file:knuck-0.1.1.cone
+---
+pkg:knuck
+version:1.0.4
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2)
+size:173755
+sha:2c1c073d
+file:knuck-1.0.4.cone
 ---
 pkg:knuck-icmp
 version:1.0.0
 arch:any
 deps:knuck@>=0.1.0
-desc:knuck-icmp (1.0.0)
-size:9865
-sha:eb026f07
+desc:KNUCK ICMP kernel module and ping utility
+size:14409
+sha:738fe71a
 file:knuck-icmp-1.0.0.cone
+---
+pkg:libbase
+version:1.0.0
+arch:any
+deps:
+desc:libbase (1.0.0)
+size:7737
+sha:1a6c89ba
+file:libbase-1.0.0.cone
+---
+pkg:libhttp
+version:1.0.0
+arch:any
+deps:libbase@>=1.0.0
+desc:HTTP client over AF_MODEM/TCP (uses libbase)
+size:3248
+sha:384944eb
+file:libhttp-1.0.0.cone
 ---
 pkg:login
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:login (1.0.0)
-size:1083
-sha:c1109fe3
+desc:PineconeOS login and auth
+size:1562
+sha:774b08ee
 file:login-1.0.0.cone
 ---
 pkg:man
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:man (1.0.0)
-size:2131
-sha:e104f693
+desc:Manual page reader for PineconeOS syscalls (man <name>)
+size:3011
+sha:f5bc49b9
 file:man-1.0.0.cone
 ---
 pkg:mount
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:mount (1.0.0)
-size:2401
-sha:8592dab9
+desc:Filesystem mount/umount utilities
+size:3216
+sha:cd00ef49
 file:mount-1.0.0.cone
 ---
 pkg:nano
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:nano (1.0.0)
-size:5848
-sha:3612d213
+desc:Nano-style non-modal text editor
+size:9568
+sha:b886a5ec
 file:nano-1.0.0.cone
 ---
 pkg:netutils
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:netutils (1.0.0)
-size:17110
-sha:c5746e7e
+desc:Networking utilities (ifconfig, wget, nc, ping, ip, route, hostname, arp)
+size:23304
+sha:cc8f07da
 file:netutils-1.0.0.cone
 ---
 pkg:pine
@@ -130,97 +148,61 @@ version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
 desc:PineconeOS package manager
-size:22722
-sha:00115503
+size:29481
+sha:6d5eff8d
 file:pine-1.0.0.cone
 ---
 pkg:procutils
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:procutils (1.0.0)
-size:8702
-sha:ca9a2749
+desc:Process and system utilities (ps, kill, mount, df, uname, free, uptime, which, whoami, id)
+size:12246
+sha:331f8aae
 file:procutils-1.0.0.cone
 ---
 pkg:rv32emu
 version:0.1.0
 arch:any
 deps:
-desc:rv32emu (0.1.0)
-size:21779
-sha:676b5e5e
+desc:RV32I/RV32E userspace emulator (Linux rv32 syscall ABI)
+size:30370
+sha:cc9e0bfe
 file:rv32emu-0.1.0.cone
 ---
 pkg:shell
 version:0.1.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:shell (0.1.0)
-size:4416
-sha:865835fd
+desc:PineconeOS interactive shell
+size:6237
+sha:d4930ee1
 file:shell-0.1.0.cone
 ---
 pkg:specutils
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:specutils (1.0.0)
-size:4738
-sha:2922fbc8
+desc:Base distro spec-required utils (sleep, env, umask, chgrp, readlink, mkfifo, nice, reboot, halt)
+size:6999
+sha:88caea34
 file:specutils-1.0.0.cone
 ---
 pkg:textutils
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:textutils (1.0.0)
-size:14230
-sha:11624c42
+desc:Text processing utilities (grep, sed, sort, uniq, cut, tr)
+size:20670
+sha:89592ca5
 file:textutils-1.0.0.cone
 ---
 pkg:vi
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:vi (1.0.0)
-size:9383
-sha:c5a677b7
+desc:Vi-style modal text editor
+size:13190
+sha:7018b831
 file:vi-1.0.0.cone
----
-pkg:libhttp
-version:1.0.0
-arch:any
-deps:libbase@>=1.0.0
-desc:HTTP client over AF_MODEM/TCP (uses libbase)
-size:2679
-sha:49664f9c
-file:libhttp-1.0.0.cone
----
-pkg:knuck
-version:1.0.2
-arch:any
-deps:
-desc:KNUCK microkernel (Lua 5.2)
-size:135267
-sha:bfed81db
-file:knuck-1.0.2.cone
----
-pkg:knuck
-version:1.0.3
-arch:any
-deps:
-desc:KNUCK microkernel (Lua 5.2)
-size:135394
-sha:b956571b
-file:knuck-1.0.3.cone
----
-pkg:knuck
-version:1.0.4
-arch:any
-deps:
-desc:KNUCK microkernel (Lua 5.2)
-size:135496
-sha:3a656fb9
-file:knuck-1.0.4.cone
 ---

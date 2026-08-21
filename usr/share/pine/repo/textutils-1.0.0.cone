@@ -3,7 +3,7 @@ name=textutils
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=textutils (1.0.0)
+description=Text processing utilities (grep, sed, sort, uniq, cut, tr)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,60 +15,62 @@ prerem=
 postrem=
 files=6
 ---END MANIFEST---
----FILE /usr/bin/cut.lua 0755 2434 8e401ee9 src---
+---FILE /usr/bin/cut.lua 0755 3386 348da6f7 src---
+-- cut: cut fields by delimiter
+-- Usage: cut -d DELIM -f FIELDS [FILE]
 local function usage()
-print("usage: cut -d DELIM -f FIELDS [file]")
-exit(1)
+    print("usage: cut -d DELIM -f FIELDS [file]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function split_lines(data)
-local lines = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-lines[#lines+1] = data:sub(pos, nl - 1)
-pos = nl + 1
-else
-if pos <= #data then
-lines[#lines+1] = data:sub(pos)
-end
-break
-end
-end
-return lines
+    local lines = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            lines[#lines+1] = data:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            if pos <= #data then
+                lines[#lines+1] = data:sub(pos)
+            end
+            break
+        end
+    end
+    return lines
 end
 
 local function parse_fields(spec)
-local fields = {}
-for part in spec:gmatch("[^,]+") do
-local dash = part:find("-", 1, true)
-if dash then
-local from = tonumber(part:sub(1, dash - 1))
-local to = tonumber(part:sub(dash + 1))
-if from and to then
-for n = from, to do
-fields[#fields+1] = n
-end
-end
-else
-local n = tonumber(part)
-if n then
-fields[#fields+1] = n
-end
-end
-end
-return fields
+    local fields = {}
+    for part in spec:gmatch("[^,]+") do
+        local dash = part:find("-", 1, true)
+        if dash then
+            local from = tonumber(part:sub(1, dash - 1))
+            local to = tonumber(part:sub(dash + 1))
+            if from and to then
+                for n = from, to do
+                    fields[#fields+1] = n
+                end
+            end
+        else
+            local n = tonumber(part)
+            if n then
+                fields[#fields+1] = n
+            end
+        end
+    end
+    return fields
 end
 
 local args = {}
@@ -80,137 +82,146 @@ local files = {}
 local i = 1
 
 while i <= #args do
-local a = args[i]
-if a == "-d" then
-i = i + 1
-if i > #args then
-print("cut: -d requires an argument")
-usage()
-end
-delim = args[i]
-elseif a:sub(1, 2) == "-d" and #a > 2 then
-delim = a:sub(3)
-elseif a == "-f" then
-i = i + 1
-if i > #args then
-print("cut: -f requires an argument")
-usage()
-end
-field_spec = args[i]
-elseif a:sub(1, 2) == "-f" and #a > 2 then
-field_spec = a:sub(3)
-elseif a == "-h" or a == "--help" then
-usage()
-else
-files[#files+1] = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-d" then
+        i = i + 1
+        if i > #args then
+            print("cut: -d requires an argument")
+            usage()
+        end
+        delim = args[i]
+    elseif a:sub(1, 2) == "-d" and #a > 2 then
+        delim = a:sub(3)
+    elseif a == "-f" then
+        i = i + 1
+        if i > #args then
+            print("cut: -f requires an argument")
+            usage()
+        end
+        field_spec = args[i]
+    elseif a:sub(1, 2) == "-f" and #a > 2 then
+        field_spec = a:sub(3)
+    elseif a == "-h" or a == "--help" then
+        usage()
+    else
+        files[#files+1] = a
+    end
+    i = i + 1
 end
 
 if not delim then
-print("cut: -d delimiter is required")
-usage()
+    print("cut: -d delimiter is required")
+    usage()
 end
 if not field_spec then
-print("cut: -f fields is required")
-usage()
+    print("cut: -f fields is required")
+    usage()
 end
 
 local fields = parse_fields(field_spec)
 
 local function process(fd)
-local data = read_all(fd)
-local lines = split_lines(data)
-for _, line in ipairs(lines) do
-local parts = {}
-local pos = 1
-while true do
-local dp = line:find(delim, pos, true)
-if dp then
-parts[#parts+1] = line:sub(pos, dp - 1)
-pos = dp + #delim
-else
-parts[#parts+1] = line:sub(pos)
-break
-end
-end
-local out = {}
-for _, f in ipairs(fields) do
-if f <= #parts then
-out[#out+1] = parts[f]
-end
-end
-write(1, table.concat(out, delim) .. "\n")
-end
+    local data = read_all(fd)
+    local lines = split_lines(data)
+    for _, line in ipairs(lines) do
+        local parts = {}
+        local pos = 1
+        while true do
+            local dp = line:find(delim, pos, true)
+            if dp then
+                parts[#parts+1] = line:sub(pos, dp - 1)
+                pos = dp + #delim
+            else
+                parts[#parts+1] = line:sub(pos)
+                break
+            end
+        end
+        local out = {}
+        for _, f in ipairs(fields) do
+            if f <= #parts then
+                out[#out+1] = parts[f]
+            end
+        end
+        write(1, table.concat(out, delim) .. "\n")
+    end
 end
 
 if #files == 0 then
-process(0)
+    process(0)
 else
-for _, path in ipairs(files) do
-local fd, err = open(path, 0)
-if not fd then
-print("cut: " .. path .. ": " .. (err or "no such file"))
-exit(1)
+    for _, path in ipairs(files) do
+        local fd, err = open(path, 0)
+        if not fd then
+            print("cut: " .. path .. ": " .. (err or "no such file"))
+            exit(1)
+        end
+        process(fd)
+        close(fd)
+    end
 end
-process(fd)
-close(fd)
-end
-end
----FILE /usr/bin/grep.lua 0755 3068 d1ea4437 src---
+---FILE /usr/bin/grep.lua 0755 4909 50502b9c src---
+-- grep: search patterns in files/stdin
+-- Usage: grep [-i] [-v] [-n] [-r] PATTERN [FILE...]
 local function usage()
-print("usage: grep [-i] [-v] [-n] [-r] PATTERN [FILE...]")
-exit(1)
+    print("usage: grep [-i] [-v] [-n] [-r] PATTERN [FILE...]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function split_lines(data)
-local lines = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-lines[#lines+1] = data:sub(pos, nl - 1)
-pos = nl + 1
-else
-if pos <= #data then
-lines[#lines+1] = data:sub(pos)
-end
-break
-end
-end
-return lines
+    local lines = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            lines[#lines+1] = data:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            if pos <= #data then
+                lines[#lines+1] = data:sub(pos)
+            end
+            break
+        end
+    end
+    return lines
 end
 
 local function is_dir(path)
-local s = stat(path)
-if s and s.type == "dir" then return true end
-return false
+    local s = stat(path)
+    if s and s.type == "dir" then return true end
+    return false
 end
 
 local function list_files_recursive(base)
-local files = {}
-local function walk(dir)
-local fd = open(dir, 0)
-if not fd then return end
-close(fd)
-end
-files[#files+1] = base
-return files
+    local files = {}
+    local function walk(dir)
+        local fd = open(dir, 0)
+        if not fd then return end
+        -- Try reading directory contents; if stat says dir, iterate
+        -- Use a simple approach: read dir as file, parse names
+        -- Actually in CC:Tweaked/KNUCK we list by trying known children
+        -- Since we can't readdir natively, we'll grep files passed as args
+        -- For -r, we try to read the path and split into lines (directory listing)
+        close(fd)
+    end
+    -- Simpler: just return the path itself if it's a file
+    files[#files+1] = base
+    return files
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- Parse options
 local case_insensitive = false
 local invert = false
 local show_line_numbers = false
@@ -218,139 +229,150 @@ local recursive = false
 local i = 1
 
 while i <= #args do
-local a = args[i]
-if a == "-i" then
-case_insensitive = true
-elseif a == "-v" then
-invert = true
-elseif a == "-n" then
-show_line_numbers = true
-elseif a == "-r" then
-recursive = true
-elseif a:sub(1, 1) == "-" and #a > 1 then
-for j = 2, #a do
-local c = a:sub(j, j)
-if c == "i" then case_insensitive = true
-elseif c == "v" then invert = true
-elseif c == "n" then show_line_numbers = true
-elseif c == "r" then recursive = true
-else print("grep: unknown option: -" .. c); usage() end
-end
-else
-break
-end
-i = i + 1
+    local a = args[i]
+    if a == "-i" then
+        case_insensitive = true
+    elseif a == "-v" then
+        invert = true
+    elseif a == "-n" then
+        show_line_numbers = true
+    elseif a == "-r" then
+        recursive = true
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        -- combined flags like -inv
+        for j = 2, #a do
+            local c = a:sub(j, j)
+            if c == "i" then case_insensitive = true
+            elseif c == "v" then invert = true
+            elseif c == "n" then show_line_numbers = true
+            elseif c == "r" then recursive = true
+            else print("grep: unknown option: -" .. c); usage() end
+        end
+    else
+        break
+    end
+    i = i + 1
 end
 
 if i > #args then usage() end
 local pattern = args[i]
 i = i + 1
 
+-- Collect files
 local files = {}
 while i <= #args do
-files[#files+1] = args[i]
-i = i + 1
+    files[#files+1] = args[i]
+    i = i + 1
 end
 
+-- If recursive, expand directories
 if recursive and #files > 0 then
-local expanded = {}
-for _, f in ipairs(files) do
-if is_dir(f) then
-local dir_data = read_all(open(f, 0) or 0)
-if dir_data and #dir_data > 0 then
-for _, name in ipairs(split_lines(dir_data)) do
-if name ~= "" then
-local child = f .. "/" .. name
-expanded[#expanded+1] = child
-end
-end
-end
-else
-expanded[#expanded+1] = f
-end
-end
-files = expanded
+    local expanded = {}
+    for _, f in ipairs(files) do
+        if is_dir(f) then
+            -- For recursive, try to read the dir as a file listing
+            -- In KNUCK, directories may not be readable, so we try anyway
+            local dir_data = read_all(open(f, 0) or 0)
+            -- If we got data, split by newlines for child names
+            if dir_data and #dir_data > 0 then
+                for _, name in ipairs(split_lines(dir_data)) do
+                    if name ~= "" then
+                        local child = f .. "/" .. name
+                        expanded[#expanded+1] = child
+                    end
+                end
+            end
+        else
+            expanded[#expanded+1] = f
+        end
+    end
+    files = expanded
 end
 
 local found_any = false
 
 local function grep_file(path, fd)
-local data = read_all(fd)
-local lines = split_lines(data)
-for line_num, line in ipairs(lines) do
-local haystack = case_insensitive and line:lower() or line
-local needle = case_insensitive and pattern:lower() or pattern
-local matched = false
-local ok, result = pcall(string.find, haystack, needle, 1, true)
-if ok and result then
-matched = true
-else
-ok, result = pcall(string.find, haystack, needle)
-if ok and result then
-matched = true
-end
-end
-if invert then matched = not matched end
-if matched then
-found_any = true
-local out = ""
-if show_line_numbers then
-out = line_num .. ":"
-end
-out = out .. line .. "\n"
-write(1, out)
-end
-end
+    local data = read_all(fd)
+    local lines = split_lines(data)
+    for line_num, line in ipairs(lines) do
+        local haystack = case_insensitive and line:lower() or line
+        local needle = case_insensitive and pattern:lower() or pattern
+        -- Try plain match first, then Lua pattern
+        local matched = false
+        local ok, result = pcall(string.find, haystack, needle, 1, true)
+        if ok and result then
+            matched = true
+        else
+            ok, result = pcall(string.find, haystack, needle)
+            if ok and result then
+                matched = true
+            end
+        end
+        if invert then matched = not matched end
+        if matched then
+            found_any = true
+            local out = ""
+            if show_line_numbers then
+                out = line_num .. ":"
+            end
+            out = out .. line .. "\n"
+            write(1, out)
+        end
+    end
 end
 
 if #files == 0 then
-grep_file("-", 0)
+    -- Read stdin
+    grep_file("-", 0)
 else
-for _, path in ipairs(files) do
-local fd, err = open(path, 0)
-if not fd then
-print("grep: " .. path .. ": " .. (err or "no such file"))
-else
-grep_file(path, fd)
-close(fd)
-end
-end
+    for _, path in ipairs(files) do
+        local fd, err = open(path, 0)
+        if not fd then
+            print("grep: " .. path .. ": " .. (err or "no such file"))
+        else
+            grep_file(path, fd)
+            close(fd)
+        end
+    end
 end
 
 exit(found_any and 0 or 1)
----FILE /usr/bin/sed.lua 0755 2670 4687c44d src---
+---FILE /usr/bin/sed.lua 0755 3932 618a3505 src---
+-- sed: stream editor
+-- Usage: sed [-n] 's/FIND/REPL/[g]' [FILE...]
+--        sed [-n] 'NUMp' [FILE...]
 local function usage()
-print("usage: sed [-n] 's/find/replace/[g]' [file...]")
-print("       sed [-n] 'NUMp' [file...]")
-exit(1)
+    print("usage: sed [-n] 's/find/replace/[g]' [file...]")
+    print("       sed [-n] 'NUMp' [file...]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function split_lines(data)
-local lines = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-lines[#lines+1] = data:sub(pos, nl - 1)
-pos = nl + 1
-else
-if pos <= #data then
-lines[#lines+1] = data:sub(pos)
-end
-break
-end
-end
-return lines
+    local lines = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            lines[#lines+1] = data:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            if pos <= #data then
+                lines[#lines+1] = data:sub(pos)
+            end
+            break
+        end
+    end
+    return lines
 end
 
 local args = {}
@@ -361,131 +383,140 @@ local expressions = {}
 local files = {}
 local i = 1
 
+-- Parse -n flag
 while i <= #args do
-local a = args[i]
-if a == "-n" then
-suppress_default = true
-elseif a:sub(1, 1) == "-" and #a > 1 and a ~= "-" then
-print("sed: unknown option: " .. a)
-usage()
-else
-break
-end
-i = i + 1
+    local a = args[i]
+    if a == "-n" then
+        suppress_default = true
+    elseif a:sub(1, 1) == "-" and #a > 1 and a ~= "-" then
+        -- Could be combined flags but sed typically only has -n
+        print("sed: unknown option: " .. a)
+        usage()
+    else
+        break
+    end
+    i = i + 1
 end
 
+-- Next arg(s) are expressions or files
+-- If arg matches 's/...' or NUMp, it's an expression; otherwise a file
 while i <= #args do
-local a = args[i]
-if a:match("^s/.*/") then
-local delim = a:sub(2, 2)
-local rest = a:sub(3)
-local p1 = rest:find(delim, 1, true)
-if not p1 then print("sed: bad expression: " .. a); usage() end
-local find = rest:sub(1, p1 - 1)
-local rest2 = rest:sub(p1 + 1)
-local p2 = rest2:find(delim, 1, true)
-if not p2 then print("sed: bad expression: " .. a); usage() end
-local repl = rest2:sub(1, p2 - 1)
-local flags = rest2:sub(p2 + 1)
-local global = false
-if flags:find("g") then global = true end
-expressions[#expressions+1] = { type = "s", find = find, repl = repl, global = global }
-elseif a:match("^%d+p$") then
-local num = tonumber(a:match("^(%d+)p$"))
-expressions[#expressions+1] = { type = "p", line = num }
-else
-files[#files+1] = a
-end
-i = i + 1
+    local a = args[i]
+    if a:match("^s/.*/") then
+        -- s/ command
+        local delim = a:sub(2, 2)
+        local rest = a:sub(3)
+        local p1 = rest:find(delim, 1, true)
+        if not p1 then print("sed: bad expression: " .. a); usage() end
+        local find = rest:sub(1, p1 - 1)
+        local rest2 = rest:sub(p1 + 1)
+        local p2 = rest2:find(delim, 1, true)
+        if not p2 then print("sed: bad expression: " .. a); usage() end
+        local repl = rest2:sub(1, p2 - 1)
+        local flags = rest2:sub(p2 + 1)
+        local global = false
+        if flags:find("g") then global = true end
+        expressions[#expressions+1] = { type = "s", find = find, repl = repl, global = global }
+    elseif a:match("^%d+p$") then
+        local num = tonumber(a:match("^(%d+)p$"))
+        expressions[#expressions+1] = { type = "p", line = num }
+    else
+        files[#files+1] = a
+    end
+    i = i + 1
 end
 
 if #expressions == 0 then
-print("sed: no expression")
-usage()
+    print("sed: no expression")
+    usage()
 end
 
 local function process(fd)
-local data = read_all(fd)
-local lines = split_lines(data)
-for line_num, line in ipairs(lines) do
-local output = nil
-local matched = false
-for _, expr in ipairs(expressions) do
-if expr.type == "s" then
-local count = expr.global and math.huge or 1
-local new_line, n = line:gsub(expr.find, expr.repl, count)
-if n > 0 then
-output = new_line
-matched = true
-end
-elseif expr.type == "p" then
-if line_num == expr.line then
-output = line
-matched = true
-end
-end
-end
-if matched and output then
-write(1, output .. "\n")
-elseif not suppress_default and not matched then
-if not suppress_default then
-write(1, line .. "\n")
-end
-end
-end
+    local data = read_all(fd)
+    local lines = split_lines(data)
+    for line_num, line in ipairs(lines) do
+        local output = nil
+        local matched = false
+        for _, expr in ipairs(expressions) do
+            if expr.type == "s" then
+                local count = expr.global and math.huge or 1
+                local new_line, n = line:gsub(expr.find, expr.repl, count)
+                if n > 0 then
+                    output = new_line
+                    matched = true
+                end
+            elseif expr.type == "p" then
+                if line_num == expr.line then
+                    output = line
+                    matched = true
+                end
+            end
+        end
+        if matched and output then
+            write(1, output .. "\n")
+        elseif not suppress_default and not matched then
+            -- Default: print line if not -n, or if no match in s/// with -n
+            -- With -n, only explicit matches print
+            if not suppress_default then
+                write(1, line .. "\n")
+            end
+        end
+    end
 end
 
 if #files == 0 then
-process(0)
+    process(0)
 else
-for _, path in ipairs(files) do
-local fd, err = open(path, 0)
-if not fd then
-print("sed: " .. path .. ": " .. (err or "no such file"))
-else
-process(fd)
-close(fd)
+    for _, path in ipairs(files) do
+        local fd, err = open(path, 0)
+        if not fd then
+            print("sed: " .. path .. ": " .. (err or "no such file"))
+        else
+            process(fd)
+            close(fd)
+        end
+    end
 end
-end
-end
----FILE /usr/bin/sort.lua 0755 2165 3fdbb606 src---
+---FILE /usr/bin/sort.lua 0755 2965 47410623 src---
+-- sort: sort lines
+-- Usage: sort [-r] [-n] [-u] [FILE...]
 local function usage()
-print("usage: sort [-r] [-n] [-u] [file...]")
-exit(1)
+    print("usage: sort [-r] [-n] [-u] [file...]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function split_lines(data)
-local lines = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-local l = data:sub(pos, nl - 1)
-if #l > 0 then
-lines[#lines+1] = l
-end
-pos = nl + 1
-else
-if pos <= #data then
-local l = data:sub(pos)
-if #l > 0 then
-lines[#lines+1] = l
-end
-end
-break
-end
-end
-return lines
+    local lines = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            local l = data:sub(pos, nl - 1)
+            if #l > 0 then
+                lines[#lines+1] = l
+            end
+            pos = nl + 1
+        else
+            if pos <= #data then
+                local l = data:sub(pos)
+                if #l > 0 then
+                    lines[#lines+1] = l
+                end
+            end
+            break
+        end
+    end
+    return lines
 end
 
 local args = {}
@@ -498,139 +529,150 @@ local files = {}
 local i = 1
 
 while i <= #args do
-local a = args[i]
-if a == "-r" then
-reverse = true
-elseif a == "-n" then
-numeric = true
-elseif a == "-u" then
-unique = true
-elseif a:sub(1, 1) == "-" and #a > 1 then
-for j = 2, #a do
-local c = a:sub(j, j)
-if c == "r" then reverse = true
-elseif c == "n" then numeric = true
-elseif c == "u" then unique = true
-else print("sort: unknown option: -" .. c); usage() end
-end
-else
-files[#files+1] = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-r" then
+        reverse = true
+    elseif a == "-n" then
+        numeric = true
+    elseif a == "-u" then
+        unique = true
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        -- combined flags
+        for j = 2, #a do
+            local c = a:sub(j, j)
+            if c == "r" then reverse = true
+            elseif c == "n" then numeric = true
+            elseif c == "u" then unique = true
+            else print("sort: unknown option: -" .. c); usage() end
+        end
+    else
+        files[#files+1] = a
+    end
+    i = i + 1
 end
 
+-- Read all input
 local all_lines = {}
 
 local function add_lines(data)
-local lines = split_lines(data)
-for _, l in ipairs(lines) do
-all_lines[#all_lines+1] = l
-end
+    local lines = split_lines(data)
+    for _, l in ipairs(lines) do
+        all_lines[#all_lines+1] = l
+    end
 end
 
 if #files == 0 then
-add_lines(read_all(0))
+    add_lines(read_all(0))
 else
-for _, path in ipairs(files) do
-local fd, err = open(path, 0)
-if not fd then
-print("sort: " .. path .. ": " .. (err or "no such file"))
-exit(1)
-end
-add_lines(read_all(fd))
-close(fd)
-end
+    for _, path in ipairs(files) do
+        local fd, err = open(path, 0)
+        if not fd then
+            print("sort: " .. path .. ": " .. (err or "no such file"))
+            exit(1)
+        end
+        add_lines(read_all(fd))
+        close(fd)
+    end
 end
 
+-- Sort
 if numeric then
-table.sort(all_lines, function(a, b)
-local na, nb = tonumber(a), tonumber(b)
-if na and nb then
-if reverse then return na > nb end
-return na < nb
-end
-if reverse then return a > b end
-return a < b
-end)
+    table.sort(all_lines, function(a, b)
+        local na, nb = tonumber(a), tonumber(b)
+        if na and nb then
+            if reverse then return na > nb end
+            return na < nb
+        end
+        if reverse then return a > b end
+        return a < b
+    end)
 else
-if reverse then
-table.sort(all_lines, function(a, b) return a > b end)
-else
-table.sort(all_lines)
-end
+    if reverse then
+        table.sort(all_lines, function(a, b) return a > b end)
+    else
+        table.sort(all_lines)
+    end
 end
 
+-- Unique
 if unique then
-local seen = {}
-local deduped = {}
-for _, l in ipairs(all_lines) do
-if not seen[l] then
-seen[l] = true
-deduped[#deduped+1] = l
-end
-end
-all_lines = deduped
+    local seen = {}
+    local deduped = {}
+    for _, l in ipairs(all_lines) do
+        if not seen[l] then
+            seen[l] = true
+            deduped[#deduped+1] = l
+        end
+    end
+    all_lines = deduped
 end
 
+-- Output
 for _, l in ipairs(all_lines) do
-write(1, l .. "\n")
+    write(1, l .. "\n")
 end
----FILE /usr/bin/tr.lua 0755 2196 b554956b src---
+---FILE /usr/bin/tr.lua 0755 3317 e1e31c7b src---
+-- tr: translate or delete characters
+-- Usage: tr SET1 [SET2]
+--        tr -d SET1
 local function usage()
-print("usage: tr SET1 [SET2]")
-print("       tr -d SET")
-exit(1)
+    print("usage: tr SET1 [SET2]")
+    print("       tr -d SET")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function expand_set(s)
-local chars = {}
-local i = 1
-while i <= #s do
-local c = s:sub(i, i)
-if c == "\\" and i < #s then
-local next_c = s:sub(i+1, i+1)
-if next_c == "n" then chars[#chars+1] = "\n"
-elseif next_c == "t" then chars[#chars+1] = "\t"
-elseif next_c == "\\" then chars[#chars+1] = "\\"
-else chars[#chars+1] = next_c end
-i = i + 2
-elseif c == "-" and #chars > 0 and i < #s then
-local from = chars[#chars]
-local to = s:sub(i+1, i+1)
-if from and to and #from == 1 and #to == 1 then
-chars[#chars] = nil
-local f_byte = string.byte(from)
-local t_byte = string.byte(to)
-if f_byte <= t_byte then
-for b = f_byte, t_byte do
-chars[#chars+1] = string.char(b)
-end
-else
-for b = f_byte, t_byte, -1 do
-chars[#chars+1] = string.char(b)
-end
-end
-i = i + 2
-else
-chars[#chars+1] = c
-i = i + 1
-end
-else
-chars[#chars+1] = c
-i = i + 1
-end
-end
-return chars
+    local chars = {}
+    local i = 1
+    while i <= #s do
+        local c = s:sub(i, i)
+        if c == "\\" and i < #s then
+            -- escape sequence
+            local next_c = s:sub(i+1, i+1)
+            if next_c == "n" then chars[#chars+1] = "\n"
+            elseif next_c == "t" then chars[#chars+1] = "\t"
+            elseif next_c == "\\" then chars[#chars+1] = "\\"
+            else chars[#chars+1] = next_c end
+            i = i + 2
+        elseif c == "-" and #chars > 0 and i < #s then
+            -- range like a-z
+            local from = chars[#chars]
+            local to = s:sub(i+1, i+1)
+            if from and to and #from == 1 and #to == 1 then
+                -- remove the last char (it's the start of range)
+                chars[#chars] = nil
+                local f_byte = string.byte(from)
+                local t_byte = string.byte(to)
+                if f_byte <= t_byte then
+                    for b = f_byte, t_byte do
+                        chars[#chars+1] = string.char(b)
+                    end
+                else
+                    for b = f_byte, t_byte, -1 do
+                        chars[#chars+1] = string.char(b)
+                    end
+                end
+                i = i + 2
+            else
+                chars[#chars+1] = c
+                i = i + 1
+            end
+        else
+            chars[#chars+1] = c
+            i = i + 1
+        end
+    end
+    return chars
 end
 
 local args = {}
@@ -641,99 +683,104 @@ local set1, set2
 local i = 1
 
 while i <= #args do
-local a = args[i]
-if a == "-d" then
-delete_mode = true
-elseif a == "-h" or a == "--help" then
-usage()
-elseif not set1 then
-set1 = a
-elseif not set2 then
-set2 = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-d" then
+        delete_mode = true
+    elseif a == "-h" or a == "--help" then
+        usage()
+    elseif not set1 then
+        set1 = a
+    elseif not set2 then
+        set2 = a
+    end
+    i = i + 1
 end
 
 if not set1 then
-print("tr: missing SET1")
-usage()
+    print("tr: missing SET1")
+    usage()
 end
 
 local chars1 = expand_set(set1)
 
 if delete_mode then
-local delete_set = {}
-for _, c in ipairs(chars1) do
-delete_set[c] = true
-end
-local data = read_all(0)
-local out = {}
-for j = 1, #data do
-local c = data:sub(j, j)
-if not delete_set[c] then
-out[#out+1] = c
-end
-end
-write(1, table.concat(out))
+    -- delete mode: build set of chars to delete
+    local delete_set = {}
+    for _, c in ipairs(chars1) do
+        delete_set[c] = true
+    end
+    local data = read_all(0)
+    local out = {}
+    for j = 1, #data do
+        local c = data:sub(j, j)
+        if not delete_set[c] then
+            out[#out+1] = c
+        end
+    end
+    write(1, table.concat(out))
 elseif set2 then
-local chars2 = expand_set(set2)
-local map = {}
-for j = 1, #chars1 do
-if j <= #chars2 then
-map[chars1[j]] = chars2[j]
+    -- translate mode
+    local chars2 = expand_set(set2)
+    local map = {}
+    for j = 1, #chars1 do
+        if j <= #chars2 then
+            map[chars1[j]] = chars2[j]
+        else
+            -- SET2 shorter: last char repeats
+            map[chars1[j]] = chars2[#chars2]
+        end
+    end
+    local data = read_all(0)
+    local out = {}
+    for j = 1, #data do
+        local c = data:sub(j, j)
+        out[#out+1] = map[c] or c
+    end
+    write(1, table.concat(out))
 else
-map[chars1[j]] = chars2[#chars2]
+    print("tr: missing SET2 (or use -d SET1)")
+    usage()
 end
-end
-local data = read_all(0)
-local out = {}
-for j = 1, #data do
-local c = data:sub(j, j)
-out[#out+1] = map[c] or c
-end
-write(1, table.concat(out))
-else
-print("tr: missing SET2 (or use -d SET1)")
-usage()
-end
----FILE /usr/bin/uniq.lua 0755 1125 ef65abe4 src---
+---FILE /usr/bin/uniq.lua 0755 1548 e08a518f src---
+-- uniq: filter adjacent duplicate lines
+-- Usage: uniq [FILE]
 local function usage()
-print("usage: uniq [file]")
-exit(1)
+    print("usage: uniq [file]")
+    exit(1)
 end
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function split_lines(data)
-local lines = {}
-local pos = 1
-while pos <= #data do
-local nl = data:find("\n", pos, true)
-if nl then
-local l = data:sub(pos, nl - 1)
-if #l > 0 then
-lines[#lines+1] = l
-end
-pos = nl + 1
-else
-if pos <= #data then
-local l = data:sub(pos)
-if #l > 0 then
-lines[#lines+1] = l
-end
-end
-break
-end
-end
-return lines
+    local lines = {}
+    local pos = 1
+    while pos <= #data do
+        local nl = data:find("\n", pos, true)
+        if nl then
+            local l = data:sub(pos, nl - 1)
+            if #l > 0 then
+                lines[#lines+1] = l
+            end
+            pos = nl + 1
+        else
+            if pos <= #data then
+                local l = data:sub(pos)
+                if #l > 0 then
+                    lines[#lines+1] = l
+                end
+            end
+            break
+        end
+    end
+    return lines
 end
 
 local args = {}
@@ -741,32 +788,32 @@ for i=1,select("#",...) do args[i]=select(i,...) end
 
 local file = nil
 for _, a in ipairs(args) do
-if a == "-h" or a == "--help" then
-usage()
-else
-file = a
-end
+    if a == "-h" or a == "--help" then
+        usage()
+    else
+        file = a
+    end
 end
 
 local data
 if file then
-local fd, err = open(file, 0)
-if not fd then
-print("uniq: " .. file .. ": " .. (err or "no such file"))
-exit(1)
-end
-data = read_all(fd)
-close(fd)
+    local fd, err = open(file, 0)
+    if not fd then
+        print("uniq: " .. file .. ": " .. (err or "no such file"))
+        exit(1)
+    end
+    data = read_all(fd)
+    close(fd)
 else
-data = read_all(0)
+    data = read_all(0)
 end
 
 local lines = split_lines(data)
 local prev = nil
 for _, line in ipairs(lines) do
-if line ~= prev then
-write(1, line .. "\n")
-prev = line
-end
+    if line ~= prev then
+        write(1, line .. "\n")
+        prev = line
+    end
 end
 ---END PKG---

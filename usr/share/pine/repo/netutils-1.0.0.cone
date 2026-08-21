@@ -3,7 +3,7 @@ name=netutils
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=netutils (1.0.0)
+description=Networking utilities (ifconfig, wget, nc, ping, ip, route, hostname, arp)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,125 +15,144 @@ prerem=
 postrem=
 files=8
 ---END MANIFEST---
----FILE /usr/bin/arp.lua 0755 1140 b7c4d100 src---
+---FILE /usr/bin/arp.lua 0755 1546 b9d3b689 src---
+-- arp: show ARP table from /sys/net/arp
+-- Usage: arp
+-- Reads /sys/net/arp and displays the ARP cache.
+-- Also aliased as 'arp -a' for compatibility.
 
 local function read_sys(path)
-local fd = open(path, "r")
-if not fd then return nil end
-local chunks = {}
-while true do
-local data = read(fd, 4096)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-local s = table.concat(chunks)
-return s:gsub("%s+$", "")
+    local fd = open(path, "r")
+    if not fd then return nil end
+    local chunks = {}
+    while true do
+        local data = read(fd, 4096)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    local s = table.concat(chunks)
+    return s:gsub("%s+$", "")
 end
 
 local function usage()
-print("usage: arp [-a]")
-print("       Display ARP cache table")
-exit(1)
+    print("usage: arp [-a]")
+    print("       Display ARP cache table")
+    exit(1)
 end
 
 local args = {}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
+-- Check for -a (all) or --help
 if #args > 0 and (args[1] == "-h" or args[1] == "--help") then
-usage()
+    usage()
 end
 
 local show_all = false
 if #args > 0 and args[1] == "-a" then
-show_all = true
+    show_all = true
 end
 
 local data = read_sys("/sys/net/arp")
 
 if not data or data == "" then
-print("arp: no ARP entries (or /sys/net/arp not available)")
-exit(0)
+    print("arp: no ARP entries (or /sys/net/arp not available)")
+    exit(0)
 end
 
+-- Parse ARP entries
+-- Expected format per line: "IP HWtype HWaddress Flags Mask Iface"
+-- or simplified: "ip mac flags"
 print("ARP table:")
 print("IP address       HW type   HW address         Flags  Iface")
 print("───────────────  ────────  ─────────────────  ─────  ──────")
 
 for line in data:gmatch("[^\n]+") do
-if show_all or not line:match("^%s*$") then
-print(line)
-end
+    if show_all or not line:match("^%s*$") then
+        print(line)
+    end
 end
 
 exit(0)
----FILE /usr/bin/hostname.lua 0755 549 0de6312c src---
+---FILE /usr/bin/hostname.lua 0755 1019 d8b27df5 src---
+-- hostname: show or set the system hostname
+-- Usage: hostname [name]
+-- Uses environment variable HOSTNAME for persistence within the session.
+-- The KNUCK kernel does not expose os.getComputerLabel() to userland,
+-- so hostname is stored in the process environment.
 
 local function usage()
-print("usage: hostname [name]")
-exit(1)
+    print("usage: hostname [name]")
+    exit(1)
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args == 0 then
-local h = getenv("HOSTNAME")
-if h and h ~= "" then
-print(h)
-else
-print("localhost")
-end
-exit(0)
+    -- Show current hostname
+    local h = getenv("HOSTNAME")
+    if h and h ~= "" then
+        print(h)
+    else
+        print("localhost")
+    end
+    exit(0)
 elseif #args == 1 then
-local name = args[1]
-if #name > 255 then
-print("hostname: name too long (max 255 characters)")
-exit(1)
-end
-if name == "" then
-print("hostname: name cannot be empty")
-exit(1)
-end
-setenv("HOSTNAME", name)
-print("hostname: hostname set to " .. name)
-exit(0)
+    local name = args[1]
+    -- Validate hostname (basic checks)
+    if #name > 255 then
+        print("hostname: name too long (max 255 characters)")
+        exit(1)
+    end
+    if name == "" then
+        print("hostname: name cannot be empty")
+        exit(1)
+    end
+    -- Set hostname
+    setenv("HOSTNAME", name)
+    print("hostname: hostname set to " .. name)
+    exit(0)
 else
-usage()
+    usage()
 end
----FILE /usr/bin/ifconfig.lua 0755 1232 690ffa67 src---
+---FILE /usr/bin/ifconfig.lua 0755 1480 3fe7d6bc src---
+-- ifconfig: show network interface configuration
+-- Usage: ifconfig [interface]
 
 local function read_sys(path)
-local fd = open(path, "r")
-if not fd then return nil end
-local chunks = {}
-while true do
-local data = read(fd, 4096)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-local s = table.concat(chunks)
-return s:gsub("%s+$", "")
+    local fd = open(path, "r")
+    if not fd then return nil end
+    local chunks = {}
+    while true do
+        local data = read(fd, 4096)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    local s = table.concat(chunks)
+    return s:gsub("%s+$", "")
 end
 
 local function read_sys_lines(path)
-local s = read_sys(path)
-if not s or s == "" then return {} end
-local lines = {}
-for line in s:gmatch("[^\n]+") do
-lines[#lines+1] = line
-end
-return lines
+    local s = read_sys(path)
+    if not s or s == "" then return {} end
+    local lines = {}
+    for line in s:gmatch("[^\n]+") do
+        lines[#lines+1] = line
+    end
+    return lines
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- Check if network info is available
 local ip = read_sys("/sys/net/ip")
 if ip == nil or ip == "" then
-print("ifconfig: no interface information available in this KNUCK build")
-exit(0)
+    print("ifconfig: no interface information available in this KNUCK build")
+    exit(0)
 end
 
 local gw = read_sys("/sys/net/gateway") or "0.0.0.0"
@@ -145,46 +164,54 @@ print("        inet addr:" .. ip .. "  Mask:" .. nm)
 print("        inet addr:" .. gw .. "  Gateway")
 print("        channel " .. ch)
 
+-- ARP table
 local arp_lines = read_sys_lines("/sys/net/arp")
 if #arp_lines > 0 then
-print("  ARP table:")
-for _, line in ipairs(arp_lines) do
-print("    " .. line)
-end
+    print("  ARP table:")
+    for _, line in ipairs(arp_lines) do
+        print("    " .. line)
+    end
 end
 
 exit(0)
----FILE /usr/bin/ip.lua 0755 2938 282f19ca src---
+---FILE /usr/bin/ip.lua 0755 4125 c7e6e4d2 src---
+-- ip: show/configure network interfaces
+-- Usage: ip addr show
+--        ip route show
+--        ip addr set <ip> <mask>
+--        ip route add <dest> <mask> <gw>
+--        ip route del <dest> <mask> <gw>
+-- Uses /sys/net/* filesystem interface.
 
 local function read_sys(path)
-local fd = open(path, "r")
-if not fd then return nil end
-local chunks = {}
-while true do
-local data = read(fd, 4096)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-local s = table.concat(chunks)
-return s:gsub("%s+$", "")
+    local fd = open(path, "r")
+    if not fd then return nil end
+    local chunks = {}
+    while true do
+        local data = read(fd, 4096)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    local s = table.concat(chunks)
+    return s:gsub("%s+$", "")
 end
 
 local function write_sys(path, value)
-local fd = open(path, "w")
-if not fd then return false, "cannot open " .. path .. " for writing" end
-write(fd, value .. "\n")
-close(fd)
-return true
+    local fd = open(path, "w")
+    if not fd then return false, "cannot open " .. path .. " for writing" end
+    write(fd, value .. "\n")
+    close(fd)
+    return true
 end
 
 local function usage()
-print("usage: ip addr show")
-print("       ip addr set <ip> <mask>")
-print("       ip route show")
-print("       ip route add <dest> <mask> <gw>")
-print("       ip route del <dest> <mask> <gw>")
-exit(1)
+    print("usage: ip addr show")
+    print("       ip addr set <ip> <mask>")
+    print("       ip route show")
+    print("       ip route add <dest> <mask> <gw>")
+    print("       ip route del <dest> <mask> <gw>")
+    exit(1)
 end
 
 local args = {}
@@ -195,318 +222,350 @@ if #args < 1 then usage() end
 local cmd = args[1]
 
 if cmd == "addr" then
-local sub = args[2] or "show"
-if sub == "show" then
-local ip_addr = read_sys("/sys/net/ip")
-local gw = read_sys("/sys/net/gateway")
-local nm = read_sys("/sys/net/netmask")
-local ch = read_sys("/sys/net/channel")
-if not ip_addr then
-print("ip: no network interface available")
-exit(1)
-end
-print("modem0: <BROADCAST,RUNNING,UP>")
-print("        inet " .. (ip_addr or "0.0.0.0") .. "/" .. (nm or "255.255.255.0"))
-print("        gateway " .. (gw or "0.0.0.0"))
-print("        channel " .. (ch or "0"))
-elseif sub == "set" then
-local new_ip = args[3]
-local new_mask = args[4]
-if not new_ip then
-print("ip: missing IP address")
-usage()
-end
-local ok, err = write_sys("/sys/net/ip", new_ip)
-if not ok then
-print("ip: " .. tostring(err))
-exit(1)
-end
-if new_mask then
-local ok2, err2 = write_sys("/sys/net/netmask", new_mask)
-if not ok2 then
-print("ip: " .. tostring(err2))
-exit(1)
-end
-end
-print("ip: interface configured")
-else
-usage()
-end
+    local sub = args[2] or "show"
+    if sub == "show" then
+        local ip_addr = read_sys("/sys/net/ip")
+        local gw = read_sys("/sys/net/gateway")
+        local nm = read_sys("/sys/net/netmask")
+        local ch = read_sys("/sys/net/channel")
+        if not ip_addr then
+            print("ip: no network interface available")
+            exit(1)
+        end
+        print("modem0: <BROADCAST,RUNNING,UP>")
+        print("        inet " .. (ip_addr or "0.0.0.0") .. "/" .. (nm or "255.255.255.0"))
+        print("        gateway " .. (gw or "0.0.0.0"))
+        print("        channel " .. (ch or "0"))
+    elseif sub == "set" then
+        local new_ip = args[3]
+        local new_mask = args[4]
+        if not new_ip then
+            print("ip: missing IP address")
+            usage()
+        end
+        local ok, err = write_sys("/sys/net/ip", new_ip)
+        if not ok then
+            print("ip: " .. tostring(err))
+            exit(1)
+        end
+        if new_mask then
+            local ok2, err2 = write_sys("/sys/net/netmask", new_mask)
+            if not ok2 then
+                print("ip: " .. tostring(err2))
+                exit(1)
+            end
+        end
+        print("ip: interface configured")
+    else
+        usage()
+    end
 elseif cmd == "route" then
-local sub = args[2] or "show"
-if sub == "show" then
-local routes = read_sys("/sys/net/routes")
-if not routes or routes == "" then
-print("ip: no routes available")
+    local sub = args[2] or "show"
+    if sub == "show" then
+        local routes = read_sys("/sys/net/routes")
+        if not routes or routes == "" then
+            print("ip: no routes available")
+        else
+            print("Kernel IP routing table")
+            print("Destination     Gateway         Mask            Metric")
+            for line in routes:gmatch("[^\n]+") do
+                print(line)
+            end
+        end
+    elseif sub == "add" then
+        local dest = args[3]
+        local mask = args[4]
+        local gw = args[5]
+        if not dest or not mask or not gw then
+            print("ip: route add requires dest mask gw")
+            usage()
+        end
+        -- Write route as "dest mask gw" to /sys/net/routes
+        local route_str = dest .. " " .. mask .. " " .. gw
+        local ok, err = write_sys("/sys/net/routes", route_str)
+        if not ok then
+            print("ip: " .. tostring(err))
+            exit(1)
+        end
+        print("ip: route added")
+    elseif sub == "del" then
+        local dest = args[3]
+        local mask = args[4]
+        local gw = args[5]
+        if not dest or not mask or not gw then
+            print("ip: route del requires dest mask gw")
+            usage()
+        end
+        -- Write delete route as "del dest mask gw"
+        local route_str = "del " .. dest .. " " .. mask .. " " .. gw
+        local ok, err = write_sys("/sys/net/routes", route_str)
+        if not ok then
+            print("ip: " .. tostring(err))
+            exit(1)
+        end
+        print("ip: route deleted")
+    else
+        usage()
+    end
 else
-print("Kernel IP routing table")
-print("Destination     Gateway         Mask            Metric")
-for line in routes:gmatch("[^\n]+") do
-print(line)
-end
-end
-elseif sub == "add" then
-local dest = args[3]
-local mask = args[4]
-local gw = args[5]
-if not dest or not mask or not gw then
-print("ip: route add requires dest mask gw")
-usage()
-end
-local route_str = dest .. " " .. mask .. " " .. gw
-local ok, err = write_sys("/sys/net/routes", route_str)
-if not ok then
-print("ip: " .. tostring(err))
-exit(1)
-end
-print("ip: route added")
-elseif sub == "del" then
-local dest = args[3]
-local mask = args[4]
-local gw = args[5]
-if not dest or not mask or not gw then
-print("ip: route del requires dest mask gw")
-usage()
-end
-local route_str = "del " .. dest .. " " .. mask .. " " .. gw
-local ok, err = write_sys("/sys/net/routes", route_str)
-if not ok then
-print("ip: " .. tostring(err))
-exit(1)
-end
-print("ip: route deleted")
-else
-usage()
-end
-else
-usage()
+    usage()
 end
 
 exit(0)
----FILE /usr/bin/nc.lua 0755 1205 cdb3a9a0 src---
+---FILE /usr/bin/nc.lua 0755 2051 c8dc85ae src---
+-- nc: netcat - connect to host:port and relay stdin/stdout
+-- Usage: nc host port
+-- Uses KNUCK AF_MODEM TCP sockets.
 
 local function usage()
-print("usage: nc host port")
-exit(1)
+    print("usage: nc host port")
+    exit(1)
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 2 then
-usage()
+    usage()
 end
 
 local host = args[1]
 local port = tonumber(args[2])
 if not port or port < 1 or port > 65535 then
-print("nc: invalid port: " .. tostring(args[2]))
-exit(1)
+    print("nc: invalid port: " .. tostring(args[2]))
+    exit(1)
 end
 
+-- Create TCP socket
 local fd, err = socket("modem", "stream", 6)
 if not fd then
-print("nc: socket creation failed: " .. tostring(err))
-exit(1)
+    print("nc: socket creation failed: " .. tostring(err))
+    exit(1)
 end
 
+-- Connect to remote host:port
 local target = host .. ":" .. port
 local ok, cerr = connect(fd, target)
 if not ok then
-print("nc: connect failed: " .. tostring(cerr))
-close(fd)
-exit(1)
+    print("nc: connect failed: " .. tostring(cerr))
+    close(fd)
+    exit(1)
 end
 
 print("nc: connected to " .. target)
 
+-- Set a short receive timeout so we can check stdin periodically
 setsockopt(fd, 1, 20, 0.5)
 
+-- Relay loop: read stdin -> send to socket, read socket -> write stdout
 while true do
-local stdin_data = read(0, 4096)
-if stdin_data and #stdin_data > 0 then
-local sent, serr = send(fd, stdin_data)
-if not sent then
-print("nc: send error: " .. tostring(serr))
-break
-end
-end
+    -- Read from stdin (non-blocking check via poll)
+    local stdin_data = read(0, 4096)
+    if stdin_data and #stdin_data > 0 then
+        local sent, serr = send(fd, stdin_data)
+        if not sent then
+            print("nc: send error: " .. tostring(serr))
+            break
+        end
+    end
 
-local data, rerr = recv(fd, 4096)
-if data and #data > 0 then
-write(1, data)
-elseif data == nil and rerr ~= "timeout" then
-break
-end
+    -- Read from socket (non-blocking with timeout)
+    local data, rerr = recv(fd, 4096)
+    if data and #data > 0 then
+        write(1, data)
+    elseif data == nil and rerr ~= "timeout" then
+        -- Connection closed or real error
+        break
+    end
 
-if stdin_data == nil or #stdin_data == 0 then
-shutdown(fd, "write")
-while true do
-local d = recv(fd, 4096)
-if d and #d > 0 then
-write(1, d)
-else
-break
-end
-end
-break
-end
+    -- If stdin returned empty data, stdin is closed
+    if stdin_data == nil or #stdin_data == 0 then
+        -- Give a moment for remaining data
+        shutdown(fd, "write")
+        -- Drain remaining socket data
+        while true do
+            local d = recv(fd, 4096)
+            if d and #d > 0 then
+                write(1, d)
+            else
+                break
+            end
+        end
+        break
+    end
 end
 
 close(fd)
 exit(0)
----FILE /usr/bin/ping.lua 0755 5031 9e08e284 src---
+---FILE /usr/bin/ping.lua 0755 6556 145e4305 src---
+-- ping: send ICMP echo requests and measure RTT
+-- Usage: ping [-c count] [-i interval] host
+-- Uses AF_ICMP socket for real ICMP echo requests/replies.
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- bxor via pure arithmetic (no bit32 in sandbox)
 local function bxor(a, b)
-local r, bit = 0, 1
-while a > 0 or b > 0 do
-local abit, bbit = a % 2, b % 2
-if abit ~= bbit then r = r + bit end
-a = math.floor(a / 2)
-b = math.floor(b / 2)
-bit = bit * 2
-end
-return r
+  local r, bit = 0, 1
+  while a > 0 or b > 0 do
+    local abit, bbit = a % 2, b % 2
+    if abit ~= bbit then r = r + bit end
+    a = math.floor(a / 2)
+    b = math.floor(b / 2)
+    bit = bit * 2
+  end
+  return r
 end
 
-local count = nil       local interval = 1.0    local host = nil
+-- Parse arguments
+local count = nil       -- -c count: stop after count replies
+local interval = 1.0    -- -i interval: seconds between pings
+local host = nil
 
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-c" and i < #args then
-count = tonumber(args[i+1])
-if not count or count < 1 then
-print("ping: invalid count")
-exit(1)
-end
-i = i + 2
-elseif a == "-i" and i < #args then
-interval = tonumber(args[i+1])
-if not interval or interval < 0.1 then
-print("ping: invalid interval")
-exit(1)
-end
-i = i + 2
-elseif a:sub(1,2) == "-c" then
-count = tonumber(a:sub(3))
-if not count or count < 1 then
-print("ping: invalid count")
-exit(1)
-end
-i = i + 1
-elseif a:sub(1,2) == "-i" then
-interval = tonumber(a:sub(3))
-if not interval or interval < 0.1 then
-print("ping: invalid interval")
-exit(1)
-end
-i = i + 1
-elseif a == "-h" or a == "--help" then
-print("usage: ping [-c count] [-i interval] host")
-exit(0)
-elseif a:sub(1,1) == "-" then
-print("ping: unknown option: " .. a)
-exit(1)
-else
-host = a
-i = i + 1
-end
+  local a = args[i]
+  if a == "-c" and i < #args then
+    count = tonumber(args[i+1])
+    if not count or count < 1 then
+      print("ping: invalid count")
+      exit(1)
+    end
+    i = i + 2
+  elseif a == "-i" and i < #args then
+    interval = tonumber(args[i+1])
+    if not interval or interval < 0.1 then
+      print("ping: invalid interval")
+      exit(1)
+    end
+    i = i + 2
+  elseif a:sub(1,2) == "-c" then
+    count = tonumber(a:sub(3))
+    if not count or count < 1 then
+      print("ping: invalid count")
+      exit(1)
+    end
+    i = i + 1
+  elseif a:sub(1,2) == "-i" then
+    interval = tonumber(a:sub(3))
+    if not interval or interval < 0.1 then
+      print("ping: invalid interval")
+      exit(1)
+    end
+    i = i + 1
+  elseif a == "-h" or a == "--help" then
+    print("usage: ping [-c count] [-i interval] host")
+    exit(0)
+  elseif a:sub(1,1) == "-" then
+    print("ping: unknown option: " .. a)
+    exit(1)
+  else
+    host = a
+    i = i + 1
+  end
 end
 
 if not host then
-print("usage: ping [-c count] [-i interval] host")
-exit(1)
+  print("usage: ping [-c count] [-i interval] host")
+  exit(1)
 end
 
+-- Resolve host to IP (try /etc/hosts first, then treat as IP)
 local dest_ip = nil
 local function resolve_host(name)
-local fd = open("/etc/hosts", 0)
-if fd then
-local data = ""
-while true do
-local chunk = read(fd, 4096)
-if not chunk or #chunk == 0 then break end
-data = data .. chunk
-end
-close(fd)
-for line in data:gmatch("[^\n]+") do
-if not line:match("^#") then
-local ip, hostnames = line:match("^(%d+%.%d+%.%d+%.%d+)%s+(.+)$")
-if ip then
-for h in hostnames:gmatch("%S+") do
-if h == name then return ip end
-end
-end
-end
-end
-end
-if name:match("^%d+%.%d+%.%d+%.%d+$") then
-return name
-end
-return nil
+  -- Check /etc/hosts
+  local fd = open("/etc/hosts", 0)
+  if fd then
+    local data = ""
+    while true do
+      local chunk = read(fd, 4096)
+      if not chunk or #chunk == 0 then break end
+      data = data .. chunk
+    end
+    close(fd)
+    for line in data:gmatch("[^\n]+") do
+      if not line:match("^#") then
+        local ip, hostnames = line:match("^(%d+%.%d+%.%d+%.%d+)%s+(.+)$")
+        if ip then
+          for h in hostnames:gmatch("%S+") do
+            if h == name then return ip end
+          end
+        end
+      end
+    end
+  end
+  -- Treat as literal IP
+  if name:match("^%d+%.%d+%.%d+%.%d+$") then
+    return name
+  end
+  return nil
 end
 
 dest_ip = resolve_host(host)
 if not dest_ip then
-print("ping: unknown host " .. host)
-exit(1)
+  print("ping: unknown host " .. host)
+  exit(1)
 end
 
+-- Create ICMP socket
 local fd = socket("icmp", "dgram", 1)
 if not fd then
-print("ping: failed to create ICMP socket")
-exit(1)
+  print("ping: failed to create ICMP socket")
+  exit(1)
 end
 
+-- Bind to receive all ICMP
 local ok, err = bind(fd, "0.0.0.0")
 if not ok then
-print("ping: bind failed: " .. (err or "unknown"))
-exit(1)
+  print("ping: bind failed: " .. (err or "unknown"))
+  exit(1)
 end
 
+-- ICMP echo request helpers
 local function build_echo(ident, seq, payload)
-local header = string.char(8, 0, 0, 0,
-math.floor(ident / 256), ident % 256,
-math.floor(seq / 256), seq % 256)
-local data = header .. payload
-local sum = 0
-for i = 1, #data, 2 do
-local hi = data:byte(i) or 0
-local lo = data:byte(i + 1) or 0
-sum = sum + hi * 256 + lo
-end
-while sum > 0xFFFF do
-sum = (sum % 0x10000) + math.floor(sum / 0x10000)
-end
-local cs = bxor(sum, 0xFFFF)
-return string.char(8, 0, math.floor(cs / 256), cs % 256,
-math.floor(ident / 256), ident % 256,
-math.floor(seq / 256), seq % 256) .. payload
+  -- type=8 (echo request), code=0, checksum=0 (computed later), ident, seq
+  local header = string.char(8, 0, 0, 0,
+    math.floor(ident / 256), ident % 256,
+    math.floor(seq / 256), seq % 256)
+  local data = header .. payload
+  -- Compute ICMP checksum
+  local sum = 0
+  for i = 1, #data, 2 do
+    local hi = data:byte(i) or 0
+    local lo = data:byte(i + 1) or 0
+    sum = sum + hi * 256 + lo
+  end
+  while sum > 0xFFFF do
+    sum = (sum % 0x10000) + math.floor(sum / 0x10000)
+  end
+  local cs = bxor(sum, 0xFFFF)
+  return string.char(8, 0, math.floor(cs / 256), cs % 256,
+    math.floor(ident / 256), ident % 256,
+    math.floor(seq / 256), seq % 256) .. payload
 end
 
 local function parse_icmp(data)
-if #data < 8 then return nil end
-local typ = data:byte(1)
-local code = data:byte(2)
-local ident = data:byte(5) * 256 + data:byte(6)
-local seq = data:byte(7) * 256 + data:byte(8)
-return typ, code, ident, seq
+  if #data < 8 then return nil end
+  local typ = data:byte(1)
+  local code = data:byte(2)
+  local ident = data:byte(5) * 256 + data:byte(6)
+  local seq = data:byte(7) * 256 + data:byte(8)
+  return typ, code, ident, seq
 end
 
+-- Generate a timestamp payload (8 bytes: seconds since boot as float approximation)
 local function make_payload()
-local t = os.clock()
-local sec = math.floor(t)
-local usec = math.floor((t - sec) * 1000000)
-return string.char(
-math.floor(sec / 256) % 256, sec % 256,
-math.floor(usec / 256) % 256, usec % 256,
-0, 0, 0, 0)
+  local t = os.clock()
+  local sec = math.floor(t)
+  local usec = math.floor((t - sec) * 1000000)
+  return string.char(
+    math.floor(sec / 256) % 256, sec % 256,
+    math.floor(usec / 256) % 256, usec % 256,
+    0, 0, 0, 0)
 end
 
+-- Main ping loop
 local ident = math.random(1, 65535)
 local seq = 0
 local sent = 0
@@ -518,291 +577,316 @@ local sum_rtt = 0
 print("PING " .. host .. " (" .. dest_ip .. ") 56(84) bytes of data.")
 
 while true do
-if count and sent >= count then break end
+  if count and sent >= count then break end
 
-seq = seq + 1
-local payload = make_payload()
-local pkt = build_echo(ident, seq, payload)
-local send_time = os.clock()
+  -- Build and send echo request
+  seq = seq + 1
+  local payload = make_payload()
+  local pkt = build_echo(ident, seq, payload)
+  local send_time = os.clock()
 
-local ok, err = sendto(fd, pkt, dest_ip, 0)
-if not ok then
-print("ping: sendto failed: " .. (err or "unknown"))
-break
-end
-sent = sent + 1
+  local ok, err = sendto(fd, pkt, dest_ip, 0)
+  if not ok then
+    print("ping: sendto failed: " .. (err or "unknown"))
+    break
+  end
+  sent = sent + 1
 
-local reply = nil
-local reply_ip = nil
-local deadline = os.clock() + 2.0
-while os.clock() < deadline do
-reply, reply_ip = recvfrom(fd)
-if reply then
-local rtyp, rcode, rident, rseq = parse_icmp(reply)
-if rtyp == 0 and rident == ident and rseq == seq then
-break
-end
-reply = nil
-end
+  -- Wait for reply (with timeout)
+  local reply = nil
+  local reply_ip = nil
+  local deadline = os.clock() + 2.0  -- 2 second timeout
+
+  while os.clock() < deadline do
+    reply, reply_ip = recvfrom(fd)
+    if reply then
+      local rtyp, rcode, rident, rseq = parse_icmp(reply)
+      if rtyp == 0 and rident == ident and rseq == seq then
+        break
+      end
+      -- Not our reply, keep waiting
+      reply = nil
+    end
+  end
+
+  local rtt = (os.clock() - send_time) * 1000  -- ms
+
+  if reply then
+    received = received + 1
+    sum_rtt = sum_rtt + rtt
+    if not min_rtt or rtt < min_rtt then min_rtt = rtt end
+    if not max_rtt or rtt > max_rtt then max_rtt = rtt end
+    print(#reply .. " bytes from " .. (reply_ip or dest_ip) ..
+          ": icmp_seq=" .. seq .. " ttl=64 time=" ..
+          string.format("%.3f", rtt) .. " ms")
+  else
+    print("Request timeout for icmp_seq " .. seq)
+  end
+
+  -- Wait for interval between pings
+  if not count or sent < count then
+    local wait_until = os.clock() + interval
+    while os.clock() < wait_until do
+      -- Small sleep to avoid busy-waiting
+      sleep(0.05)
+    end
+  end
 end
 
-local rtt = (os.clock() - send_time) * 1000
-if reply then
-received = received + 1
-sum_rtt = sum_rtt + rtt
-if not min_rtt or rtt < min_rtt then min_rtt = rtt end
-if not max_rtt or rtt > max_rtt then max_rtt = rtt end
-print(#reply .. " bytes from " .. (reply_ip or dest_ip) ..
-": icmp_seq=" .. seq .. " ttl=64 time=" ..
-string.format("%.3f", rtt) .. " ms")
-else
-print("Request timeout for icmp_seq " .. seq)
-end
-
-if not count or sent < count then
-local wait_until = os.clock() + interval
-while os.clock() < wait_until do
-sleep(0.05)
-end
-end
-end
-
+-- Print statistics
 print("")
 print("--- " .. host .. " ping statistics ---")
 local loss = 0
 if sent > 0 then
-loss = math.floor((1 - received / sent) * 100 + 0.5)
+  loss = math.floor((1 - received / sent) * 100 + 0.5)
 end
 print(sent .. " packets transmitted, " .. received .. " received, " ..
-loss .. "% packet loss")
+      loss .. "% packet loss")
 
 if received > 0 then
-local avg = sum_rtt / received
-print("rtt min/avg/max = " ..
-string.format("%.3f", min_rtt) .. "/" ..
-string.format("%.3f", avg) .. "/" ..
-string.format("%.3f", max_rtt) .. " ms")
+  local avg = sum_rtt / received
+  print("rtt min/avg/max = " ..
+        string.format("%.3f", min_rtt) .. "/" ..
+        string.format("%.3f", avg) .. "/" ..
+        string.format("%.3f", max_rtt) .. " ms")
 end
 
 close(fd)
 exit(0)
----FILE /usr/bin/route.lua 0755 2643 8ee2eb90 src---
+---FILE /usr/bin/route.lua 0755 3499 56a67a40 src---
+-- route: show/manipulate the IP routing table
+-- Usage: route [-n]
+--        route add -net <dest> netmask <mask> gw <gw>
+--        route del -net <dest> netmask <mask> gw <gw>
 
 local function read_sys(path)
-local fd = open(path, "r")
-if not fd then return nil end
-local chunks = {}
-while true do
-local data = read(fd, 4096)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-local s = table.concat(chunks)
-return s:gsub("%s+$", "")
+    local fd = open(path, "r")
+    if not fd then return nil end
+    local chunks = {}
+    while true do
+        local data = read(fd, 4096)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    local s = table.concat(chunks)
+    return s:gsub("%s+$", "")
 end
 
 local function write_sys(path, value)
-local fd = open(path, "w")
-if not fd then return false, "cannot open " .. path .. " for writing" end
-write(fd, value .. "\n")
-close(fd)
-return true
+    local fd = open(path, "w")
+    if not fd then return false, "cannot open " .. path .. " for writing" end
+    write(fd, value .. "\n")
+    close(fd)
+    return true
 end
 
 local function usage()
-print("usage: route [-n]")
-print("       route add -net dest netmask mask gw gateway")
-print("       route del -net dest netmask mask gw gateway")
-exit(1)
+    print("usage: route [-n]")
+    print("       route add -net dest netmask mask gw gateway")
+    print("       route del -net dest netmask mask gw gateway")
+    exit(1)
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 1 then
-local routes = read_sys("/sys/net/routes")
-if not routes or routes == "" then
-print("route: no routing information available")
-exit(0)
-end
-print("Kernel IP routing table")
-print("Destination     Gateway         Mask            Metric")
-for line in routes:gmatch("[^\n]+") do
-print(line)
-end
-exit(0)
+    -- show routes
+    local routes = read_sys("/sys/net/routes")
+    if not routes or routes == "" then
+        print("route: no routing information available")
+        exit(0)
+    end
+    print("Kernel IP routing table")
+    print("Destination     Gateway         Mask            Metric")
+    for line in routes:gmatch("[^\n]+") do
+        print(line)
+    end
+    exit(0)
 end
 
 local cmd = args[1]
 
 if cmd == "-n" then
-local routes = read_sys("/sys/net/routes")
-if not routes or routes == "" then
-print("route: no routing information available")
-exit(0)
-end
-print("Kernel IP routing table")
-print("Destination     Gateway         Mask            Metric")
-for line in routes:gmatch("[^\n]+") do
-print(line)
-end
-exit(0)
+    local routes = read_sys("/sys/net/routes")
+    if not routes or routes == "" then
+        print("route: no routing information available")
+        exit(0)
+    end
+    print("Kernel IP routing table")
+    print("Destination     Gateway         Mask            Metric")
+    for line in routes:gmatch("[^\n]+") do
+        print(line)
+    end
+    exit(0)
 elseif cmd == "add" then
-local dest, mask, gw
-local i = 2
-while i <= #args do
-local a = args[i]
-if a == "-net" then
-i = i + 1
-dest = args[i]
-elseif a == "netmask" then
-i = i + 1
-mask = args[i]
-elseif a == "gw" then
-i = i + 1
-gw = args[i]
-end
-i = i + 1
-end
-if not dest or not mask or not gw then
-print("route: add requires -net dest netmask mask gw gateway")
-usage()
-end
-local route_str = dest .. " " .. mask .. " " .. gw
-local ok, err = write_sys("/sys/net/routes", route_str)
-if not ok then
-print("route: " .. tostring(err))
-exit(1)
-end
-print("route: added " .. dest .. "/" .. mask .. " via " .. gw)
-exit(0)
+    -- route add -net dest netmask mask gw gateway
+    local dest, mask, gw
+    local i = 2
+    while i <= #args do
+        local a = args[i]
+        if a == "-net" then
+            i = i + 1
+            dest = args[i]
+        elseif a == "netmask" then
+            i = i + 1
+            mask = args[i]
+        elseif a == "gw" then
+            i = i + 1
+            gw = args[i]
+        end
+        i = i + 1
+    end
+    if not dest or not mask or not gw then
+        print("route: add requires -net dest netmask mask gw gateway")
+        usage()
+    end
+    local route_str = dest .. " " .. mask .. " " .. gw
+    local ok, err = write_sys("/sys/net/routes", route_str)
+    if not ok then
+        print("route: " .. tostring(err))
+        exit(1)
+    end
+    print("route: added " .. dest .. "/" .. mask .. " via " .. gw)
+    exit(0)
 elseif cmd == "del" then
-local dest, mask, gw
-local i = 2
-while i <= #args do
-local a = args[i]
-if a == "-net" then
-i = i + 1
-dest = args[i]
-elseif a == "netmask" then
-i = i + 1
-mask = args[i]
-elseif a == "gw" then
-i = i + 1
-gw = args[i]
-end
-i = i + 1
-end
-if not dest or not mask or not gw then
-print("route: del requires -net dest netmask mask gw gateway")
-usage()
-end
-local route_str = "del " .. dest .. " " .. mask .. " " .. gw
-local ok, err = write_sys("/sys/net/routes", route_str)
-if not ok then
-print("route: " .. tostring(err))
-exit(1)
-end
-print("route: deleted " .. dest .. "/" .. mask .. " via " .. gw)
-exit(0)
+    local dest, mask, gw
+    local i = 2
+    while i <= #args do
+        local a = args[i]
+        if a == "-net" then
+            i = i + 1
+            dest = args[i]
+        elseif a == "netmask" then
+            i = i + 1
+            mask = args[i]
+        elseif a == "gw" then
+            i = i + 1
+            gw = args[i]
+        end
+        i = i + 1
+    end
+    if not dest or not mask or not gw then
+        print("route: del requires -net dest netmask mask gw gateway")
+        usage()
+    end
+    local route_str = "del " .. dest .. " " .. mask .. " " .. gw
+    local ok, err = write_sys("/sys/net/routes", route_str)
+    if not ok then
+        print("route: " .. tostring(err))
+        exit(1)
+    end
+    print("route: deleted " .. dest .. "/" .. mask .. " via " .. gw)
+    exit(0)
 else
-usage()
+    usage()
 end
----FILE /usr/bin/wget.lua 0755 1691 99049bd9 src---
+---FILE /usr/bin/wget.lua 0755 2289 d9738f5f src---
+-- wget: fetch a URL via HTTP
+-- Usage: wget [-O file] URL
+-- Uses KNUCK AF_HTTP socket (http.get wrapped in socket API).
 
 local function read_all(fd)
-local chunks = {}
-while true do
-local data = read(fd, 65536)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-return table.concat(chunks)
+    local chunks = {}
+    while true do
+        local data = read(fd, 65536)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    return table.concat(chunks)
 end
 
 local function usage()
-print("usage: wget [-O file] URL")
-exit(1)
+    print("usage: wget [-O file] URL")
+    exit(1)
 end
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- Parse arguments
 local outfile = nil
 local url = nil
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-O" then
-i = i + 1
-if i > #args then
-print("wget: missing argument for -O")
-usage()
-end
-outfile = args[i]
-elseif a == "-O" and #a > 2 then
-outfile = a:sub(3)
-elseif a == "--help" or a == "-h" then
-usage()
-elseif a:sub(1,1) == "-" and #a > 1 then
-print("wget: unknown option: " .. a)
-usage()
-else
-url = a
-end
-i = i + 1
+    local a = args[i]
+    if a == "-O" then
+        i = i + 1
+        if i > #args then
+            print("wget: missing argument for -O")
+            usage()
+        end
+        outfile = args[i]
+    elseif a == "-O" and #a > 2 then
+        outfile = a:sub(3)
+    elseif a == "--help" or a == "-h" then
+        usage()
+    elseif a:sub(1,1) == "-" and #a > 1 then
+        print("wget: unknown option: " .. a)
+        usage()
+    else
+        url = a
+    end
+    i = i + 1
 end
 
 if not url then
-print("wget: missing URL")
-usage()
+    print("wget: missing URL")
+    usage()
 end
 
+-- Validate URL
 if not url:match("^https?://") then
-print("wget: invalid URL (must start with http:// or https://)")
-exit(1)
+    print("wget: invalid URL (must start with http:// or https://)")
+    exit(1)
 end
 
+-- Create HTTP socket
 local fd, err = socket("http", "stream", 0)
 if not fd then
-print("wget: socket creation failed: " .. tostring(err))
-exit(1)
+    print("wget: socket creation failed: " .. tostring(err))
+    exit(1)
 end
 
+-- Connect to URL
 local ok, cerr = connect(fd, url)
 if not ok then
-print("wget: connection failed: " .. tostring(cerr))
-close(fd)
-exit(1)
+    print("wget: connection failed: " .. tostring(cerr))
+    close(fd)
+    exit(1)
 end
 
+-- Send request (HTTP socket handles this via the send call)
 local ok, serr = send(fd, "")
 if not ok and serr ~= nil then
-print("wget: send failed: " .. tostring(serr))
-close(fd)
-exit(1)
+    print("wget: send failed: " .. tostring(serr))
+    close(fd)
+    exit(1)
 end
 
+-- Receive response body
 local body, rerr = recv(fd, 65536)
 close(fd)
 
 if not body then
-print("wget: recv failed: " .. tostring(rerr))
-exit(1)
+    print("wget: recv failed: " .. tostring(rerr))
+    exit(1)
 end
 
+-- Write output
 if outfile then
-local ofd = open(outfile, "w")
-if not ofd then
-print("wget: cannot open '" .. outfile .. "' for writing")
-exit(1)
-end
-write(ofd, body)
-close(ofd)
-print("wget: saved to " .. outfile .. " (" .. #body .. " bytes)")
+    local ofd = open(outfile, "w")
+    if not ofd then
+        print("wget: cannot open '" .. outfile .. "' for writing")
+        exit(1)
+    end
+    write(ofd, body)
+    close(ofd)
+    print("wget: saved to " .. outfile .. " (" .. #body .. " bytes)")
 else
-write(1, body)
+    -- Write to stdout
+    write(1, body)
 end
 
 exit(0)

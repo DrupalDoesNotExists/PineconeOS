@@ -3,7 +3,7 @@ name=vi
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=vi (1.0.0)
+description=Vi-style modal text editor
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,374 +15,421 @@ prerem=
 postrem=
 files=1
 ---END MANIFEST---
----FILE /usr/bin/vi.lua 0755 9077 ef4f441e src---
+---FILE /usr/bin/vi.lua 0755 12867 612be7b1 src---
+-- vi.lua — minimal modal text editor for PineconeOS
+-- Usage: vi [file]
+-- Sandbox globals: open, read, write, close, stat, exit, print, select
 
+-- ===== Helpers =====
 
 local function read_all(fd)
-local p = {}
-while true do
-local c = read(fd, 65536)
-if not c or #c == 0 then break end
-p[#p+1] = c
-end
-return table.concat(p)
+    local p = {}
+    while true do
+        local c = read(fd, 65536)
+        if not c or #c == 0 then break end
+        p[#p+1] = c
+    end
+    return table.concat(p)
 end
 
 local function split_lines(t)
-if not t or #t == 0 then return {} end
-local r, s = {}, 1
-while s <= #t do
-local nl = t:find("\n", s, true)
-if nl then
-r[#r+1] = t:sub(s, nl-1)
-s = nl+1
-else
-r[#r+1] = t:sub(s)
-break
-end
-end
-return r
+    if not t or #t == 0 then return {} end
+    local r, s = {}, 1
+    while s <= #t do
+        local nl = t:find("\n", s, true)
+        if nl then
+            r[#r+1] = t:sub(s, nl-1)
+            s = nl+1
+        else
+            r[#r+1] = t:sub(s)
+            break
+        end
+    end
+    return r
 end
 
 local function clamp(v, lo, hi)
-return v < lo and lo or (v > hi and hi or v)
+    return v < lo and lo or (v > hi and hi or v)
 end
 
+-- ===== Args =====
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- ===== State =====
 local buf = {}
 local row, col = 1, 1
-local mode = "normal"   local filepath = args[1]
+local mode = "normal"   -- normal | insert | command
+local filepath = args[1]
 local modified = false
 local cmd_buf = ""
 local pending = ""
 local msg = ""
 local running = true
 
+-- ===== Load file =====
 if filepath then
-local fd = open(filepath, "r")
-if fd then
-buf = split_lines(read_all(fd))
-close(fd)
-end
+    local fd = open(filepath, "r")
+    if fd then
+        buf = split_lines(read_all(fd))
+        close(fd)
+    end
 end
 if #buf == 0 then buf = {""} end
 
+-- ===== Cursor clamp =====
 local function fix()
-row = clamp(row, 1, #buf)
-col = clamp(col, 1, #(buf[row] or "") + 1)
+    row = clamp(row, 1, #buf)
+    col = clamp(col, 1, #(buf[row] or "") + 1)
 end
 
+-- ===== Display =====
 local function redraw()
-write(1, "\27[2J\27[H")
-local n = #buf
-local w = #tostring(n > 0 and n or 1)
-for i=1,n do
-write(1, string.format("%"..w.."d ", i) .. (buf[i] or "") .. "\n")
-end
-local fn = filepath or "[No Name]"
-local st = fn
-if modified then st = st .. " [+]" end
-if mode == "normal" then
-st = st .. "  -- NORMAL --"
-elseif mode == "insert" then
-st = st .. "  -- INSERT --"
-elseif mode == "command" then
-st = st .. "  :" .. cmd_buf
-end
-if msg ~= "" then st = st .. "  " .. msg; msg = "" end
-write(1, "\27[2K" .. st .. "\n")
-write(1, "\27[" .. row .. ";" .. (col + w + 1) .. "H")
+    write(1, "\27[2J\27[H")
+    local n = #buf
+    local w = #tostring(n > 0 and n or 1)
+    for i=1,n do
+        write(1, string.format("%"..w.."d ", i) .. (buf[i] or "") .. "\n")
+    end
+    -- status line
+    local fn = filepath or "[No Name]"
+    local st = fn
+    if modified then st = st .. " [+]" end
+    if mode == "normal" then
+        st = st .. "  -- NORMAL --"
+    elseif mode == "insert" then
+        st = st .. "  -- INSERT --"
+    elseif mode == "command" then
+        st = st .. "  :" .. cmd_buf
+    end
+    if msg ~= "" then st = st .. "  " .. msg; msg = "" end
+    write(1, "\27[2K" .. st .. "\n")
+    -- approx cursor position
+    write(1, "\27[" .. row .. ";" .. (col + w + 1) .. "H")
 end
 
+-- ===== File save =====
 local function save(p)
-p = p or filepath
-if not p then msg = "No filename"; return false end
-filepath = p
-local fd, e = open(p, "w")
-if not fd then msg = "Write error: " .. (e or "?"); return false end
-local c = table.concat(buf, "\n")
-if #buf > 0 then c = c .. "\n" end
-write(fd, c)
-close(fd)
-modified = false
-return true
+    p = p or filepath
+    if not p then msg = "No filename"; return false end
+    filepath = p
+    local fd, e = open(p, "w")
+    if not fd then msg = "Write error: " .. (e or "?"); return false end
+    local c = table.concat(buf, "\n")
+    if #buf > 0 then c = c .. "\n" end
+    write(fd, c)
+    close(fd)
+    modified = false
+    return true
 end
 
+-- ===== Single-char input =====
 local function read_key()
-local ch = read(0, 1)
-if not ch or ch == "" then return nil end
-return ch
+    local ch = read(0, 1)
+    if not ch or ch == "" then return nil end
+    return ch
 end
 
+-- ===== NORMAL mode =====
 local function do_normal(k)
-if pending == "d" then
-pending = ""
-if k == "d" then
-table.remove(buf, row)
-if #buf == 0 then buf = {""} end
-fix(); modified = true; msg = "1 line deleted"
-end
-return
-end
-if pending == "g" then
-pending = ""
-if k == "g" then row, col = 1, 1 end
-return
+    -- pending dd
+    if pending == "d" then
+        pending = ""
+        if k == "d" then
+            table.remove(buf, row)
+            if #buf == 0 then buf = {""} end
+            fix(); modified = true; msg = "1 line deleted"
+        end
+        return
+    end
+    -- pending gg
+    if pending == "g" then
+        pending = ""
+        if k == "g" then row, col = 1, 1 end
+        return
+    end
+
+    if k == "i" then
+        mode = "insert"
+    elseif k == "a" then
+        mode = "insert"; col = col + 1; fix()
+    elseif k == "A" then
+        mode = "insert"; col = #(buf[row] or "") + 1
+    elseif k == "I" then
+        mode = "insert"; col = 1
+    elseif k == "o" then
+        table.insert(buf, row + 1, ""); row = row + 1; col = 1
+        mode = "insert"; modified = true
+    elseif k == "O" then
+        table.insert(buf, row, ""); col = 1
+        mode = "insert"; modified = true
+    elseif k == "h" then
+        col = math.max(1, col - 1)
+    elseif k == "l" then
+        col = math.min(#(buf[row] or "") + 1, col + 1)
+    elseif k == "j" then
+        row = math.min(#buf, row + 1); fix()
+    elseif k == "k" then
+        row = math.max(1, row - 1); fix()
+    elseif k == "x" then
+        local ln = buf[row]
+        if #ln > 0 then
+            local c = clamp(col, 1, #ln)
+            buf[row] = ln:sub(1, c-1) .. ln:sub(c+1)
+            modified = true; fix()
+        end
+    elseif k == "d" then
+        pending = "d"; msg = "d"
+    elseif k == "g" then
+        pending = "g"; msg = "g"
+    elseif k == "G" then
+        row = #buf; fix()
+    elseif k == "0" then
+        col = 1
+    elseif k == "$" then
+        col = #(buf[row] or "") + 1
+    elseif k == "w" then
+        -- next word start
+        local ln = buf[row] or ""
+        local p = col
+        while p <= #ln and ln:sub(p,p):match("%w") do p = p + 1 end
+        while p <= #ln and ln:sub(p,p):match("%s") do p = p + 1 end
+        if p <= #ln then col = p end
+    elseif k == "b" then
+        -- prev word start
+        local ln = buf[row] or ""
+        local p = col - 1
+        while p >= 1 and ln:sub(p,p):match("%s") do p = p - 1 end
+        while p >= 1 and ln:sub(p,p):match("%w") do p = p - 1 end
+        col = math.max(1, p + 1)
+    elseif k == ":" then
+        mode = "command"; cmd_buf = ""
+    elseif k == "q" then
+        if modified then msg = "No write since last change (add ! to override)"
+        else running = false end
+    elseif k == "\3" then   -- Ctrl+C
+        running = false
+    end
 end
 
-if k == "i" then
-mode = "insert"
-elseif k == "a" then
-mode = "insert"; col = col + 1; fix()
-elseif k == "A" then
-mode = "insert"; col = #(buf[row] or "") + 1
-elseif k == "I" then
-mode = "insert"; col = 1
-elseif k == "o" then
-table.insert(buf, row + 1, ""); row = row + 1; col = 1
-mode = "insert"; modified = true
-elseif k == "O" then
-table.insert(buf, row, ""); col = 1
-mode = "insert"; modified = true
-elseif k == "h" then
-col = math.max(1, col - 1)
-elseif k == "l" then
-col = math.min(#(buf[row] or "") + 1, col + 1)
-elseif k == "j" then
-row = math.min(#buf, row + 1); fix()
-elseif k == "k" then
-row = math.max(1, row - 1); fix()
-elseif k == "x" then
-local ln = buf[row]
-if #ln > 0 then
-local c = clamp(col, 1, #ln)
-buf[row] = ln:sub(1, c-1) .. ln:sub(c+1)
-modified = true; fix()
-end
-elseif k == "d" then
-pending = "d"; msg = "d"
-elseif k == "g" then
-pending = "g"; msg = "g"
-elseif k == "G" then
-row = #buf; fix()
-elseif k == "0" then
-col = 1
-elseif k == "$" then
-col = #(buf[row] or "") + 1
-elseif k == "w" then
-local ln = buf[row] or ""
-local p = col
-while p <= #ln and ln:sub(p,p):match("%w") do p = p + 1 end
-while p <= #ln and ln:sub(p,p):match("%s") do p = p + 1 end
-if p <= #ln then col = p end
-elseif k == "b" then
-local ln = buf[row] or ""
-local p = col - 1
-while p >= 1 and ln:sub(p,p):match("%s") do p = p - 1 end
-while p >= 1 and ln:sub(p,p):match("%w") do p = p - 1 end
-col = math.max(1, p + 1)
-elseif k == ":" then
-mode = "command"; cmd_buf = ""
-elseif k == "q" then
-if modified then msg = "No write since last change (add ! to override)"
-else running = false end
-elseif k == "\3" then           running = false
-end
-end
-
+-- ===== INSERT mode =====
 local function do_insert(k)
-if k == "\27" then           mode = "normal"
-if col > 1 then col = col - 1 end
-fix()
-elseif k == "\13" or k == "\10" then           local ln = buf[row] or ""
-buf[row] = ln:sub(1, col-1)
-table.insert(buf, row + 1, ln:sub(col))
-row = row + 1; col = 1; modified = true
-elseif k == "\127" or k == "\8" then           if col > 1 then
-local ln = buf[row]
-buf[row] = ln:sub(1, col-2) .. ln:sub(col)
-col = col - 1; modified = true
-elseif row > 1 then
-local prev = buf[row - 1]
-col = #prev + 1
-buf[row - 1] = prev .. (buf[row] or "")
-table.remove(buf, row); row = row - 1; modified = true
-end
-elseif k == "\9" then           local ln = buf[row]
-buf[row] = ln:sub(1, col-1) .. "    " .. ln:sub(col)
-col = col + 4; modified = true
-elseif #k == 1 and k:byte() >= 32 then           local ln = buf[row] or ""
-buf[row] = ln:sub(1, col-1) .. k .. ln:sub(col)
-col = col + 1; modified = true
-end
+    if k == "\27" then   -- ESC
+        mode = "normal"
+        if col > 1 then col = col - 1 end
+        fix()
+    elseif k == "\13" or k == "\10" then   -- Enter
+        local ln = buf[row] or ""
+        buf[row] = ln:sub(1, col-1)
+        table.insert(buf, row + 1, ln:sub(col))
+        row = row + 1; col = 1; modified = true
+    elseif k == "\127" or k == "\8" then   -- Backspace
+        if col > 1 then
+            local ln = buf[row]
+            buf[row] = ln:sub(1, col-2) .. ln:sub(col)
+            col = col - 1; modified = true
+        elseif row > 1 then
+            local prev = buf[row - 1]
+            col = #prev + 1
+            buf[row - 1] = prev .. (buf[row] or "")
+            table.remove(buf, row); row = row - 1; modified = true
+        end
+    elseif k == "\9" then   -- Tab
+        local ln = buf[row]
+        buf[row] = ln:sub(1, col-1) .. "    " .. ln:sub(col)
+        col = col + 4; modified = true
+    elseif #k == 1 and k:byte() >= 32 then   -- printable
+        local ln = buf[row] or ""
+        buf[row] = ln:sub(1, col-1) .. k .. ln:sub(col)
+        col = col + 1; modified = true
+    end
 end
 
+-- ===== COMMAND mode =====
 local function do_command(k)
-if k == "\13" or k == "\10" then           local c = cmd_buf
-if c == "" then
-mode = "normal"
-elseif c == "w" then
-if save() then msg = "\"" .. filepath .. "\" " .. #buf .. "L, written" end
-mode = "normal"
-elseif c == "q" then
-if modified then msg = "No write since last change (add ! to override)"
-else running = false end
-mode = "normal"
-elseif c == "wq" then
-if save() then running = false else msg = "Write failed" end
-mode = "normal"
-elseif c == "q!" then
-running = false; mode = "normal"
-elseif c == "x" then
-if save() then running = false end; mode = "normal"
-elseif c:match("^w%s+(.+)$") then
-local p = c:match("^w%s+(.+)$")
-if save(p) then msg = "\"" .. p .. "\" written" end
-mode = "normal"
-elseif c == "wq!" then
-if save() then running = false end; mode = "normal"
-else
-msg = "E: unknown command " .. c; mode = "normal"
+    if k == "\13" or k == "\10" then   -- Enter
+        local c = cmd_buf
+        if c == "" then
+            mode = "normal"
+        elseif c == "w" then
+            if save() then msg = "\"" .. filepath .. "\" " .. #buf .. "L, written" end
+            mode = "normal"
+        elseif c == "q" then
+            if modified then msg = "No write since last change (add ! to override)"
+            else running = false end
+            mode = "normal"
+        elseif c == "wq" then
+            if save() then running = false else msg = "Write failed" end
+            mode = "normal"
+        elseif c == "q!" then
+            running = false; mode = "normal"
+        elseif c == "x" then
+            if save() then running = false end; mode = "normal"
+        elseif c:match("^w%s+(.+)$") then
+            local p = c:match("^w%s+(.+)$")
+            if save(p) then msg = "\"" .. p .. "\" written" end
+            mode = "normal"
+        elseif c == "wq!" then
+            if save() then running = false end; mode = "normal"
+        else
+            msg = "E: unknown command " .. c; mode = "normal"
+        end
+        cmd_buf = ""
+    elseif k == "\27" then   -- ESC
+        mode = "normal"; cmd_buf = ""
+    elseif k == "\127" or k == "\8" then   -- Backspace
+        if #cmd_buf > 0 then cmd_buf = cmd_buf:sub(1, -2)
+        else mode = "normal" end
+    elseif #k == 1 and k:byte() >= 32 then
+        cmd_buf = cmd_buf .. k
+    end
 end
-cmd_buf = ""
-elseif k == "\27" then           mode = "normal"; cmd_buf = ""
-elseif k == "\127" or k == "\8" then           if #cmd_buf > 0 then cmd_buf = cmd_buf:sub(1, -2)
-else mode = "normal" end
-elseif #k == 1 and k:byte() >= 32 then
-cmd_buf = cmd_buf .. k
-end
-end
+
+-- ===== Line-based fallback mode =====
+-- Used when raw single-char input is unavailable (e.g. cooked terminal).
+-- In this mode, each input line is parsed as a vi command.
 
 local function do_line_normal(line)
-if line == "" then return end
-if line == "i" then
-mode = "insert"
-elseif line == "a" then
-mode = "insert"; col = col + 1; fix()
-elseif line == "o" then
-table.insert(buf, row + 1, ""); row = row + 1; col = 1
-mode = "insert"; modified = true
-elseif line == "h" then
-col = math.max(1, col - 1)
-elseif line == "l" then
-col = math.min(#(buf[row] or "") + 1, col + 1)
-elseif line == "j" then
-row = math.min(#buf, row + 1); fix()
-elseif line == "k" then
-row = math.max(1, row - 1); fix()
-elseif line == "dd" then
-table.remove(buf, row)
-if #buf == 0 then buf = {""} end
-fix(); modified = true; msg = "1 line deleted"
-elseif line == "x" then
-local ln = buf[row]
-if #ln > 0 then
-local c = clamp(col, 1, #ln)
-buf[row] = ln:sub(1, c-1) .. ln:sub(c+1)
-modified = true; fix()
-end
-elseif line == "G" then
-row = #buf; fix()
-elseif line == "gg" then
-row, col = 1, 1
-elseif line == "0" then
-col = 1
-elseif line == "$" then
-col = #(buf[row] or "") + 1
-elseif line == "q" then
-if modified then msg = "No write (use q!)" else running = false end
-elseif line == "q!" then
-running = false
-elseif line == "w" then
-if save() then msg = "Written" end
-elseif line == "wq" then
-if save() then running = false end
-elseif line:sub(1, 1) == ":" then
-local c = line:sub(2)
-if c == "w" then
-if save() then msg = "Written" end
-elseif c == "q" then
-if modified then msg = "No write (use :q!)" else running = false end
-elseif c == "wq" then
-if save() then running = false end
-elseif c == "q!" then
-running = false
-elseif c == "x" then
-if save() then running = false end
-elseif c:match("^w%s+(.+)$") then
-local p = c:match("^w%s+(.+)$")
-if save(p) then msg = "Written to " .. p end
-else
-msg = "E: unknown command " .. c
-end
-else
-do_normal(line:sub(1, 1))
-end
+    if line == "" then return end
+    if line == "i" then
+        mode = "insert"
+    elseif line == "a" then
+        mode = "insert"; col = col + 1; fix()
+    elseif line == "o" then
+        table.insert(buf, row + 1, ""); row = row + 1; col = 1
+        mode = "insert"; modified = true
+    elseif line == "h" then
+        col = math.max(1, col - 1)
+    elseif line == "l" then
+        col = math.min(#(buf[row] or "") + 1, col + 1)
+    elseif line == "j" then
+        row = math.min(#buf, row + 1); fix()
+    elseif line == "k" then
+        row = math.max(1, row - 1); fix()
+    elseif line == "dd" then
+        table.remove(buf, row)
+        if #buf == 0 then buf = {""} end
+        fix(); modified = true; msg = "1 line deleted"
+    elseif line == "x" then
+        local ln = buf[row]
+        if #ln > 0 then
+            local c = clamp(col, 1, #ln)
+            buf[row] = ln:sub(1, c-1) .. ln:sub(c+1)
+            modified = true; fix()
+        end
+    elseif line == "G" then
+        row = #buf; fix()
+    elseif line == "gg" then
+        row, col = 1, 1
+    elseif line == "0" then
+        col = 1
+    elseif line == "$" then
+        col = #(buf[row] or "") + 1
+    elseif line == "q" then
+        if modified then msg = "No write (use q!)" else running = false end
+    elseif line == "q!" then
+        running = false
+    elseif line == "w" then
+        if save() then msg = "Written" end
+    elseif line == "wq" then
+        if save() then running = false end
+    elseif line:sub(1, 1) == ":" then
+        local c = line:sub(2)
+        if c == "w" then
+            if save() then msg = "Written" end
+        elseif c == "q" then
+            if modified then msg = "No write (use :q!)" else running = false end
+        elseif c == "wq" then
+            if save() then running = false end
+        elseif c == "q!" then
+            running = false
+        elseif c == "x" then
+            if save() then running = false end
+        elseif c:match("^w%s+(.+)$") then
+            local p = c:match("^w%s+(.+)$")
+            if save(p) then msg = "Written to " .. p end
+        else
+            msg = "E: unknown command " .. c
+        end
+    else
+        -- try single-char fallback
+        do_normal(line:sub(1, 1))
+    end
 end
 
 local function do_line_insert(line)
-if line == "." then
-mode = "normal"
-if col > 1 then col = col - 1 end
-fix()
-return
+    if line == "." then
+        mode = "normal"
+        if col > 1 then col = col - 1 end
+        fix()
+        return
+    end
+    local ln = buf[row] or ""
+    buf[row] = ln:sub(1, col-1) .. line
+    table.insert(buf, row + 1, ln:sub(col))
+    row = row + 1; col = 1; modified = true
 end
-local ln = buf[row] or ""
-buf[row] = ln:sub(1, col-1) .. line
-table.insert(buf, row + 1, ln:sub(col))
-row = row + 1; col = 1; modified = true
-end
+
+-- ===== Input mode detection & main loop =====
+-- Try character-at-a-time first. If first read returns a full line
+-- (contains newline), switch to line-based mode.
 
 local first = read_key()
 if first then
-if #first > 1 or first:find("\n") or first:find("\r") then
-local line_buf = first:gsub("[\r\n]+$", "")
-while running do
-redraw()
-while #line_buf > 0 do
-local nl_pos = line_buf:find("\n")
-local one_line
-if nl_pos then
-one_line = line_buf:sub(1, nl_pos - 1)
-line_buf = line_buf:sub(nl_pos + 1)
+    -- Check if we got a multi-char line (cooked mode / pipe)
+    if #first > 1 or first:find("\n") or first:find("\r") then
+        -- Line-based mode: buffer reads until newline
+        local line_buf = first:gsub("[\r\n]+$", "")
+        while running do
+            redraw()
+            -- process buffered lines
+            while #line_buf > 0 do
+                local nl_pos = line_buf:find("\n")
+                local one_line
+                if nl_pos then
+                    one_line = line_buf:sub(1, nl_pos - 1)
+                    line_buf = line_buf:sub(nl_pos + 1)
+                else
+                    one_line = line_buf
+                    line_buf = ""
+                end
+                one_line = one_line:gsub("\r$", "")
+                if mode == "normal" then
+                    do_line_normal(one_line)
+                elseif mode == "insert" then
+                    do_line_insert(one_line)
+                end
+                if not running then break end
+            end
+            if not running then break end
+            -- read more input
+            local chunk = read(0, 4096)
+            if not chunk or chunk == "" then break end
+            line_buf = line_buf .. chunk
+        end
+    else
+        -- Character-at-a-time mode
+        -- Process the first char we already read
+        if mode == "normal" then do_normal(first)
+        elseif mode == "insert" then do_insert(first)
+        elseif mode == "command" then do_command(first)
+        end
+
+        while running do
+            redraw()
+            local k = read_key()
+            if not k then break end
+            if mode == "normal" then do_normal(k)
+            elseif mode == "insert" then do_insert(k)
+            elseif mode == "command" then do_command(k)
+            end
+        end
+    end
 else
-one_line = line_buf
-line_buf = ""
-end
-one_line = one_line:gsub("\r$", "")
-if mode == "normal" then
-do_line_normal(one_line)
-elseif mode == "insert" then
-do_line_insert(one_line)
-end
-if not running then break end
-end
-if not running then break end
-local chunk = read(0, 4096)
-if not chunk or chunk == "" then break end
-line_buf = line_buf .. chunk
-end
-else
-if mode == "normal" then do_normal(first)
-elseif mode == "insert" then do_insert(first)
-elseif mode == "command" then do_command(first)
+    -- No input available — just display and exit
+    redraw()
 end
 
-while running do
-redraw()
-local k = read_key()
-if not k then break end
-if mode == "normal" then do_normal(k)
-elseif mode == "insert" then do_insert(k)
-elseif mode == "command" then do_command(k)
-end
-end
-end
-else
-redraw()
-end
-
+-- Final cleanup
 write(1, "\27[2J\27[H")
 ---END PKG---

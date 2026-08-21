@@ -3,7 +3,7 @@ name=dhcp
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=dhcp (1.0.0)
+description=DHCP client - obtain IP configuration via UDP broadcast
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,271 +15,330 @@ prerem=
 postrem=
 files=1
 ---END MANIFEST---
----FILE /usr/bin/dhcp.lua 0755 6954 dbb1208e src---
+---FILE /usr/bin/dhcp.lua 0755 9723 57108953 src---
+-- dhcp: obtain IP configuration via DHCP
+-- Usage: dhcp [interface]
+-- Performs a single-shot DHCP DISCOVER/OFFER/REQUEST/ACK flow
+-- and writes the obtained configuration to /sys/net/*.
+-- Uses AF_MODEM UDP sockets for broadcast DHCP.
 
 local function read_sys(path)
-local fd = open(path, "r")
-if not fd then return nil end
-local chunks = {}
-while true do
-local data = read(fd, 4096)
-if not data or #data == 0 then break end
-chunks[#chunks+1] = data
-end
-close(fd)
-local s = table.concat(chunks)
-return s:gsub("%s+$", "")
+    local fd = open(path, "r")
+    if not fd then return nil end
+    local chunks = {}
+    while true do
+        local data = read(fd, 4096)
+        if not data or #data == 0 then break end
+        chunks[#chunks+1] = data
+    end
+    close(fd)
+    local s = table.concat(chunks)
+    return s:gsub("%s+$", "")
 end
 
 local function write_sys(path, value)
-local fd = open(path, "w")
-if not fd then return false, "cannot open " .. path .. " for writing" end
-write(fd, value .. "\n")
-close(fd)
-return true
+    local fd = open(path, "w")
+    if not fd then return false, "cannot open " .. path .. " for writing" end
+    write(fd, value .. "\n")
+    close(fd)
+    return true
 end
 
 local function usage()
-print("usage: dhcp [interface]")
-print("       Obtain IP configuration via DHCP and apply to /sys/net")
-exit(1)
+    print("usage: dhcp [interface]")
+    print("       Obtain IP configuration via DHCP and apply to /sys/net")
+    exit(1)
 end
 
 local function log(msg)
-write(1, "dhcp: " .. msg .. "\n")
+    write(1, "dhcp: " .. msg .. "\n")
 end
 
+-- DHCP message construction helpers
 local function dhcp_opt(optcode, data)
-return string.char(optcode, #data) .. data
+    return string.char(optcode, #data) .. data
 end
 
 local function ip_to_bytes(ip)
-local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-if not a then return nil end
-return string.char(tonumber(a), tonumber(b), tonumber(c), tonumber(d))
+    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then return nil end
+    return string.char(tonumber(a), tonumber(b), tonumber(c), tonumber(d))
 end
 
 local function bytes_to_ip(b)
-if not b or #b ~= 4 then return "0.0.0.0" end
-return string.format("%d.%d.%d.%d", b:byte(1), b:byte(2), b:byte(3), b:byte(4))
+    if not b or #b ~= 4 then return "0.0.0.0" end
+    return string.format("%d.%d.%d.%d", b:byte(1), b:byte(2), b:byte(3), b:byte(4))
 end
 
 local function build_dhcp_discover(xid)
-local msg = string.char(
-0x01,               0x01,               0x06,               0x00,                       math.floor(xid / 0x1000000) % 256,
-math.floor(xid / 0x10000) % 256,
-math.floor(xid / 0x100) % 256,
-xid % 256,
-0x00, 0x00,
-0x80, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-)
-msg = msg .. string.rep("\0", 64)
-msg = msg .. string.rep("\0", 128)
-msg = msg .. string.char(0x63, 0x82, 0x53, 0x63)
-msg = msg .. dhcp_opt(53, string.char(0x01))
-msg = msg .. dhcp_opt(50, string.char(0x00, 0x00, 0x00, 0x00))
-msg = msg .. dhcp_opt(55, string.char(0x01, 0x03, 0x06))
-msg = msg .. string.char(0xFF)
-if #msg < 300 then
-msg = msg .. string.rep("\0", 300 - #msg)
-end
-return msg
+    -- Boot request (1), hardware type ethernet (1), hw addr len 6, hops 0
+    local msg = string.char(
+        0x01,       -- op: BOOTREQUEST
+        0x01,       -- htype: Ethernet
+        0x06,       -- hlen: 6
+        0x00,       -- hops
+        -- xid: 4 bytes (random transaction id)
+        math.floor(xid / 0x1000000) % 256,
+        math.floor(xid / 0x10000) % 256,
+        math.floor(xid / 0x100) % 256,
+        xid % 256,
+        -- sec since boot: 0
+        0x00, 0x00,
+        -- flags: broadcast
+        0x80, 0x00,
+        -- ciaddr: 0.0.0.0
+        0x00, 0x00, 0x00, 0x00,
+        -- yiaddr: 0.0.0.0
+        0x00, 0x00, 0x00, 0x00,
+        -- siaddr: 0.0.0.0
+        0x00, 0x00, 0x00, 0x00,
+        -- giaddr: 0.0.0.0
+        0x00, 0x00, 0x00, 0x00,
+        -- chaddr: random MAC (6 bytes) + padding
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    )
+    -- sname (64 bytes): zeroed
+    msg = msg .. string.rep("\0", 64)
+    -- file (128 bytes): zeroed
+    msg = msg .. string.rep("\0", 128)
+    -- magic cookie: 99.130.83.99 (0x63825363)
+    msg = msg .. string.char(0x63, 0x82, 0x53, 0x63)
+    -- DHCP options: message type DISCOVER (1)
+    msg = msg .. dhcp_opt(53, string.char(0x01))
+    -- Requested IP option (50)
+    msg = msg .. dhcp_opt(50, string.char(0x00, 0x00, 0x00, 0x00))
+    -- Parameter request list (55): subnet, router, dns
+    msg = msg .. dhcp_opt(55, string.char(0x01, 0x03, 0x06))
+    -- End option
+    msg = msg .. string.char(0xFF)
+    -- Pad to minimum 300 bytes
+    if #msg < 300 then
+        msg = msg .. string.rep("\0", 300 - #msg)
+    end
+    return msg
 end
 
 local function build_dhcp_request(xid, requested_ip, server_ip)
-local msg = string.char(
-0x01, 0x01, 0x06, 0x00,
-math.floor(xid / 0x1000000) % 256,
-math.floor(xid / 0x10000) % 256,
-math.floor(xid / 0x100) % 256,
-xid % 256,
-0x00, 0x00, 0x80, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00,
-0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-)
-msg = msg .. string.rep("\0", 64)
-msg = msg .. string.rep("\0", 128)
-msg = msg .. string.char(0x63, 0x82, 0x53, 0x63)
-msg = msg .. dhcp_opt(53, string.char(0x03))
-msg = msg .. dhcp_opt(50, requested_ip)
-msg = msg .. dhcp_opt(54, server_ip)
-msg = msg .. dhcp_opt(55, string.char(0x01, 0x03, 0x06))
-msg = msg .. string.char(0xFF)
-if #msg < 300 then
-msg = msg .. string.rep("\0", 300 - #msg)
-end
-return msg
+    -- Similar to DISCOVER but with REQUEST type and options
+    local msg = string.char(
+        0x01, 0x01, 0x06, 0x00,
+        math.floor(xid / 0x1000000) % 256,
+        math.floor(xid / 0x10000) % 256,
+        math.floor(xid / 0x100) % 256,
+        xid % 256,
+        0x00, 0x00, 0x80, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    )
+    msg = msg .. string.rep("\0", 64)
+    msg = msg .. string.rep("\0", 128)
+    -- Magic cookie
+    msg = msg .. string.char(0x63, 0x82, 0x53, 0x63)
+    -- DHCP options: message type REQUEST (3)
+    msg = msg .. dhcp_opt(53, string.char(0x03))
+    -- Requested IP (50)
+    msg = msg .. dhcp_opt(50, requested_ip)
+    -- Server identifier (54)
+    msg = msg .. dhcp_opt(54, server_ip)
+    -- Parameter request list (55)
+    msg = msg .. dhcp_opt(55, string.char(0x01, 0x03, 0x06))
+    -- End
+    msg = msg .. string.char(0xFF)
+    if #msg < 300 then
+        msg = msg .. string.rep("\0", 300 - #msg)
+    end
+    return msg
 end
 
 local function parse_dhcp_options(data)
-local result = {}
-local i = 241         if #data >= 244 then
-if data:byte(241) == 0x63 and data:byte(242) == 0x82 and
-data:byte(243) == 0x53 and data:byte(244) == 0x63 then
-i = 245
-end
-end
-while i <= #data do
-local code = data:byte(i)
-if code == 0xFF then break end         if code == 0 then
-i = i + 1         else
-local len = data:byte(i + 1) or 0
-local val = data:sub(i + 2, i + 1 + len)
-result[code] = val
-i = i + 2 + len
-end
-end
-return result
+    local result = {}
+    local i = 241 -- skip bootp header to magic cookie end
+    -- Find magic cookie
+    if #data >= 244 then
+        if data:byte(241) == 0x63 and data:byte(242) == 0x82 and
+           data:byte(243) == 0x53 and data:byte(244) == 0x63 then
+            i = 245
+        end
+    end
+    while i <= #data do
+        local code = data:byte(i)
+        if code == 0xFF then break end -- end
+        if code == 0 then
+            i = i + 1 -- padding
+        else
+            local len = data:byte(i + 1) or 0
+            local val = data:sub(i + 2, i + 1 + len)
+            result[code] = val
+            i = i + 2 + len
+        end
+    end
+    return result
 end
 
+-- Main
 local args = {}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
+-- Interface name (for display; modem0 is the only one)
 local iface = args[1] or "modem0"
 
 if args[1] == "-h" or args[1] == "--help" then
-usage()
+    usage()
 end
 
 log("starting DHCP on " .. iface)
 
-local fd, err = socket("modem", "dgram", 17) if not fd then
-log("failed to create UDP socket: " .. tostring(err))
-exit(1)
+-- Create UDP socket on port 67 (DHCP server port) for sending/receiving
+local fd, err = socket("modem", "dgram", 17) -- protocol 17 = UDP
+if not fd then
+    log("failed to create UDP socket: " .. tostring(err))
+    exit(1)
 end
 
-setsockopt(fd, 1, 6, 1)
+-- Enable broadcast
+setsockopt(fd, 1, 6, 1) -- SOL_SOCKET=1, SO_BROADCAST=6
+
+-- Bind to 0.0.0.0:68 (DHCP client port)
 local bok, berr = bind(fd, "0.0.0.0:68")
 if not bok then
-log("bind failed: " .. tostring(berr))
-close(fd)
-exit(1)
+    log("bind failed: " .. tostring(berr))
+    close(fd)
+    exit(1)
 end
 
-setsockopt(fd, 1, 20, 5.0)
+-- Set receive timeout
+setsockopt(fd, 1, 20, 5.0) -- SO_RCVTIMEO=20, 5 seconds
+
+-- Generate random transaction ID
 local xid = math.random(1, 0x7FFFFFFF)
 
+-- Step 1: Send DISCOVER
 log("sending DHCP DISCOVER")
 local discover = build_dhcp_discover(xid)
 local sent, serr = sendto(fd, discover, "255.255.255.255", 67)
 if not sent then
-log("sendto failed: " .. tostring(serr))
-close(fd)
-exit(1)
+    log("sendto failed: " .. tostring(serr))
+    close(fd)
+    exit(1)
 end
 
+-- Step 2: Wait for OFFER
 log("waiting for OFFER...")
 local offer_data, offer_ip, offer_port = recvfrom(fd)
 if not offer_data then
-log("no OFFER received (timeout)")
-close(fd)
-exit(1)
+    log("no OFFER received (timeout)")
+    close(fd)
+    exit(1)
 end
 
 local offer_opts = parse_dhcp_options(offer_data)
 local offer_msg_type = offer_opts[53]
 
 if not offer_msg_type or offer_msg_type:byte(1) ~= 0x02 then
-log("unexpected response (not OFFER)")
-close(fd)
-exit(1)
+    log("unexpected response (not OFFER)")
+    close(fd)
+    exit(1)
 end
 
+-- Extract offered IP from yiaddr field (offset 16, 4 bytes)
 local offered_ip = bytes_to_ip(offer_data:sub(17, 20))
 local server_id = offer_opts[54]
 
 if not server_id or #server_id ~= 4 then
-log("OFFER missing server identifier")
-close(fd)
-exit(1)
+    log("OFFER missing server identifier")
+    close(fd)
+    exit(1)
 end
 
 local server_ip = bytes_to_ip(server_id)
 log("got OFFER: ip=" .. offered_ip .. " server=" .. server_ip)
 
+-- Step 3: Send REQUEST
 log("sending DHCP REQUEST")
 local request = build_dhcp_request(xid, ip_to_bytes(offered_ip), server_id)
 local sent2, serr2 = sendto(fd, request, "255.255.255.255", 67)
 if not sent2 then
-log("sendto failed: " .. tostring(serr2))
-close(fd)
-exit(1)
+    log("sendto failed: " .. tostring(serr2))
+    close(fd)
+    exit(1)
 end
 
+-- Step 4: Wait for ACK
 log("waiting for ACK...")
 local ack_data, ack_ip, ack_port = recvfrom(fd)
 if not ack_data then
-log("no ACK received (timeout)")
-close(fd)
-exit(1)
+    log("no ACK received (timeout)")
+    close(fd)
+    exit(1)
 end
 
 local ack_opts = parse_dhcp_options(ack_data)
 local ack_msg_type = ack_opts[53]
 
 if not ack_msg_type or ack_msg_type:byte(1) ~= 0x05 then
-if ack_msg_type and ack_msg_type:byte(1) == 0x06 then
-log("DHCP NAK received - lease denied")
-else
-log("unexpected response (not ACK)")
-end
-close(fd)
-exit(1)
+    -- NAK (type 6) or other
+    if ack_msg_type and ack_msg_type:byte(1) == 0x06 then
+        log("DHCP NAK received - lease denied")
+    else
+        log("unexpected response (not ACK)")
+    end
+    close(fd)
+    exit(1)
 end
 
+-- Extract assigned IP
 local assigned_ip = bytes_to_ip(ack_data:sub(17, 20))
 log("got ACK: ip=" .. assigned_ip)
 
+-- Extract subnet mask (option 1)
 local subnet = ack_opts[1]
 local netmask
 if subnet and #subnet == 4 then
-netmask = bytes_to_ip(subnet)
+    netmask = bytes_to_ip(subnet)
 else
-netmask = "255.255.255.0"
+    netmask = "255.255.255.0"
 end
 
+-- Extract gateway (option 3)
 local gw = ack_opts[3]
 local gateway
 if gw and #gw == 4 then
-gateway = bytes_to_ip(gw)
+    gateway = bytes_to_ip(gw)
 else
-gateway = "0.0.0.0"
+    gateway = "0.0.0.0"
 end
 
+-- Apply to /sys/net
 log("applying network configuration")
 write_sys("/sys/net/ip", assigned_ip)
 write_sys("/sys/net/netmask", netmask)
 write_sys("/sys/net/gateway", gateway)
 
+-- Add default route
 if gateway ~= "0.0.0.0" then
-local route_ok, route_err = write_sys("/sys/net/routes", "0.0.0.0 0.0.0.0 " .. gateway)
-if not route_ok then
-log("warning: failed to add default route: " .. tostring(route_err))
-else
-log("default route added via " .. gateway)
-end
+    local route_ok, route_err = write_sys("/sys/net/routes", "0.0.0.0 0.0.0.0 " .. gateway)
+    if not route_ok then
+        log("warning: failed to add default route: " .. tostring(route_err))
+    else
+        log("default route added via " .. gateway)
+    end
 end
 
 log("DHCP complete:")

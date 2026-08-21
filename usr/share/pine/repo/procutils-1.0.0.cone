@@ -3,7 +3,7 @@ name=procutils
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=procutils (1.0.0)
+description=Process and system utilities (ps, kill, mount, df, uname, free, uptime, which, whoami, id)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,217 +15,249 @@ prerem=
 postrem=
 files=10
 ---END MANIFEST---
----FILE /usr/bin/df.lua 0755 772 cbeab303 src---
+---FILE /usr/bin/df.lua 0755 1133 25af7da1 src---
+-- df: report disk free space
+-- Usage: df [path]
+-- KNUCK does not expose a VFS stat-size API to userspace,
+-- so this prints a summary of known mounts.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 write(1, string.format("%-16s %-10s %-10s %-10s %s\n",
-"Filesystem", "Size", "Used", "Avail", "Mounted on"))
+    "Filesystem", "Size", "Used", "Avail", "Mounted on"))
 
+-- Known mounts from kernel boot
 local mounts = {
-{ fs = "/dev/disk0", mp = "/" },
-{ fs = "/dev/disk0", mp = "/boot" },
-{ fs = "tmpfs",      mp = "/tmp" },
-{ fs = "romfs",      mp = "/rom" },
-{ fs = "devfs",      mp = "/dev" },
-{ fs = "sysfs",      mp = "/sys" },
-{ fs = "procfs",     mp = "/proc" },
+    { fs = "/dev/disk0", mp = "/" },
+    { fs = "/dev/disk0", mp = "/boot" },
+    { fs = "tmpfs",      mp = "/tmp" },
+    { fs = "romfs",      mp = "/rom" },
+    { fs = "devfs",      mp = "/dev" },
+    { fs = "sysfs",      mp = "/sys" },
+    { fs = "procfs",     mp = "/proc" },
 }
 
 for _, m in ipairs(mounts) do
-if #args > 0 then
-local target = args[1]
-if target == m.mp or target:sub(1, #m.mp) == m.mp then
-write(1, string.format("%-16s %-10s %-10s %-10s %s\n",
-m.fs, "n/a", "n/a", "n/a", m.mp))
+    -- If a specific path was given, only show that mount
+    if #args > 0 then
+        local target = args[1]
+        if target == m.mp or target:sub(1, #m.mp) == m.mp then
+            write(1, string.format("%-16s %-10s %-10s %-10s %s\n",
+                m.fs, "n/a", "n/a", "n/a", m.mp))
+        end
+    else
+        write(1, string.format("%-16s %-10s %-10s %-10s %s\n",
+            m.fs, "n/a", "n/a", "n/a", m.mp))
+    end
 end
-else
-write(1, string.format("%-16s %-10s %-10s %-10s %s\n",
-m.fs, "n/a", "n/a", "n/a", m.mp))
-end
-end
----FILE /usr/bin/free.lua 0755 246 05b104bf src---
+---FILE /usr/bin/free.lua 0755 369 aeec4d49 src---
+-- free: display memory usage
+-- Usage: free
+-- KNUCK has no meminfo syscall; print available memory info from CC runtime.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 write(1, "              total       used       free\n")
 write(1, "Mem:     n/a         n/a         n/a\n")
 write(1, "\nNote: KNUCK exposes no memory accounting to userland\n")
----FILE /usr/bin/id.lua 0755 921 2adeaeab src---
+---FILE /usr/bin/id.lua 0755 1339 69bf8d19 src---
+-- id: print real and effective user and group IDs
+-- Usage: id [user]
+-- Without arguments, prints current uid/gid.
+-- With a username argument, looks up via getpwnam().
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args > 0 then
-for _, name in ipairs(args) do
-local entry = getpwnam(name)
-if entry then
-write(1, string.format("uid=%d(%s) gid=%d(%s)\n",
-entry.uid, name, entry.gid, name))
+    -- Look up the named user
+    for _, name in ipairs(args) do
+        local entry = getpwnam(name)
+        if entry then
+            write(1, string.format("uid=%d(%s) gid=%d(%s)\n",
+                entry.uid, name, entry.gid, name))
+        else
+            write(2, "id: '" .. name .. "': no such user\n")
+            exit(1)
+        end
+    end
 else
-write(2, "id: '" .. name .. "': no such user\n")
-exit(1)
-end
-end
-else
-local uid = getuid()
-local euid = geteuid()
-local gid = getgid()
-local egid = getegid()
+    local uid = getuid()
+    local euid = geteuid()
+    local gid = getgid()
+    local egid = getegid()
 
-local function lookup_name(tbl, id)
-local e = tbl(id)
-if e and e.name then return e.name end
-return tostring(id)
-end
+    -- Look up names
+    local function lookup_name(tbl, id)
+        local e = tbl(id)
+        if e and e.name then return e.name end
+        return tostring(id)
+    end
 
-local uname = lookup_name(getpwuid, uid)
-local euname = lookup_name(getpwuid, euid)
+    local uname = lookup_name(getpwuid, uid)
+    local euname = lookup_name(getpwuid, euid)
 
-local out = string.format("uid=%d(%s) gid=%d(%s)",
-uid, uname, gid, lookup_name(getgrgid, gid))
+    local out = string.format("uid=%d(%s) gid=%d(%s)",
+        uid, uname, gid, lookup_name(getgrgid, gid))
 
-if euid ~= uid then
-out = out .. string.format(" euid=%d(%s)", euid, euname)
-end
-if egid ~= gid then
-out = out .. string.format(" egid=%d(%s)", egid, lookup_name(getgrgid, egid))
-end
+    if euid ~= uid then
+        out = out .. string.format(" euid=%d(%s)", euid, euname)
+    end
+    if egid ~= gid then
+        out = out .. string.format(" egid=%d(%s)", egid, lookup_name(getgrgid, egid))
+    end
 
-write(1, out .. "\n")
+    write(1, out .. "\n")
 end
----FILE /usr/bin/kill.lua 0755 1135 d7ca191f src---
+---FILE /usr/bin/kill.lua 0755 1582 bb692096 src---
+-- kill: send signal to a process
+-- Usage: kill [-s SIGNAL] PID  or  kill [-SIGNAL] PID
+-- Default signal is SIGTERM (15).
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 local SIGNALS = {
-HUP=1, INT=2, QUIT=3, KILL=9, USR1=10, USR2=12,
-PIPE=13, ALRM=14, TERM=15, CHLD=17, CONT=18, STOP=19,
+    HUP=1, INT=2, QUIT=3, KILL=9, USR1=10, USR2=12,
+    PIPE=13, ALRM=14, TERM=15, CHLD=17, CONT=18, STOP=19,
 }
 
-local sig = 15  local pid = nil
+local sig = 15  -- SIGTERM default
+local pid = nil
 
 local i = 1
 while i <= #args do
-local a = args[i]
-if a == "-s" then
-i = i + 1
-if i > #args then
-write(2, "kill: option requires an argument -- s\n")
-exit(1)
-end
-local s = args[i]
-sig = SIGNALS[s:upper()] or tonumber(s)
-if not sig then
-write(2, "kill: invalid signal: '" .. s .. "'\n")
-exit(1)
-end
-elseif a:sub(1, 1) == "-" and #a > 1 then
-local rest = a:sub(2)
-local sname = rest:match("^([A-Za-z]+)") or ""
-local num = tonumber(rest)
-if sname ~= "" and SIGNALS[sname:upper()] then
-sig = SIGNALS[sname:upper()]
-elseif num then
-sig = num
-else
-write(2, "kill: invalid signal: '" .. rest .. "'\n")
-exit(1)
-end
-else
-pid = tonumber(a)
-if not pid then
-write(2, "kill: invalid pid: '" .. a .. "'\n")
-exit(1)
-end
-end
-i = i + 1
+    local a = args[i]
+    if a == "-s" then
+        i = i + 1
+        if i > #args then
+            write(2, "kill: option requires an argument -- s\n")
+            exit(1)
+        end
+        local s = args[i]
+        sig = SIGNALS[s:upper()] or tonumber(s)
+        if not sig then
+            write(2, "kill: invalid signal: '" .. s .. "'\n")
+            exit(1)
+        end
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        local rest = a:sub(2)
+        local sname = rest:match("^([A-Za-z]+)") or ""
+        local num = tonumber(rest)
+        if sname ~= "" and SIGNALS[sname:upper()] then
+            sig = SIGNALS[sname:upper()]
+        elseif num then
+            sig = num
+        else
+            write(2, "kill: invalid signal: '" .. rest .. "'\n")
+            exit(1)
+        end
+    else
+        pid = tonumber(a)
+        if not pid then
+            write(2, "kill: invalid pid: '" .. a .. "'\n")
+            exit(1)
+        end
+    end
+    i = i + 1
 end
 
 if not pid then
-write(2, "usage: kill [-s SIGNAL] PID\n")
-exit(1)
+    write(2, "usage: kill [-s SIGNAL] PID\n")
+    exit(1)
 end
 
 local ok, err = kill(pid, sig)
 if not ok then
-write(2, "kill: " .. tostring(err or "failed") .. "\n")
-exit(1)
+    write(2, "kill: " .. tostring(err or "failed") .. "\n")
+    exit(1)
 end
----FILE /usr/bin/mount.lua 0755 490 21a128d7 src---
+---FILE /usr/bin/mount.lua 0755 783 d4c3b9bc src---
+-- mount: show mounted filesystems
+-- Usage: mount
+-- Reads /proc/mounts if available, otherwise prints known virtual mounts.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- Try /proc/mounts first
 local fd = open("/proc/mounts", 0)
 if fd then
-local chunks = {}
-while true do
-local d = read(fd, 4096)
-if not d or #d == 0 then break end
-chunks[#chunks+1] = d
-end
-close(fd)
-write(1, table.concat(chunks))
+    local chunks = {}
+    while true do
+        local d = read(fd, 4096)
+        if not d or #d == 0 then break end
+        chunks[#chunks+1] = d
+    end
+    close(fd)
+    write(1, table.concat(chunks))
 else
-write(1, "/          disk\n")
-write(1, "/boot      disk\n")
-write(1, "/tmp       tmp\n")
-write(1, "/rom       rom\n")
-write(1, "/dev       dev\n")
-write(1, "/sys       sys\n")
-write(1, "/proc      proc\n")
+    -- No /proc/mounts; report what the kernel boots with by default
+    write(1, "/          disk\n")
+    write(1, "/boot      disk\n")
+    write(1, "/tmp       tmp\n")
+    write(1, "/rom       rom\n")
+    write(1, "/dev       dev\n")
+    write(1, "/sys       sys\n")
+    write(1, "/proc      proc\n")
 end
----FILE /usr/bin/ps.lua 0755 1060 d16a3565 src---
+---FILE /usr/bin/ps.lua 0755 1576 665752cd src---
+-- ps: list running processes
+-- Usage: ps
+-- Reads /proc entries to discover processes.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- Read /proc directory for pid entries
 local entries = readdir("/proc")
 if not entries then
-write(2, "ps: cannot read /proc\n")
-exit(1)
+    write(2, "ps: cannot read /proc\n")
+    exit(1)
 end
 
 write(1, string.format("%-8s %-8s %-8s %-8s %s\n", "PID", "PPID", "UID", "STATE", "NAME"))
 
 local count = 0
 for _, e in ipairs(entries) do
-local name = e.name
-local pid = tonumber(name)
-if pid then
-local fd = open("/proc/" .. pid .. "/status", 0)
-if fd then
-local chunks = {}
-while true do
-local d = read(fd, 4096)
-if not d or #d == 0 then break end
-chunks[#chunks+1] = d
-end
-close(fd)
-local data = table.concat(chunks)
+    local name = e.name
+    local pid = tonumber(name)
+    if pid then
+        -- Read /proc/<pid>/status
+        local fd = open("/proc/" .. pid .. "/status", 0)
+        if fd then
+            local chunks = {}
+            while true do
+                local d = read(fd, 4096)
+                if not d or #d == 0 then break end
+                chunks[#chunks+1] = d
+            end
+            close(fd)
+            local data = table.concat(chunks)
 
-local pname = "?"
-local pstate = "?"
-local ppid = "?"
-local puid = "?"
+            local pname = "?"
+            local pstate = "?"
+            local ppid = "?"
+            local puid = "?"
 
-for line in data:gmatch("[^\n]+") do
-local k, v = line:match("^(%S+):%s+(.+)$")
-if k == "Name" then pname = v
-elseif k == "State" then pstate = v
-elseif k == "PPid" then ppid = v
-elseif k == "Uid" then puid = v
-end
-end
+            for line in data:gmatch("[^\n]+") do
+                local k, v = line:match("^(%S+):%s+(.+)$")
+                if k == "Name" then pname = v
+                elseif k == "State" then pstate = v
+                elseif k == "PPid" then ppid = v
+                elseif k == "Uid" then puid = v
+                end
+            end
 
-write(1, string.format("%-8s %-8s %-8s %-8s %s\n", pid, ppid, puid, pstate, pname))
-count = count + 1
-end
-end
+            write(1, string.format("%-8s %-8s %-8s %-8s %s\n", pid, ppid, puid, pstate, pname))
+            count = count + 1
+        end
+    end
 end
 
 if count == 0 then
-write(1, "ps: no processes found\n")
+    write(1, "ps: no processes found\n")
 end
----FILE /usr/bin/uname.lua 0755 1537 d1f3b6ad src---
+---FILE /usr/bin/uname.lua 0755 2030 64839305 src---
+-- uname: print system information
+-- Usage: uname [-a] [-s] [-r] [-n] [-m]
+-- Reads /proc/version when available.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
@@ -236,50 +268,51 @@ local show_nodename = false
 local show_machine = false
 
 if #args == 0 then
-show_sysname = true
+    show_sysname = true
 else
-for _, a in ipairs(args) do
-if a == "-a" then
-show_all = true
-elseif a == "-s" then show_sysname = true
-elseif a == "-r" then show_release = true
-elseif a == "-n" then show_nodename = true
-elseif a == "-m" then show_machine = true
-elseif a:sub(1,1) == "-" and #a > 1 then
-for j=2,#a do
-local c = a:sub(j,j)
-if c == "a" then show_all = true
-elseif c == "s" then show_sysname = true
-elseif c == "r" then show_release = true
-elseif c == "n" then show_nodename = true
-elseif c == "m" then show_machine = true
-else
-write(2, "uname: unknown option: -" .. c .. "\n")
-exit(1)
-end
-end
-end
-end
+    for _, a in ipairs(args) do
+        if a == "-a" then
+            show_all = true
+        elseif a == "-s" then show_sysname = true
+        elseif a == "-r" then show_release = true
+        elseif a == "-n" then show_nodename = true
+        elseif a == "-m" then show_machine = true
+        elseif a:sub(1,1) == "-" and #a > 1 then
+            for j=2,#a do
+                local c = a:sub(j,j)
+                if c == "a" then show_all = true
+                elseif c == "s" then show_sysname = true
+                elseif c == "r" then show_release = true
+                elseif c == "n" then show_nodename = true
+                elseif c == "m" then show_machine = true
+                else
+                    write(2, "uname: unknown option: -" .. c .. "\n")
+                    exit(1)
+                end
+            end
+        end
+    end
 end
 
 if show_all then
-show_sysname = true
-show_release = true
-show_nodename = true
-show_machine = true
+    show_sysname = true
+    show_release = true
+    show_nodename = true
+    show_machine = true
 end
 
+-- Read kernel version from /proc/version
 local kernel_version = "KNUCK"
 local fd = open("/proc/version", 0)
 if fd then
-local chunks = {}
-while true do
-local d = read(fd, 4096)
-if not d or #d == 0 then break end
-chunks[#chunks+1] = d
-end
-close(fd)
-kernel_version = table.concat(chunks):match("^(%S+)") or "KNUCK"
+    local chunks = {}
+    while true do
+        local d = read(fd, 4096)
+        if not d or #d == 0 then break end
+        chunks[#chunks+1] = d
+    end
+    close(fd)
+    kernel_version = table.concat(chunks):match("^(%S+)") or "KNUCK"
 end
 
 local parts = {}
@@ -289,91 +322,104 @@ if show_release then parts[#parts+1] = "1.0" end
 if show_machine then parts[#parts+1] = "lua52" end
 
 if #parts == 0 then
-parts[1] = kernel_version
+    parts[1] = kernel_version
 end
 
 write(1, table.concat(parts, " ") .. "\n")
----FILE /usr/bin/uptime.lua 0755 907 27032b08 src---
+---FILE /usr/bin/uptime.lua 0755 1196 9ec875f5 src---
+-- uptime: show system uptime
+-- Usage: uptime
+-- Reads /proc/uptime if available, else uses clock() syscall.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- Try /proc/uptime first
 local fd = open("/proc/uptime", 0)
 if fd then
-local chunks = {}
-while true do
-local d = read(fd, 4096)
-if not d or #d == 0 then break end
-chunks[#chunks+1] = d
-end
-close(fd)
-local raw = table.concat(chunks):match("^(%S+)")
-local secs = tonumber(raw)
-if secs then
-local days = math.floor(secs / 86400)
-local hours = math.floor((secs % 86400) / 3600)
-local mins = math.floor((secs % 3600) / 60)
-write(1, string.format(" up %d days, %02d:%02d\n", days, hours, mins))
-return
-end
+    local chunks = {}
+    while true do
+        local d = read(fd, 4096)
+        if not d or #d == 0 then break end
+        chunks[#chunks+1] = d
+    end
+    close(fd)
+    local raw = table.concat(chunks):match("^(%S+)")
+    local secs = tonumber(raw)
+    if secs then
+        local days = math.floor(secs / 86400)
+        local hours = math.floor((secs % 86400) / 3600)
+        local mins = math.floor((secs % 3600) / 60)
+        write(1, string.format(" up %d days, %02d:%02d\n", days, hours, mins))
+        return
+    end
 end
 
+-- Fallback: try clock() syscall
 local ok, t = pcall(function() return clock() end)
 if ok and t then
-local secs = math.floor(t)
-local days = math.floor(secs / 86400)
-local hours = math.floor((secs % 86400) / 3600)
-local mins = math.floor((secs % 3600) / 60)
-write(1, string.format(" up %d days, %02d:%02d\n", days, hours, mins))
+    local secs = math.floor(t)
+    local days = math.floor(secs / 86400)
+    local hours = math.floor((secs % 86400) / 3600)
+    local mins = math.floor((secs % 3600) / 60)
+    write(1, string.format(" up %d days, %02d:%02d\n", days, hours, mins))
 else
-write(1, "up unknown (no uptime data available)\n")
+    write(1, "up unknown (no uptime data available)\n")
 end
----FILE /usr/bin/which.lua 0755 591 a4a68643 src---
+---FILE /usr/bin/which.lua 0755 886 518701a0 src---
+-- which: locate a command in PATH
+-- Usage: which command...
+-- Searches /usr/bin, /bin, /sbin, /usr/sbin for the given commands.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args == 0 then
-write(2, "usage: which command...\n")
-exit(1)
+    write(2, "usage: which command...\n")
+    exit(1)
 end
 
 local path_dirs = { "/usr/bin", "/bin", "/sbin", "/usr/sbin" }
 
 local rc = 0
 for _, cmd in ipairs(args) do
-local found = false
-for _, dir in ipairs(path_dirs) do
-for _, cand in ipairs({ cmd, cmd .. ".lua" }) do
-local full = dir .. "/" .. cand
-local st = stat(full)
-if st and st.type == "file" then
-write(1, full .. "\n")
-found = true
-break
-end
-end
-if found then break end
-end
-if not found then
-write(2, cmd .. " not found\n")
-rc = 1
-end
+    local found = false
+    for _, dir in ipairs(path_dirs) do
+        for _, cand in ipairs({ cmd, cmd .. ".lua" }) do
+            local full = dir .. "/" .. cand
+            local st = stat(full)
+            if st and st.type == "file" then
+                write(1, full .. "\n")
+                found = true
+                break
+            end
+        end
+        if found then break end
+    end
+    if not found then
+        write(2, cmd .. " not found\n")
+        rc = 1
+    end
 end
 
 exit(rc)
----FILE /usr/bin/whoami.lua 0755 264 2b3d9c07 src---
+---FILE /usr/bin/whoami.lua 0755 497 45f52ab7 src---
+-- whoami: print current username
+-- Usage: whoami
+-- Uses getuid() and getpwnam() to resolve the username.
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 local uid = getuid()
 
+-- Try to look up the username via getpwuid
 local entry = getpwuid(uid)
 if entry and entry.name then
-write(1, entry.name .. "\n")
+    write(1, entry.name .. "\n")
 else
-if uid == 0 then
-write(1, "root\n")
-else
-write(1, tostring(uid) .. "\n")
-end
+    -- Fallback: numeric uid or "root" for uid 0
+    if uid == 0 then
+        write(1, "root\n")
+    else
+        write(1, tostring(uid) .. "\n")
+    end
 end
 ---END PKG---

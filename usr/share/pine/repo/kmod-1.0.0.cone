@@ -3,7 +3,7 @@ name=kmod
 version=1.0.0
 arch=any
 maintainer=userland@pinecone.dev
-description=kmod (1.0.0)
+description=Kernel module utilities (insmod, rmmod, lsmod)
 license=MIT
 essential=no
 deps=coreutils@>=1.0.0
@@ -15,79 +15,93 @@ prerem=
 postrem=
 files=3
 ---END MANIFEST---
----FILE /usr/bin/insmod.lua 0755 447 3832dbf2 src---
+---FILE /usr/bin/insmod.lua 0755 638 dfb34748 src---
+-- insmod: load a kernel module
+-- Usage: insmod <path.lua>
+-- Loads a Lua kernel module file via the insmod() syscall.
+-- Requires root (uid=0).
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 1 then
-write(2, "usage: insmod <module.lua>\n")
-exit(1)
+    write(2, "usage: insmod <module.lua>\n")
+    exit(1)
 end
 
 local path = args[1]
 
+-- check file exists
 local st = stat(path)
 if not st then
-write(2, "insmod: cannot open '"..path.."': No such file or directory\n")
-exit(1)
+    write(2, "insmod: cannot open '"..path.."': No such file or directory\n")
+    exit(1)
 end
 
 local ok, err = insmod(path)
 if not ok then
-write(2, "insmod: "..(err or "failed to load module").."\n")
-exit(1)
+    write(2, "insmod: "..(err or "failed to load module").."\n")
+    exit(1)
 end
 
 write(1, "insmod: loaded "..path.."\n")
----FILE /usr/bin/lsmod.lua 0755 571 609e58c4 src---
+---FILE /usr/bin/lsmod.lua 0755 826 e6e23d19 src---
+-- lsmod: list loaded kernel modules
+-- Usage: lsmod
+-- Reads /sys/modules to show currently loaded kernel modules.
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
+-- read /sys/modules
 local fd = open("/sys/modules", 0)
 if not fd then
-write(2, "lsmod: cannot read /sys/modules\n")
-exit(1)
+    write(2, "lsmod: cannot read /sys/modules\n")
+    exit(1)
 end
 
 local chunks = {}
 while true do
-local d = read(fd, 4096)
-if not d or #d == 0 then break end
-chunks[#chunks+1] = d
+    local d = read(fd, 4096)
+    if not d or #d == 0 then break end
+    chunks[#chunks+1] = d
 end
 close(fd)
 
 local data = table.concat(chunks)
 if data == "" or data == "\n" then
-write(1, "No modules loaded.\n")
+    write(1, "No modules loaded.\n")
 else
-local mods = {}
-for name in data:gmatch("[^\n]+") do
-mods[#mods+1] = name
+    -- parse module names from newline-separated list
+    local mods = {}
+    for name in data:gmatch("[^\n]+") do
+        mods[#mods+1] = name
+    end
+    table.sort(mods)
+    for _, name in ipairs(mods) do
+        write(1, name.."\n")
+    end
 end
-table.sort(mods)
-for _, name in ipairs(mods) do
-write(1, name.."\n")
-end
-end
----FILE /usr/bin/rmmod.lua 0755 324 a38324d4 src---
+---FILE /usr/bin/rmmod.lua 0755 488 6766fee0 src---
+-- rmmod: unload a kernel module
+-- Usage: rmmod <module-name>
+-- Removes a loaded kernel module via the rmmod() syscall.
+-- Requires root (uid=0).
 
 local args = {}
 for i=1,select("#",...) do args[i]=select(i,...) end
 
 if #args < 1 then
-write(2, "usage: rmmod <module-name>\n")
-exit(1)
+    write(2, "usage: rmmod <module-name>\n")
+    exit(1)
 end
 
 local name = args[1]
 
 local ok, err = rmmod(name)
 if not ok then
-write(2, "rmmod: "..(err or "failed to unload module").."\n")
-exit(1)
+    write(2, "rmmod: "..(err or "failed to unload module").."\n")
+    exit(1)
 end
 
 write(1, "rmmod: unloaded "..name.."\n")
