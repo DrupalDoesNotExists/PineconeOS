@@ -63,13 +63,13 @@ sha:ed7b7c2b
 file:knuck-0.1.1.cone
 ---
 pkg:knuck
-version:1.0.4
+version:1.0.5
 arch:any
 deps:
-desc:KNUCK microkernel (Lua 5.2)
-size:173755
-sha:2c1c073d
-file:knuck-1.0.4.cone
+desc:KNUCK microkernel (Lua 5.2) — fix TIOCSCTTY tty bind, sched starvation guard
+size:110768
+sha:03302105
+file:knuck-1.0.5.cone
 ---
 pkg:knuck-icmp
 version:1.0.0
