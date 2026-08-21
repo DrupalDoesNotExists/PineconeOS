@@ -1,0 +1,5647 @@
+---PINEPKG v1---
+name=knuck
+version=1.0.11
+arch=any
+maintainer=pine@pineconeos.dev
+description=KNUCK microkernel (Lua 5.2) — vfs peripherals virtual dir, tty scroll 1-line Up/Down, sched starvation guard
+license=MIT
+essential=no
+deps=
+files=15
+---END MANIFEST---
+---FILE /lib/knuck/boot.lua 0755 6800 bb7921f2 src---
+--[[
+  KNUCK kernel entry
+  ==================
+  Boot sequence:
+    1. Build kernel namespace K (kernel env = full globals).
+    2. Load module loader.
+    3. Run self-diagnostics (diag).
+    4. Load core modules (sched, syscall, proc, vfs).
+    5. Init modules, mount VFS.
+    6. Start scheduler -> run init process.
+
+  Run: lua /lib/knuck/boot.lua
+]]
+
+-- Kernel namespace. Kernel code runs with full globals (os/fs/term/...).
+local K = {
+  env = _G,
+  modules = {},
+  selfcheck = {},
+}
+
+-- Bit helpers (CraftOS 1.9 = Lua 5.2/Cobalt: no bitwise operators, no bit32)
+K.bit = {
+  band = function(a, b)
+    local r, bit = 0, 1
+    while a > 0 and b > 0 do
+      if a % 2 == 1 and b % 2 == 1 then r = r + bit end
+      a = math.floor(a / 2); b = math.floor(b / 2); bit = bit * 2
+    end
+    return r
+  end,
+  bor = function(a, b)
+    local r, bit = 0, 1
+    while a > 0 or b > 0 do
+      if a % 2 == 1 or b % 2 == 1 then r = r + bit end
+      a = math.floor(a / 2); b = math.floor(b / 2); bit = bit * 2
+    end
+    return r
+  end,
+  bnot = function(a)
+    -- 32-bit complement
+    return 0xFFFFFFFF - a
+  end,
+}
+
+-- Kernel log (writes to stderr/console + dmesg ring buffer)
+K.log_ring = {}   -- dmesg ring (FIFO, capped)
+K.log_ring_max = 200
+function K.log(msg)
+  local line = "[" .. tostring(os.time()) .. "] " .. tostring(msg)
+  table.insert(K.log_ring, line)
+  if #K.log_ring > K.log_ring_max then
+    table.remove(K.log_ring, 1)
+  end
+  term.setTextColor(colors.yellow)
+  K.term_write("[k] " .. tostring(msg) .. "\n")
+  term.setTextColor(colors.white)
+end
+
+-- Terminal writer with explicit newline/wrap handling.
+-- CC's term.write does not reliably wrap or advance lines across versions,
+-- so the kernel manages cursor movement itself: split on \n, write in
+-- screen-width chunks, scroll at the bottom edge. A line is advanced ONLY
+-- on a real \n, so raw partial writes (e.g. shell input echo) stay inline.
+function K.term_write(s)
+  local t = term
+  local text = tostring(s or "")
+  if not t or not t.getSize or not t.getCursorPos or not t.setCursorPos then
+    -- fallback (host stub / minimal env): plain write
+    if t and t.write then t.write(text) end
+    return
+  end
+  local w, h = t.getSize()
+  if not w or w < 1 or not h or h < 1 then
+    if t.write then t.write(text) end
+    return
+  end
+  local pos = 1
+  while pos <= #text do
+    local nl = text:find("\n", pos, true)
+    local seg, has_nl
+    if nl then
+      seg = text:sub(pos, nl - 1)
+      has_nl = true
+      pos = nl + 1
+    else
+      seg = text:sub(pos)
+      has_nl = false
+      pos = #text + 1
+    end
+    -- write seg with wrapping + backspace handling
+    local cx, cy = t.getCursorPos()
+    local col = cx or 1
+    if seg:find("\b", 1, true) then
+      -- char-by-char (backspace present): \b moves cursor back one column
+      -- (the caller's following space erases the char)
+      for i = 1, #seg do
+        local ch = seg:sub(i, i)
+        if ch == "\b" then
+          col = col - 1
+          if col < 1 then col = 1 end
+          t.setCursorPos(col, cy)
+        else
+          t.write(ch)
+          col = col + 1
+          if col > w then
+            cy = cy + 1
+            if cy > h then
+              t.scroll(1)
+              cy = h
+            end
+            t.setCursorPos(1, cy)
+            col = 1
+          end
+        end
+      end
+    else
+      -- chunked fast path
+      local i = 1
+      while i <= #seg do
+        local avail = w - col + 1
+        if avail < 1 then avail = 1 end
+        local chunk = seg:sub(i, i + avail - 1)
+        t.write(chunk)
+        i = i + #chunk
+        col = col + #chunk
+        if col > w then
+          cy = cy + 1
+          if cy > h then
+            t.scroll(1)
+            cy = h
+          end
+          t.setCursorPos(1, cy)
+          col = 1
+        end
+      end
+    end
+    -- advance line only on an actual newline
+    if has_nl then
+      cy = cy + 1
+      if cy > h then
+        t.scroll(1)
+        cy = h
+      end
+      t.setCursorPos(1, cy)
+    end
+  end
+end
+
+-- 1. Loader
+K.loader = loadfile("/lib/knuck/kernel/loader.lua", "t", K.env)()
+
+-- 2. Self-diagnostics
+local diag = K.loader.load("/lib/knuck/kernel/diag.lua", K)
+K.diag = diag
+K.selfcheck = diag.run(K)
+
+-- 3. Core modules
+K.sched = K.loader.load("/lib/knuck/kernel/sched.lua", K)
+K.syscall = K.loader.load("/lib/knuck/kernel/syscall.lua", K)
+K.proc = K.loader.load("/lib/knuck/kernel/proc.lua", K)
+K.fs = K.loader.load("/lib/knuck/kernel/fs.lua", K)
+K.vfs = K.loader.load("/lib/knuck/kernel/vfs.lua", K)
+K.ipc = K.loader.load("/lib/knuck/kernel/ipc.lua", K)
+K.net = K.loader.load("/lib/knuck/kernel/net.lua", K)
+K.net_transport = K.loader.load("/lib/knuck/kernel/net_transport.lua", K)
+K.auth = K.loader.load("/lib/knuck/kernel/auth.lua", K)
+K.tty = K.loader.load("/lib/knuck/kernel/tty.lua", K)
+
+-- 4. Init modules (dependency order)
+K.syscall.init(K)
+K.proc.init(K)
+K.vfs.init(K)
+K.sched.init(K)
+
+-- 5. Mount VFS
+K.vfs.mount_root()
+
+-- 5a. Mount present disk drives at /mnt/disk0..N
+local ndrives = K.vfs.mount_drives()
+if ndrives > 0 then
+  print("  mounted " .. ndrives .. " disk drive(s)")
+end
+
+-- 5a. Load /boot/knuck.conf (extra modules + init path)
+local init_path = "/sbin/init.lua"
+local ok_conf, conf = pcall(K.fs.read_all, "/boot/knuck.conf")
+if ok_conf and conf then
+  for line in (conf .. "\n"):gmatch("([^\n]*)\n") do
+    line = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if line ~= "" and not line:match("^#") then
+      local cmd, arg = line:match("^(%S+)%s+(.+)$")
+      if cmd == "module" and arg then
+        local okm, mod = pcall(K.loader.load, arg, K)
+        if okm then
+          local name = arg:match("([^/]+)%.lua$") or arg
+          K.modules[name] = mod
+          K.module_paths = K.module_paths or {}
+          K.module_paths[name] = arg
+        end
+      elseif cmd == "init" and arg then
+        init_path = arg
+      end
+    end
+  end
+end
+
+-- 5b. Init network (gracefully disables if no modem)
+K.net.init()
+K.net_transport.init()
+
+-- 5c. Load account database
+K.auth.init(K)
+
+-- 5d. Init virtual terminals
+K.tty.init(K)
+
+-- 6. Boot banner
+term.clear()
+term.setCursorPos(1, 1)
+term.setTextColor(colors.green)
+print("KNUCK " .. (K.selfcheck.craftos or "?") .. " boot")
+term.setTextColor(colors.white)
+if K.selfcheck.preempt then
+  print("  scheduler: preemptive")
+else
+  print("  scheduler: cooperative (no yield-from-hook)")
+end
+if not K.selfcheck.collectgarbage then
+  print("  memory: soft mode (no collectgarbage)")
+end
+
+-- 7. Spawn init (pid 1) detached from tty (init has no controlling tty, per Linux)
+local init_pid = K.proc.spawn("/sbin/init.lua", 0, 0, 0, {}, 0)
+if init_pid then
+  K.proc.set_init(init_pid)
+  print("  init pid " .. init_pid)
+else
+  print("  ERROR: failed to spawn init")
+end
+
+-- 8. Start scheduler (never returns)
+K.sched.start()---FILE /lib/knuck/kernel/auth.lua 0755 4492 a56f6440 src---
+--[[
+  KNUCK account database
+  ======================
+  Reads /etc/passwd and /etc/group. Passwords are hashed with FNV-1a 32-bit
+  (8 hex chars). A password field of "x" means "no password / locked".
+
+  /etc/passwd line:  name:password:uid:gid:gecos:home:shell
+  /etc/group  line:  name:password:gid:member1,member2,...
+]]
+
+return function(K)
+  local M = {}
+
+  -- FNV-1a 32-bit hash (consistent with pine/package checksums)
+  -- Try libcrypto first, then libbase; fall back to inline implementation.
+  local fnv1a = nil
+  do
+    local ok, crypto = pcall(require, "libcrypto")
+    if ok and crypto and crypto.fnv1a then
+      fnv1a = crypto.fnv1a
+    else
+      local ok2, libbase = pcall(require, "libbase")
+      if ok2 and libbase and libbase.fnv1a then
+        fnv1a = libbase.fnv1a
+      else
+      -- Inline fallback (arithmetic bxor, no bit32 in Lua 5.2/Cobalt)
+      -- Uses 16-bit-split multiply to avoid float precision loss.
+      local function bxor(a, b)
+        local r, bit = 0, 1
+        a = a % 0x100000000; b = b % 0x100000000
+        while a > 0 or b > 0 do
+          if (a % 2) ~= (b % 2) then r = r + bit end
+          a = math.floor(a / 2); b = math.floor(b / 2); bit = bit * 2
+        end
+        return r
+      end
+      fnv1a = function(data)
+        local h = 0x811c9dc5
+        for i = 1, #data do
+          h = bxor(h, string.byte(data, i))
+          local lo = h % 0x10000
+          local hi = (h - lo) / 0x10000
+          local plo = 0x01000193 % 0x10000
+          local phi = (0x01000193 - plo) / 0x10000
+          local r = lo * plo + ((lo * phi + hi * plo) % 0x10000) * 0x10000
+          h = r % 0x100000000
+        end
+        return string.format("%08x", h)
+        end
+      end
+    end
+  end
+
+  function M.hash_password(pass)
+    return fnv1a(tostring(pass or ""))
+  end
+
+  local passwd = {}   -- name -> { name, pass, uid, gid, gecos, home, shell }
+  local by_uid = {}   -- uid  -> passwd entry
+  local groups = {}   -- name -> { name, pass, gid, members }
+  local by_gid = {}   -- gid  -> group entry
+
+  -- Parse /etc/passwd
+  local function load_passwd()
+    passwd, by_uid = {}, {}
+    local data = K.fs.read_all("/etc/passwd")
+    if not data then return end
+    for line in data:gmatch("[^\r\n]+") do
+      local name, pass, uid, gid, gecos, home, shell = line:match(
+        "([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*):([^:]*)")
+      if name and name ~= "" then
+        local e = {
+          name = name, pass = pass or "", uid = tonumber(uid) or 0,
+          gid = tonumber(gid) or 0, gecos = gecos or "", home = home or "/",
+          shell = shell or "/bin/sh.lua",
+        }
+        passwd[name] = e
+        by_uid[e.uid] = e
+      end
+    end
+  end
+
+  -- Parse /etc/group
+  local function load_groups()
+    groups, by_gid = {}, {}
+    local data = K.fs.read_all("/etc/group")
+    if not data then return end
+    for line in data:gmatch("[^\r\n]+") do
+      local name, pass, gid, members = line:match(
+        "([^:]*):([^:]*):([^:]*):([^:]*)")
+      if name and name ~= "" then
+        local mem = {}
+        if members and members ~= "" then
+          for m in members:gmatch("[^,]+") do mem[#mem + 1] = m end
+        end
+        local e = { name = name, pass = pass or "", gid = tonumber(gid) or 0, members = mem }
+        groups[name] = e
+        by_gid[e.gid] = e
+      end
+    end
+  end
+
+  function M.init(K)
+    load_passwd()
+    load_groups()
+  end
+
+  -- Reload from disk (after useradd/groupadd)
+  function M.reload()
+    load_passwd()
+    load_groups()
+  end
+
+  -- Lookup by name or uid
+  function M.getpwnam(name) return passwd[name] end
+  function M.getpwuid(uid) return by_uid[uid] end
+  function M.getgrnam(name) return groups[name] end
+  function M.getgrgid(gid) return by_gid[gid] end
+
+  -- Check a password against an entry. "x" or empty = locked (no login).
+  -- Compares FNV-1a hash; falls back to plaintext for legacy entries.
+  function M.check_password(entry, pass)
+    if not entry then return false end
+    if entry.pass == "" or entry.pass == "x" then return false end
+    local stored = entry.pass
+    local hashed = M.hash_password(pass)
+    -- Match against hash (8 hex chars) or legacy plaintext
+    return stored == hashed or stored == tostring(pass or "")
+  end
+
+  -- Login: returns uid, gid on success, or nil.
+  function M.login(name, pass)
+    local e = passwd[name]
+    if not e then return nil end
+    if not M.check_password(e, pass) then return nil end
+    return e.uid, e.gid
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/diag.lua 0755 1975 92fbba74 src---
+--[[
+  KNUCK self-diagnostics
+  ======================
+  Runs at boot before init. Detects platform capabilities and decides
+  kernel behavior (preemptive vs cooperative, memory accounting on/off).
+  Result stored in K.selfcheck and exposed via /proc/selfcheck.
+]]
+
+return function(K)
+  local M = {}
+
+  -- Check a global function exists
+  local function has(fn)
+    return type(fn) == "function"
+  end
+
+  -- Check yield-from-hook (key for preemptive scheduler)
+  local function check_yield_from_hook()
+    if not has(debug.sethook) then return false end
+    local co = coroutine.create(function()
+      local n = 0
+      for i = 1, 10000 do n = n + i end
+      return n
+    end)
+    local fired, yielded = false, false
+    local ok = pcall(function()
+      debug.sethook(co, function()
+        fired = true
+        coroutine.yield("HOOK_YIELD")
+      end, "", 100)
+      local ok_res, val = coroutine.resume(co)
+      if ok_res and val == "HOOK_YIELD" then
+        yielded = true
+        coroutine.resume(co)
+      end
+    end)
+    debug.sethook(co)
+    return ok and fired and yielded
+  end
+
+  function M.run(K)
+    local sc = {
+      lua = _VERSION or "unknown",
+      craftos = (type(os) == "table" and type(os.version) == "function") and os.version() or "unknown",
+      sethook = has(debug.sethook),
+      preempt = check_yield_from_hook(),
+      collectgarbage = has(collectgarbage),
+      fs_rename = (type(fs) == "table" and type(fs.rename) == "function"),
+      sandbox = false,
+    }
+
+    -- Sandbox check: load with custom env hides os/fs
+    local ok_load, load_res = pcall(function()
+      local sandbox = {
+        type = type, tostring = tostring, pairs = pairs, ipairs = ipairs,
+        string = string, math = math, table = table,
+      }
+      local chunk = load("return type(os) == 'nil' and type(fs) == 'nil'", "diag", "t", sandbox)
+      return chunk and chunk()
+    end)
+    sc.sandbox = ok_load and load_res == true
+
+    return sc
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/drivers/term.lua 0755 857 187d13ab src---
+--[[
+  KNUCK term driver
+  =================
+  Backs the /dev/console device node. Delegates to the virtual-terminal
+  layer (K.tty) so each process writes to its bound tty and only the
+  active tty renders to the physical CraftOS terminal.
+]]
+
+return function(K)
+  local M = {}
+
+  -- Write data to the process's tty. Returns bytes written.
+  function M.write(data)
+    local proc = K.sched.current()
+    if K.tty then
+      return K.tty.write(proc, data)
+    end
+    local s = tostring(data or "")
+    term.write(s)
+    return #s
+  end
+
+  -- Read from the process's tty. Blocks until input on that tty.
+  function M.read(n)
+    local proc = K.sched.current()
+    if K.tty then
+      return K.tty.read(proc, n)
+    end
+    if proc then
+      K.sched.wait(proc, "input", "console")
+    end
+    return proc and proc.pending_result or nil
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/fs.lua 0755 5240 9c02e930 src---
+--[[
+  KNUCK inode layer + real-fs backend
+  ===================================
+  Represents filesystem objects (inodes) and enforces the permission model.
+
+  CraftOS 1.9 stores no permissions/timestamps and has no fs.rename. So:
+  - File CONTENT lives in the real CraftOS fs (path = VFS path).
+  - METADATA (type, mode, uid, gid, nlink, symlink target) lives in an
+    in-memory inode table keyed by canonical VFS path. In-memory only for
+    now (permissions reset on reboot; persistence is a later concern).
+
+  Permission model: rwxrwxrwx (octal 0777) + setuid(4000)/setgid(2000)/
+  sticky(1000). Access: owner bits if uid matches, else group bits if gid
+  matches, else other bits. Root (uid 0) bypasses r/w/x checks.
+]]
+
+return function(K)
+  local M = {}
+
+  local inodes = {}             -- canonical path -> inode table
+  local real_root = "/"         -- CraftOS fs root that VFS maps onto
+
+  -- Drive mounts: VFS prefix -> real CraftOS path (disk drives).
+  -- A drive peripheral's filesystem lives at a CC mount path (e.g. "disk");
+  -- we expose it under /mnt/diskN by translating paths before CC fs access.
+  local drive_mounts = {}       -- vfs_prefix -> real_path
+
+  function M.set_drive_mount(vfs_prefix, real_path)
+    drive_mounts[vfs_prefix] = real_path
+  end
+  function M.clear_drive_mount(vfs_prefix)
+    drive_mounts[vfs_prefix] = nil
+  end
+
+  -- Translate a VFS path to the real CraftOS path (honoring drive mounts).
+  local function real_path(path)
+    for prefix, real in pairs(drive_mounts) do
+      if path == prefix then
+        return real
+      elseif path:sub(1, #prefix + 1) == prefix .. "/" then
+        return real .. path:sub(#prefix + 1)
+      end
+    end
+    return path
+  end
+
+  -- Default modes
+  local DMODE = 0x1ED           -- 0755 dir
+  local FMODE = 0x1A4           -- 0644 file
+
+  -- ---- inode helpers ----
+
+  -- Get or create the inode for a path (real-fs backed)
+  function M.inode(path)
+    local ino = inodes[path]
+    if ino then return ino end
+    -- Create from real fs state
+    local t
+    if fs.isDir(path) then
+      t = "dir"
+    elseif fs.exists(path) then
+      t = "file"
+    else
+      return nil
+    end
+    ino = {
+      type = t,
+      mode = (t == "dir") and DMODE or FMODE,
+      uid = 0,
+      gid = 0,
+      nlink = 1,
+      size = fs.exists(path) and (fs.getSize and fs.getSize(path) or 0) or 0,
+    }
+    inodes[path] = ino
+    return ino
+  end
+
+  -- Register an explicit inode (for virtual fs, devices, symlinks)
+  function M.set_inode(path, ino)
+    inodes[path] = ino
+  end
+
+  -- Get an inode without creating (for virtual fs)
+  function M.get_inode(path)
+    return inodes[path]
+  end
+
+  -- Remove an inode (on unlink/rmdir)
+  function M.drop_inode(path)
+    inodes[path] = nil
+  end
+
+  -- ---- permission model ----
+
+  -- Check access: want = "r" | "w" | "x". Returns true/false.
+  function M.check_access(proc, ino, want)
+    if not ino then return false end
+    if proc.uid == 0 then
+      -- root bypasses r/w; execute needs at least one x bit
+      if want == "x" then
+        return K.bit.band(ino.mode, 0x49) ~= 0  -- any execute bit (0111 octal)
+      end
+      return true
+    end
+    local shift
+    if proc.uid == ino.uid then
+      shift = 6
+    elseif proc.gid == ino.gid then
+      shift = 3
+    else
+      shift = 0
+    end
+    local bit = (want == "r") and 4 or (want == "w") and 2 or 1
+    return K.bit.band(ino.mode, bit * (2 ^ shift)) ~= 0
+  end
+
+  -- Apply umask to a requested mode
+  function M.apply_umask(proc, mode)
+    local um = proc.umask or 0x12  -- 0022 octal
+    return K.bit.band(K.bit.band(mode, K.bit.bnot(um)), 0x1FF)
+  end
+
+  -- ---- real-fs operations ----
+
+  function M.is_dir(path)
+    return fs.isDir(real_path(path)) == true
+  end
+
+  function M.exists(path)
+    return fs.exists(real_path(path)) == true
+  end
+
+  function M.list(path)
+    local out = {}
+    if fs.list then
+      for _, name in ipairs(fs.list(real_path(path))) do
+        out[#out + 1] = name
+      end
+    end
+    return out
+  end
+
+  function M.make_dir(path)
+    if fs.makeDir then fs.makeDir(real_path(path)) end
+  end
+
+  function M.remove(path)
+    if fs.delete then fs.delete(real_path(path)) end
+  end
+
+  function M.open(path, mode)
+    return fs.open(real_path(path), mode)
+  end
+
+  -- Read a whole file as string
+  function M.read_all(path)
+    local f = fs.open(real_path(path), "r")
+    if not f then return nil end
+    local data = f.readAll and f.readAll() or ""
+    f.close()
+    return data
+  end
+
+  -- Write a whole file
+  function M.write_all(path, data)
+    local f = fs.open(real_path(path), "w")
+    if not f then return nil end
+    f.write(data)
+    f.close()
+    return true
+  end
+
+  -- Rename: CraftOS 1.9 has no fs.rename -> copy + delete
+  function M.rename(old, new)
+    if fs.rename then
+      fs.rename(old, new)
+      return true
+    end
+    -- fallback: copy + delete
+    local data = M.read_all(old)
+    if data == nil then return nil end
+    if not M.write_all(new, data) then return nil end
+    M.remove(old)
+    return true
+  end
+
+  -- Copy a file (for hardlink fallback)
+  function M.copy(src, dst)
+    local data = M.read_all(src)
+    if data == nil then return nil end
+    return M.write_all(dst, data)
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/ipc.lua 0755 26699 269a6db2 src---
+--[[
+  KNUCK IPC layer
+  ===============
+  Pipes, FIFOs, and sockets (AF_UNIX, AF_MODEM4/AF_MODEM6, AF_HTTP) with a
+  unified socket(domain, type, proto) API.
+
+  Address families:
+    AF_MODEM4 = 2  -- IPv4 over modem (primary modem domain)
+    AF_MODEM6 = 10 -- IPv6 over modem (reserved)
+    AF_ICMP   = 2  -- DEPRECATED: use AF_MODEM4 + IPPROTO_ICMP instead
+    AF_HTTP   = 3  -- HTTP over CraftOS http API
+    AF_UNIX   = 1  -- local UNIX domain sockets
+
+  ICMP sockets: socket("modem4", "raw", 1) or deprecated socket("icmp", "dgram", 1)
+
+  Blocking model: processes block via K.sched.wait(reason, key). Pipe and
+  socket activity wakes them via K.sched.wake. Readiness checks drive
+  select/poll.
+]]
+
+return function(K)
+  local M = {}
+
+  M.recv_timeouts = {}          -- timer id -> socket (SO_RCVTIMEO)
+
+  -- Timer event handler: wakes a recv waiter with nil (timeout). Returns true
+  -- if the timer was one of ours. Called from sched.lua event dispatch.
+  function M.recv_timeout_fired(timer_id)
+    local s = M.recv_timeouts[timer_id]
+    if not s then return false end
+    M.recv_timeouts[timer_id] = nil
+    s.rcv_timeout_timer = nil
+    K.sched.wake("recv", s, nil)
+    return true
+  end
+
+  local pipes = {}              -- pipe objects
+  local unix_sockets = {}       -- path -> listening socket
+  local next_sock = 1
+  local fd_ready_waiters = {}   -- processes blocked in select (no timeout)
+  local http_pending = {}       -- http.request obj -> { proc, socket }
+
+  -- Block a process until some fd becomes ready (select, no timeout)
+  function M.wait_fd_ready(proc, resume_fn)
+    fd_ready_waiters[proc] = true
+    K.sched.wait(proc, "fd_ready", proc.pid, resume_fn)
+  end
+
+  -- Wake all fd_ready waiters (broadcast; select re-checks)
+  function M.wake_fd_ready()
+    for p in pairs(fd_ready_waiters) do
+      fd_ready_waiters[p] = nil
+      K.sched.wake("fd_ready", p.pid, true)
+    end
+  end
+
+  -- ---- pipes ----
+
+  local function new_pipe()
+    return {
+      buffer = {},
+      closed_r = false,
+      closed_w = false,
+      readers = {},             -- waiting reader processes
+      writers = {},             -- waiting writer processes
+    }
+  end
+
+  -- Create a pipe. Returns read_fd, write_fd.
+  function M.pipe()
+    local p = new_pipe()
+    pipes[p] = true
+    return { type = "pipe_r", pipe = p }, { type = "pipe_w", pipe = p }
+  end
+
+  -- Is a pipe readable (has data or EOF)?
+  function M.pipe_readable(p)
+    return #p.buffer > 0 or p.closed_w
+  end
+
+  -- Is a pipe writable?
+  function M.pipe_writable(p)
+    return not p.closed_r
+  end
+
+  -- Read from a pipe. Returns data or nil (EOF) or blocks.
+  function M.pipe_read(proc, fd, n)
+    local p = fd.pipe
+    if #p.buffer > 0 then
+      local data = table.remove(p.buffer, 1)
+      -- wake a waiting writer (space freed)
+      for w in pairs(p.writers) do
+        p.writers[w] = nil
+        K.sched.wake("pipe_write", p, true)
+        break
+      end
+      return data
+    end
+    if p.closed_w then return nil end  -- EOF
+    -- block until data or EOF; on wake, re-read the buffer
+    p.readers[proc] = true
+    K.sched.wait(proc, "pipe_read", p, function()
+      p.readers[proc] = nil
+      if #p.buffer > 0 then
+        local data = table.remove(p.buffer, 1)
+        for w in pairs(p.writers) do
+          p.writers[w] = nil
+          K.sched.wake("pipe_write", p, true)
+          break
+        end
+        return data
+      end
+      return nil
+    end)
+  end
+
+  -- Write to a pipe. Returns bytes or nil (EPIPE).
+  function M.pipe_write(proc, fd, data)
+    local p = fd.pipe
+    if p.closed_r then
+      -- SIGPIPE: write to a pipe with no reader
+      if K.proc and K.proc.send_signal then K.proc.send_signal(proc, 13) end
+      return nil, "EPIPE"
+    end
+    p.buffer[#p.buffer + 1] = data
+    -- wake a waiting reader
+    for r in pairs(p.readers) do
+      p.readers[r] = nil
+      K.sched.wake("pipe_read", p, true)
+      break
+    end
+    M.wake_fd_ready()
+    return #data
+  end
+
+  -- Close a pipe end
+  function M.pipe_close(fd)
+    local p = fd.pipe
+    if fd.type == "pipe_r" then
+      p.closed_r = true
+      -- wake writers (EPIPE)
+      for w in pairs(p.writers) do
+        p.writers[w] = nil
+        K.sched.wake("pipe_write", p, nil)
+      end
+    else
+      p.closed_w = true
+      -- wake readers (EOF)
+      for r in pairs(p.readers) do
+        p.readers[r] = nil
+        K.sched.wake("pipe_read", p, nil)
+      end
+    end
+    return true
+  end
+
+  -- ---- FIFOs ----
+
+  -- Create a FIFO inode (called by mkfifo syscall via vfs)
+  function M.fifo_create()
+    return { type = "fifo", pipe = new_pipe() }
+  end
+
+  -- Open a FIFO for read: signal a reader exists, then block until a writer
+  function M.fifo_open_read(proc, ino, on_open)
+    local p = ino.pipe
+    p.has_reader = true
+    -- wake a waiting writer
+    for w in pairs(p.writers) do
+      p.writers[w] = nil
+      K.sched.wake("fifo_write", p, true)
+      break
+    end
+    if not p.has_writer then
+      p.readers[proc] = true
+      K.sched.wait(proc, "fifo_read", p, function()
+        p.readers[proc] = nil
+        return { on_open({ type = "pipe_r", pipe = p }) }
+      end)
+    end
+    return { type = "pipe_r", pipe = p }
+  end
+
+  -- Open a FIFO for write: signal a writer exists, then block until a reader
+  function M.fifo_open_write(proc, ino, on_open)
+    local p = ino.pipe
+    p.has_writer = true
+    -- wake a waiting reader
+    for r in pairs(p.readers) do
+      p.readers[r] = nil
+      K.sched.wake("fifo_read", p, true)
+      break
+    end
+    if not p.has_reader then
+      p.writers[proc] = true
+      K.sched.wait(proc, "fifo_write", p, function()
+        p.writers[proc] = nil
+        return { on_open({ type = "pipe_w", pipe = p }) }
+      end)
+    end
+    return { type = "pipe_w", pipe = p }
+  end
+
+  -- Called when a FIFO end opens: wake the opposite waiter
+  function M.fifo_joined(p, side)
+    if side == "r" then
+      p.has_reader = true
+      for w in pairs(p.writers) do
+        p.writers[w] = nil
+        K.sched.wake("fifo_write", p, true)
+        break
+      end
+    else
+      p.has_writer = true
+      for r in pairs(p.readers) do
+        p.readers[r] = nil
+        K.sched.wake("fifo_read", p, true)
+        break
+      end
+    end
+  end
+
+  -- ---- sockets ----
+
+  -- Normalize domain string: "icmp" -> "modem4" (deprecated), "modem" -> "modem4".
+  -- Returns the normalized domain and true if the domain was an alias.
+  local function normalize_domain(domain)
+    if domain == "icmp" then
+      -- DEPRECATED: AF_ICMP is an alias for AF_MODEM4 + IPPROTO_ICMP
+      if K.log then K.log("ipc: AF_ICMP deprecated, use AF_MODEM4 + IPPROTO_ICMP") end
+      return "modem4", true
+    elseif domain == "modem" then
+      -- Legacy: "modem" defaults to AF_MODEM4 (IPv4 over modem)
+      return "modem4", false
+    elseif domain == "inet" then
+      return "modem4", false
+    elseif domain == "inet6" then
+      return "modem6", false
+    end
+    return domain, false
+  end
+
+  -- Is this an ICMP-capable domain (modem4/modem6) with IPPROTO_ICMP?
+  local function is_icmp_socket(domain, proto)
+    return (domain == "modem4" or domain == "modem6")
+      and (proto == 1 or proto == "icmp")
+  end
+
+  -- Create a socket fd
+  function M.socket(domain, socktype, proto)
+    -- Normalize domain aliases ("icmp" -> "modem4", "modem" -> "modem4")
+    local norm_domain
+    norm_domain, _ = normalize_domain(domain or "unix")
+
+    local s = {
+      id = next_sock,
+      domain = norm_domain,
+      domain_input = domain,      -- original domain string (for diagnostics)
+      socktype = socktype or "stream",
+      proto = proto or 0,
+      state = "unbound",        -- unbound | bound | listening | connected
+      path = nil,
+      backlog = {},
+      conn = nil,               -- for connected stream sockets
+      queue = {},               -- for datagram sockets (incoming messages)
+      peer = nil,
+      closed = false,
+      -- network sockets
+      port = nil,               -- AF_MODEM4 bound UDP port
+      broadcast = false,        -- SO_BROADCAST
+      url = nil,                -- AF_HTTP target URL
+      response = nil,           -- AF_HTTP canned response
+      -- AF_MODEM4 STREAM/TCP
+      tcp_conn = nil,           -- TCP connection object (connect/accept)
+      tcp_listener = false,     -- this socket is a TCP listener
+      -- AF_HTTP real
+      http_request = nil,       -- pending http.request object
+      http_response = nil,      -- completed response { body, code, headers }
+      http_error = nil,         -- failure message
+      http_method = "GET",      -- GET | POST
+      http_headers = {},        -- request headers
+      http_body = nil,          -- POST body
+      -- AF_MODEM4 + IPPROTO_ICMP (also handles deprecated "icmp" domain)
+      icmp_sock = nil,          -- net_icmp socket object
+      dest_ip = nil,            -- ICMP destination (4-byte string)
+    }
+    -- ICMP socket: AF_MODEM4/AF_MODEM6 with IPPROTO_ICMP (or deprecated "icmp" domain)
+    if is_icmp_socket(norm_domain, proto) then
+      if not K.net_icmp then
+        error("ICMP module not loaded")
+      end
+      s.icmp_sock = K.net_icmp.socket_create(norm_domain, socktype, proto)
+      s.icmp_sock.id = s.id  -- back-reference for net_icmp to use ipc wakeup
+    end
+    next_sock = next_sock + 1
+    return { type = "socket", sock = s }
+  end
+
+  -- Bind a socket to a path (AF_UNIX) or port (AF_MODEM4/AF_MODEM6)
+  function M.socket_bind(proc, fd, path)
+    local s = fd.sock
+    if s.domain == "modem4" or s.domain == "modem6" then
+      if s.icmp_sock then
+        -- AF_MODEM4/AF_MODEM6 + IPPROTO_ICMP: bind to filter address (root-only)
+        if not K.net_icmp then return nil, "ICMP not available" end
+        return K.net_icmp.socket_bind(proc, s.icmp_sock, path)
+      elseif s.socktype == "stream" then
+        -- AF_MODEM4/AF_MODEM6 STREAM: bind = listen on a TCP port (root-only)
+        if proc.uid ~= 0 then return nil, "permission denied" end
+        local port = tonumber(path)
+        if not port then return nil, "invalid port" end
+        local ok, err = K.net_transport.tcp_listen(port)
+        if not ok then return nil, err end
+        s.state = "listening"
+        s.port = port
+        s.tcp_listener = true
+        return true
+      else
+        -- AF_MODEM4/AF_MODEM6 DGRAM: bind to a UDP port (root-only)
+        if proc.uid ~= 0 then return nil, "permission denied" end
+        local port = tonumber(path)
+        if not port then return nil, "invalid port" end
+        local ok, err = K.net_transport.udp_bind(port)
+        if not ok then return nil, err end
+        s.state = "bound"
+        s.port = port
+        return true
+      end
+    end
+    if s.domain ~= "unix" then return nil, "invalid argument" end
+    if unix_sockets[path] then return nil, "address in use" end
+    s.state = "bound"
+    s.path = path
+    unix_sockets[path] = s
+    -- register in VFS as a socket inode
+    K.vfs.set_socket(path, s)
+    return true
+  end
+
+  -- Listen on a bound socket
+  function M.socket_listen(proc, fd, backlog)
+    local s = fd.sock
+    if s.tcp_listener then return true end  -- TCP already listening from bind
+    if s.state ~= "bound" then return nil, "not bound" end
+    s.state = "listening"
+    s.backlog_max = backlog or 8
+    return true
+  end
+
+  -- Accept a connection (blocks until one arrives). on_conn(connfd) converts
+  -- the accepted fd into the value the syscall should return (e.g. allocates
+  -- an fd number). The resume_fn must return an ARRAY table so the process
+  -- wrapper's table.unpack yields the value.
+  function M.socket_accept(proc, fd, on_conn)
+    local s = fd.sock
+    if s.tcp_listener then
+      -- AF_MODEM4/AF_MODEM6 STREAM: accept from a TCP listener (blocks until a conn)
+      local on_conn_fn = function(conn)
+        local cs = {
+          id = next_sock,
+          domain = s.domain,
+          socktype = "stream",
+          state = "connected",
+          tcp_conn = conn,
+          peer = K.net.ip_to_str(conn.remote_ip) .. ":" .. conn.remote_port,
+          queue = {},
+          closed = false,
+        }
+        next_sock = next_sock + 1
+        return { type = "socket", sock = cs }
+      end
+      return K.net_transport.tcp_accept(proc, s.port, on_conn_fn)
+    end
+    if s.state ~= "listening" then return nil, "not listening" end
+    if #s.backlog > 0 then
+      local conn = table.remove(s.backlog, 1)
+      return M._make_conn(conn)
+    end
+    -- block until a connection arrives; on wake, re-check the backlog
+    s.accept_waiters = s.accept_waiters or {}
+    s.accept_waiters[proc] = true
+    K.sched.wait(proc, "accept", s, function()
+      s.accept_waiters[proc] = nil
+      if #s.backlog > 0 then
+        local conn = table.remove(s.backlog, 1)
+        return { on_conn(M._make_conn(conn)) }
+      end
+      return nil
+    end)
+  end
+
+  -- Connect to a listening socket (blocks until accepted)
+  function M.socket_connect(proc, fd, path)
+    local s = fd.sock
+    if s.domain == "http" then
+      -- AF_HTTP: connect sets the target URL (STREAM only)
+      if s.socktype ~= "stream" then return nil, "invalid argument" end
+      if not path:match("^https?://") then return nil, "invalid url" end
+      if not http then return nil, "http not available" end
+      if not http.checkURL(path) then return nil, "url not allowed" end
+      s.state = "connected"
+      s.url = path
+      s.peer = path
+      return true
+    end
+    if (s.domain == "modem4" or s.domain == "modem6") and s.socktype == "stream" then
+      -- AF_MODEM4/AF_MODEM6 STREAM: TCP connect to ip:port
+      local ip_str, port_str = path:match("^(%d+%.%d+%.%d+%.%d+):(%d+)$")
+      if not ip_str then return nil, "invalid address" end
+      local dest_ip = K.net.str_to_ip(ip_str)
+      local dest_port = tonumber(port_str)
+      if not dest_ip or not dest_port then return nil, "invalid address" end
+      local ok, err = K.net_transport.tcp_connect(proc, dest_ip, dest_port, s.port or 0)
+      if not ok then return nil, err end
+      for conn in pairs(K.net_transport.tcp_conns) do
+        if conn.remote_ip == dest_ip and conn.remote_port == dest_port
+          and conn.state == "ESTABLISHED" then
+          s.tcp_conn = conn
+          break
+        end
+      end
+      if not s.tcp_conn then return nil, "connection failed" end
+      s.state = "connected"
+      s.peer = path
+      return true
+    end
+    local server = unix_sockets[path]
+    if not server or server.state ~= "listening" then
+      return nil, "connection refused"
+    end
+    -- create the connection pair
+    local conn = {
+      server = server,
+      client = s,
+      to_server = new_pipe(),   -- client -> server
+      to_client = new_pipe(),   -- server -> client
+    }
+    s.state = "connected"
+    s.conn = conn
+    s.peer = path
+    server.backlog[#server.backlog + 1] = conn
+    -- wake an accept waiter
+    if server.accept_waiters then
+      for w in pairs(server.accept_waiters) do
+        server.accept_waiters[w] = nil
+        K.sched.wake("accept", server, true)
+        break
+      end
+    end
+    return true
+  end
+
+  -- Build the server-side fd for an accepted connection
+  function M._make_conn(conn)
+    local s = {
+      id = next_sock,
+      domain = "unix",
+      socktype = "stream",
+      state = "connected",
+      conn = conn,
+      peer = conn.client.path or "unix",
+      queue = {},
+      closed = false,
+    }
+    next_sock = next_sock + 1
+    return { type = "socket", sock = s }
+  end
+
+  -- Send on a socket
+  function M.socket_send(proc, fd, data)
+    local s = fd.sock
+    if s.closed then return nil, "closed" end
+    if s.domain == "http" then
+      -- AF_HTTP: send fires an async http.request and blocks for the response
+      if s.state ~= "connected" then return nil, "not connected" end
+      if not http then return nil, "http not available" end
+      if s.http_request then return nil, "request in progress" end
+      local url = s.url
+      local ok, req
+      if s.http_method == "POST" then
+        ok, req = http.request(url, s.http_body or data, s.http_headers or {})
+      else
+        local full_url = url
+        if data and #data > 0 then
+          full_url = full_url .. (url:find("?") and "&" or "?") .. data
+        end
+        ok, req = http.request(full_url)
+      end
+      if not ok then return nil, "request failed" end
+      s.http_request = req
+      http_pending[req] = { proc = proc, socket = s }
+      K.sched.wait(proc, "http_response", proc.pid)
+      return true
+    end
+    if (s.domain == "modem4" or s.domain == "modem6") and s.tcp_conn then
+      -- AF_MODEM4/AF_MODEM6 STREAM: TCP send
+      if s.closed then return nil, "closed" end
+      if s.tcp_conn.state ~= "ESTABLISHED" then return nil, "not connected" end
+      return K.net_transport.tcp_send(proc, s.tcp_conn, data)
+    end
+    if s.icmp_sock then
+      -- AF_MODEM4/AF_MODEM6 + IPPROTO_ICMP: send ICMP packet
+      if not K.net_icmp then return nil, "ICMP not available" end
+      return K.net_icmp.socket_send(proc, s.icmp_sock, data)
+    end
+    if s.socktype == "datagram" then
+      -- datagram: send to peer's queue
+      local target = s.peer_sock
+      if not target then return nil, "not connected" end
+      target.queue[#target.queue + 1] = data
+      M._wake_recv(target)
+      M.wake_fd_ready()
+      return #data
+    end
+    -- stream: write to the connection pipe
+    local conn = s.conn
+    if not conn then return nil, "not connected" end
+    local out = (conn.client == s) and conn.to_server or conn.to_client
+    return M.pipe_write(proc, { type = "pipe_w", pipe = out }, data)
+  end
+
+  -- Receive on a socket (blocks unless MSG_DONTWAIT)
+  -- flags: MSG_DONTWAIT=1 (return nil if no data), MSG_PEEK=2 (don't consume)
+  function M.socket_recv(proc, fd, n, flags)
+    local s = fd.sock
+    if s.closed then return nil end
+    local dontwait = flags and (flags % 2 == 1) or false
+    local peek = flags and (math.floor(flags / 2) % 2 == 1) or false
+    if s.domain == "http" then
+      -- AF_HTTP: recv returns the response body (or error)
+      if s.http_response then
+        local r = s.http_response
+        s.http_response = nil
+        return "HTTP/1.1 " .. r.code .. " OK\r\nContent-Length: " .. #(r.body or "")
+          .. "\r\n\r\n" .. (r.body or "")
+      end
+      if s.http_error then
+        local e = s.http_error
+        s.http_error = nil
+        return nil, e
+      end
+      return nil
+    end
+    if (s.domain == "modem4" or s.domain == "modem6") and s.tcp_conn then
+      -- AF_MODEM4/AF_MODEM6 STREAM: TCP recv
+      if s.closed then return nil end
+      return K.net_transport.tcp_recv(proc, s.tcp_conn)
+    end
+    if s.icmp_sock then
+      -- AF_MODEM4/AF_MODEM6 + IPPROTO_ICMP: recv ICMP packet
+      if not K.net_icmp then return nil end
+      return K.net_icmp.socket_recv(proc, s.icmp_sock, n, flags)
+    end
+    if s.socktype == "datagram" then
+      if #s.queue > 0 then
+        local d = s.queue[1]
+        if not peek then table.remove(s.queue, 1) end
+        return d
+      end
+      if dontwait then return nil end
+      -- block until a datagram arrives; on wake, re-read the queue
+      s.recv_waiters = s.recv_waiters or {}
+      s.recv_waiters[proc] = true
+      if s.rcvtimeo and s.rcvtimeo > 0 then
+        local tid = K.env.os.startTimer(s.rcvtimeo)
+        s.rcv_timeout_timer = tid
+        M.recv_timeouts[tid] = s
+      end
+      K.sched.wait(proc, "recv", s, function()
+        s.recv_waiters[proc] = nil
+        if s.rcv_timeout_timer then
+          K.env.os.cancelTimer(s.rcv_timeout_timer)
+          M.recv_timeouts[s.rcv_timeout_timer] = nil
+          s.rcv_timeout_timer = nil
+        end
+        if #s.queue > 0 then return table.remove(s.queue, 1) end
+        return nil
+      end)
+    end
+    -- stream: read from the connection pipe
+    local conn = s.conn
+    if not conn then return nil, "not connected" end
+    local inp = (conn.client == s) and conn.to_client or conn.to_server
+    return M.pipe_read(proc, { type = "pipe_r", pipe = inp }, n)
+  end
+
+  -- Send a datagram to a specific address (AF_MODEM4/AF_MODEM6). Blocks.
+  function M.socket_sendto(proc, fd, data, dest_ip, dest_port)
+    local s = fd.sock
+    if s.closed then return nil, "closed" end
+    if s.icmp_sock then
+      -- AF_MODEM4/AF_MODEM6 + IPPROTO_ICMP: sendto with destination IP
+      if not K.net_icmp then return nil, "ICMP not available" end
+      local ip4 = K.net.str_to_ip(dest_ip)
+      if not ip4 then return nil, "invalid address" end
+      s.icmp_sock.dest_ip = ip4
+      s.icmp_sock.state = "bound"
+      return K.net_icmp.socket_sendto(proc, s.icmp_sock, data, ip4, dest_port)
+    end
+    if s.domain ~= "modem4" and s.domain ~= "modem6" then return nil, "invalid argument" end
+    if s.state ~= "bound" then return nil, "not bound" end
+    if dest_ip == string.char(255, 255, 255, 255) and not s.broadcast then
+      return nil, "permission denied"  -- SO_BROADCAST required
+    end
+    return K.net_transport.udp_send(s.port, dest_ip, dest_port, data)
+  end
+
+  -- Receive a datagram with sender address (AF_MODEM4/AF_MODEM6). Blocks.
+  function M.socket_recvfrom(proc, fd)
+    local s = fd.sock
+    if s.closed then return nil end
+    if s.icmp_sock then
+      -- AF_MODEM4/AF_MODEM6 + IPPROTO_ICMP: recvfrom returns data + source IP
+      if not K.net_icmp then return nil end
+      return K.net_icmp.socket_recv(proc, s.icmp_sock, nil, nil)
+    end
+    if s.domain ~= "modem4" and s.domain ~= "modem6" then return nil, "invalid argument" end
+    if s.state ~= "bound" then return nil, "not bound" end
+    return K.net_transport.udp_recv(proc, s.port)
+  end
+
+  -- Wake a socket's recv waiters
+  function M._wake_recv(s)
+    if s.recv_waiters then
+      for w in pairs(s.recv_waiters) do
+        s.recv_waiters[w] = nil
+        K.sched.wake("recv", s, true)
+        break
+      end
+    end
+  end
+
+  -- Shutdown a socket honoring how: "read" | "write" | "both"
+  function M.socket_shutdown(fd, how)
+    local s = fd.sock
+    if s.closed then return true end
+    how = how or "both"
+    if s.tcp_conn then
+      -- TCP: write = FIN (close conn), read = stop reading
+      if how == "write" or how == "both" then
+        if not s.tcp_conn.closed then K.net_transport.tcp_close(s.tcp_conn) end
+      end
+      if how == "read" or how == "both" then
+        s.closed = true
+      end
+      return true
+    end
+    if s.conn then
+      -- UNIX stream: write closes the out pipe (EOF to peer), read closes the in pipe
+      if how == "write" or how == "both" then
+        local out = (s.conn.client == s) and s.conn.to_server or s.conn.to_client
+        M.pipe_close({ type = "pipe_w", pipe = out })
+      end
+      if how == "read" or how == "both" then
+        local inp = (s.conn.client == s) and s.conn.to_client or s.conn.to_server
+        M.pipe_close({ type = "pipe_r", pipe = inp })
+      end
+      if how == "both" then s.closed = true end
+      return true
+    end
+    return M.socket_close(fd)
+  end
+
+  -- Close a socket
+  function M.socket_close(fd)
+    local s = fd.sock
+    if s.closed then return true end
+    s.closed = true
+    if s.tcp_conn and not s.tcp_conn.closed then
+      K.net_transport.tcp_close(s.tcp_conn)
+    end
+    if s.icmp_sock and K.net_icmp then
+      K.net_icmp.socket_close(s.icmp_sock)
+    end
+    if s.path and unix_sockets[s.path] == s then
+      unix_sockets[s.path] = nil
+      K.vfs.drop_socket(s.path)
+    end
+    -- close connection pipes
+    if s.conn then
+      M.pipe_close({ type = "pipe_r", pipe = s.conn.to_server })
+      M.pipe_close({ type = "pipe_w", pipe = s.conn.to_server })
+      M.pipe_close({ type = "pipe_r", pipe = s.conn.to_client })
+      M.pipe_close({ type = "pipe_w", pipe = s.conn.to_client })
+    end
+    return true
+  end
+
+  -- Socket readiness (for select)
+  function M.socket_readable(s)
+    if s.closed then return true end
+    if s.domain == "modem4" or s.domain == "modem6" then
+      if s.tcp_conn then
+        return #s.tcp_conn.recv_queue > 0
+          or s.tcp_conn.state == "CLOSE_WAIT"
+          or s.tcp_conn.state == "CLOSED"
+      end
+      return s.port ~= nil and K.net_transport.udp_readable(s.port)
+    end
+    if s.domain == "http" then
+      return s.http_response ~= nil or s.http_error ~= nil
+    end
+    if s.icmp_sock then
+      if K.net_icmp then return K.net_icmp.socket_readable(s.icmp_sock) end
+      return false
+    end
+    if s.socktype == "datagram" then return #s.queue > 0 end
+    if s.state == "listening" then return #s.backlog > 0 end
+    if s.conn then
+      local inp = (s.conn.client == s) and s.conn.to_client or s.conn.to_server
+      return M.pipe_readable(inp)
+    end
+    return false
+  end
+
+  function M.socket_writable(s)
+    if s.closed then return false end
+    if s.domain == "modem4" or s.domain == "modem6" then
+      if s.tcp_conn then
+        return s.tcp_conn.state == "ESTABLISHED" and #s.tcp_conn.send_queue == 0
+      end
+      return s.state == "bound"
+    end
+    if s.domain == "http" then return s.state == "connected" end
+    if s.socktype == "datagram" then return s.peer_sock ~= nil end
+    if s.state == "connected" and s.conn then
+      local out = (s.conn.client == s) and s.conn.to_server or s.conn.to_client
+      return M.pipe_writable(out)
+    end
+    return false
+  end
+
+  -- ---- fd readiness (for select) ----
+
+  function M.fd_readable(fd)
+    if fd.type == "pipe_r" then return M.pipe_readable(fd.pipe) end
+    if fd.type == "socket" then return M.socket_readable(fd.sock) end
+    if fd.type == "console" then return false end
+    if fd.type == "file" or fd.type == "memfile" then return true end
+    return false
+  end
+
+  function M.fd_writable(fd)
+    if fd.type == "pipe_w" then return M.pipe_writable(fd.pipe) end
+    if fd.type == "socket" then return M.socket_writable(fd.sock) end
+    if fd.type == "console" then return true end
+    if fd.type == "file" or fd.type == "memfile" then return true end
+    return false
+  end
+
+  -- Handle an http_success/http_failure event from the scheduler: match the
+  -- completed request to its waiting process and wake it.
+  function M.http_event(kind, req, err_msg)
+    local entry = http_pending[req]
+    if not entry then return end
+    http_pending[req] = nil
+    local s = entry.socket
+    s.http_request = nil
+    if kind == "success" and req.readAll then
+      local body = req.readAll()
+      local code = req.getResponseCode and req.getResponseCode() or 0
+      local headers = req.getResponseHeaders and req.getResponseHeaders() or {}
+      req.close()
+      s.http_response = { body = body, code = code, headers = headers }
+    else
+      s.http_error = err_msg or "request failed"
+    end
+    K.sched.wake("http_response", entry.proc.pid, true)
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/loader.lua 0755 1423 277f798e src---
+--[[
+  KNUCK module loader
+  ===================
+  CraftOS 1.9 has no `require`/`package`. This loader loads kernel modules
+  via loadfile with a shared kernel environment. Each module is a function
+  that takes the kernel namespace `K` and returns its exports.
+
+  Usage:
+    local loader = loadfile("/lib/knuck/kernel/loader.lua", "t", K.env)()
+    local sched = loader.load("/lib/knuck/kernel/sched.lua", K)
+]]
+
+local M = {}
+local loaded = {}
+
+-- Load a module file. `K` is the kernel namespace (has .env = kernel env).
+-- Module files return `function(K) ... return M end`. We execute the chunk
+-- to get that function, then call it with K to get the module's exports.
+-- Returns the module's exports (cached).
+function M.load(path, K)
+  if loaded[path] then return loaded[path] end
+  local f, err = loadfile(path, "t", K.env)
+  if not f then
+    error("load " .. path .. ": " .. tostring(err))
+  end
+  local modfn = f()
+  local mod = modfn(K)
+  loaded[path] = mod
+  return mod
+end
+
+-- Load a plain data file (returns its value, e.g. a config table).
+function M.loadfile(path, K)
+  local f, err = loadfile(path, "t", K.env)
+  if not f then
+    error("load " .. path .. ": " .. tostring(err))
+  end
+  return f()
+end
+
+-- Reset the loader cache (used on kernel restart).
+function M.reset()
+  loaded = {}
+end
+
+-- Drop a single module from the cache (used by rmmod).
+function M.unload(path)
+  loaded[path] = nil
+end
+
+return M---FILE /lib/knuck/kernel/net.lua 0755 17188 1f18fc71 src---
+--[[
+  KNUCK network core
+  ==================
+  Link + IP + ARP layer over a CC modem (shared broadcast medium).
+
+  All nodes open a common channel (default 0) and transmit Ethernet frames
+  on it. Every node receives every frame and filters by destination MAC
+  (own or broadcast FF:FF:FF:FF:FF:FF).
+
+  MAC derivation: locally-administered 02:00:00:00:xx:xx where xx:xx is the
+  computer ID as 16-bit big-endian (byte5 = hi, byte6 = lo). No numeric
+  modem id exists in the CC modem API, so the computer ID is the node id.
+
+  Frame format: dest(6) + src(6) + ethertype(2, BE) + payload + FCS(4).
+  FCS is CRC32 (poly 0xEDB88320, reflected), appended little-endian.
+  Min frame 64 bytes (payload padded), max 1518 bytes.
+
+  Ethertypes: 0x0800 = IPv4, 0x0806 = ARP.
+  IP protocols: 1 = ICMP, 6 = TCP, 17 = UDP (TCP/UDP live in net_transport).
+
+  Address families:
+    AF_UNIX   = 1   -- local (UNIX domain sockets, ipc.lua)
+    AF_MODEM4 = 2   -- IPv4 over modem link
+    AF_INET   = 2   -- alias for AF_MODEM4
+    AF_ICMP   = 2   -- DEPRECATED: alias for AF_MODEM4 (use AF_MODEM4 + IPPROTO_ICMP)
+    AF_HTTP   = 3   -- HTTP over CraftOS http API
+    AF_MODEM6 = 10  -- IPv6 over modem link (reserved, not yet implemented)
+    AF_INET6  = 10  -- alias for AF_MODEM6
+
+  IP protocol numbers (IPPROTO):
+    IPPROTO_ICMP = 1,  IPPROTO_TCP = 6,  IPPROTO_UDP = 17
+
+  Lua 5.2/Cobalt has no bit32 library: bit ops are done with arithmetic.
+]]
+
+return function(K)
+  local M = {}
+
+  local BROADCAST_MAC = string.char(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+  local MTU = 1500
+  local MAX_FRAME = 1518
+  local MIN_FRAME = 64
+  local ARP_TTL = 120          -- seconds
+  local RX_QUEUE_MAX = 64
+
+  -- ---- bit helpers (no bit32 in Cobalt) ----
+
+  local function band(a, b)
+    local r, bit = 0, 1
+    while a > 0 and b > 0 do
+      if a % 2 == 1 and b % 2 == 1 then r = r + bit end
+      a = math.floor(a / 2)
+      b = math.floor(b / 2)
+      bit = bit * 2
+    end
+    return r
+  end
+
+  local function bxor(a, b)
+    local r, bit = 0, 1
+    while a > 0 or b > 0 do
+      local abit, bbit = a % 2, b % 2
+      if abit ~= bbit then r = r + bit end
+      a = math.floor(a / 2)
+      b = math.floor(b / 2)
+      bit = bit * 2
+    end
+    return r
+  end
+
+  local function bshl(a, n) return a * (2 ^ n) end
+  local function bshr(a, n) return math.floor(a / (2 ^ n)) end
+  M.bxor = bxor
+
+  -- ---- constants (exposed to userspace via proc.lua) ----
+
+  M.AF_UNIX   = 1     -- UNIX domain sockets
+  M.AF_MODEM4 = 2     -- IPv4 over modem link
+  M.AF_INET   = 2     -- alias for AF_MODEM4
+  M.AF_ICMP   = 2     -- DEPRECATED: alias for AF_MODEM4
+  M.AF_HTTP   = 3     -- HTTP over CraftOS http API
+  M.AF_MODEM6 = 10    -- IPv6 over modem link (reserved)
+  M.AF_INET6  = 10    -- alias for AF_MODEM6
+
+  M.SOCK_STREAM = 1
+  M.SOCK_DGRAM  = 2
+  M.SOCK_RAW    = 3
+
+  M.IPPROTO_IP   = 0
+  M.IPPROTO_ICMP = 1
+  M.IPPROTO_TCP  = 6
+  M.IPPROTO_UDP  = 17
+
+  -- ---- state ----
+
+  M.enabled = false
+  M.modem = nil
+  M.side = nil
+  M.mac = nil
+  M.channel = 0
+  M.family = M.AF_MODEM4               -- active address family (AF_MODEM4|AF_MODEM6)
+  M.ip = string.char(0, 0, 0, 0)          -- 4-byte string
+  M.netmask = string.char(255, 255, 255, 0)
+  M.gateway = string.char(0, 0, 0, 0)
+  M.arp_cache = {}                        -- ip_str -> { mac, ttl, static }
+  M.arp_pending = {}                      -- ip_str -> { callback, ... }
+  M.protos = {}                           -- proto_num -> handler(payload, src_ip)
+  M.frag_buf = {}                         -- key -> reassembly state
+  M.timers = {}                           -- timer_id -> action
+  M.rx_queue = {}                         -- raw frames for /dev/modemN
+  M.ip_id = 1
+  M.routes = {}                           -- { dest=ip4, mask=ip4, gw=ip4, metric=int, family=int }
+
+  -- ---- helpers ----
+
+  function M.ip_to_str(ip)
+    return string.format("%d.%d.%d.%d", ip:byte(1), ip:byte(2), ip:byte(3), ip:byte(4))
+  end
+
+  function M.str_to_ip(s)
+    local a, b, c, d = s:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not a then return nil end
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if not (a and b and c and d) then return nil end
+    if a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+    return string.char(a, b, c, d)
+  end
+
+  function M.mac_to_str(mac)
+    local parts = {}
+    for i = 1, 6 do parts[i] = string.format("%02x", mac:byte(i)) end
+    return table.concat(parts, ":")
+  end
+
+  function M.str_to_mac(s)
+    local parts = {}
+    for p in s:gmatch("%x+") do
+      local v = tonumber(p, 16)
+      if not v or v > 255 then return nil end
+      parts[#parts + 1] = v
+    end
+    if #parts ~= 6 then return nil end
+    return string.char(table.unpack(parts))
+  end
+
+  -- ---- CRC32 (Ethernet FCS) ----
+
+  local crc_table
+  local function crc32(s)
+    if not crc_table then
+      crc_table = {}
+      for i = 0, 255 do
+        local c = i
+        for _ = 1, 8 do
+          if band(c, 1) == 1 then
+            c = bxor(bshr(c, 1), 0xEDB88320)
+          else
+            c = bshr(c, 1)
+          end
+        end
+        crc_table[i] = c
+      end
+    end
+    local crc = 0xFFFFFFFF
+    for i = 1, #s do
+      crc = bxor(bshr(crc, 8), crc_table[band(bxor(crc, s:byte(i)), 0xFF)])
+    end
+    crc = bxor(crc, 0xFFFFFFFF)
+    return string.char(band(crc, 0xFF), band(bshr(crc, 8), 0xFF),
+      band(bshr(crc, 16), 0xFF), band(bshr(crc, 24), 0xFF))
+  end
+  M.crc32 = crc32
+
+  -- ---- Ethernet framing ----
+
+  function M.eth_build(dest_mac, ethertype, payload)
+    local body = dest_mac .. M.mac
+      .. string.char(math.floor(ethertype / 256), ethertype % 256)
+      .. payload
+    if #body < MIN_FRAME - 4 then
+      body = body .. string.rep("\0", MIN_FRAME - 4 - #body)
+    end
+    return body .. crc32(body)
+  end
+
+  function M.eth_parse(frame)
+    if type(frame) ~= "string" then return nil end
+    if #frame < MIN_FRAME or #frame > MAX_FRAME then return nil end
+    local body = frame:sub(1, -5)
+    if crc32(body) ~= frame:sub(-4) then return nil end
+    local dest = body:sub(1, 6)
+    local src = body:sub(7, 12)
+    local ethertype = body:byte(13) * 256 + body:byte(14)
+    return dest, src, ethertype, body:sub(15)
+  end
+
+  -- ---- transmit / receive ----
+
+  function M.transmit(frame)
+    if not M.enabled then return end
+    M.modem.transmit(M.channel, M.channel, frame)
+  end
+
+  function M.on_modem_message(side, channel, replyChannel, message, distance)
+    if not M.enabled then return end
+    if type(message) ~= "string" then return end
+    -- queue raw frame for /dev/modemN readers (bounded)
+    if #M.rx_queue < RX_QUEUE_MAX then
+      M.rx_queue[#M.rx_queue + 1] = message
+    end
+    local dest, src, ethertype, payload = M.eth_parse(message)
+    if not dest then return end
+    if dest ~= M.mac and dest ~= BROADCAST_MAC then return end
+    if ethertype == 0x0806 then
+      M.arp_handle(payload)
+    elseif ethertype == 0x0800 then
+      M.ip_handle(payload)
+    end
+  end
+
+  -- ---- ARP (RFC 826) ----
+
+  local function arp_packet(op, sha, spa, tha, tpa)
+    return string.char(0, 1, 8, 0, 6, 4, 0, op) .. sha .. spa .. tha .. tpa
+  end
+
+  function M._arp_cache(ip_str, mac, is_static)
+    M.arp_cache[ip_str] = { mac = mac, ttl = os.clock() + ARP_TTL, static = is_static }
+    -- schedule a sweep timer (one at a time)
+    if not M.arp_sweep_timer then
+      M.arp_sweep_timer = os.startTimer(ARP_TTL)
+      M.timers[M.arp_sweep_timer] = function()
+        M.arp_sweep_timer = nil
+        local now = os.clock()
+        for k, v in pairs(M.arp_cache) do
+          if not v.static and v.ttl < now then M.arp_cache[k] = nil end
+        end
+      end
+    end
+  end
+
+  function M.arp_request(ip)
+    M.transmit(M.eth_build(BROADCAST_MAC, 0x0806,
+      arp_packet(1, M.mac, M.ip, string.rep("\0", 6), ip)))
+  end
+
+  function M.arp_reply(ip, mac)
+    M.transmit(M.eth_build(mac, 0x0806,
+      arp_packet(2, M.mac, M.ip, mac, ip)))
+  end
+
+  function M.arp_resolve(ip, callback)
+    local dstr = M.ip_to_str(ip)
+    local entry = M.arp_cache[dstr]
+    if entry then
+      callback(entry.mac)
+      return
+    end
+    M.arp_pending[dstr] = M.arp_pending[dstr] or {}
+    table.insert(M.arp_pending[dstr], callback)
+    M.arp_request(ip)
+  end
+
+  function M.arp_handle(payload)
+    if #payload < 28 then return end
+    local htype = payload:byte(1) * 256 + payload:byte(2)
+    local ptype = payload:byte(3) * 256 + payload:byte(4)
+    local hlen, plen = payload:byte(5), payload:byte(6)
+    local op = payload:byte(7) * 256 + payload:byte(8)
+    if htype ~= 1 or ptype ~= 0x0800 or hlen ~= 6 or plen ~= 4 then return end
+    local sha = payload:sub(9, 14)
+    local spa = payload:sub(15, 18)
+    local tha = payload:sub(19, 24)
+    local tpa = payload:sub(25, 28)
+    local spa_str = M.ip_to_str(spa)
+    if op == 1 then
+      -- request: cache sender, reply if it is for us
+      M._arp_cache(spa_str, sha, false)
+      if tpa == M.ip then
+        M.arp_reply(spa, sha)
+      end
+    elseif op == 2 then
+      -- reply: cache sender, resolve queued callbacks
+      M._arp_cache(spa_str, sha, false)
+      local q = M.arp_pending[spa_str]
+      if q then
+        M.arp_pending[spa_str] = nil
+        for _, cb in ipairs(q) do cb(sha) end
+      end
+    end
+  end
+
+  -- ---- IP (RFC 791) ----
+
+  function M.ip_checksum(header)
+    local sum = 0
+    for i = 1, #header, 2 do
+      local hi = header:byte(i) or 0
+      local lo = header:byte(i + 1) or 0
+      sum = sum + hi * 256 + lo
+    end
+    while sum > 0xFFFF do
+      sum = (sum % 0x10000) + math.floor(sum / 0x10000)
+    end
+    return bxor(sum, 0xFFFF)
+  end
+
+  function M._same_subnet(ip)
+    for i = 1, 4 do
+      if band(M.ip:byte(i), M.netmask:byte(i)) ~= band(ip:byte(i), M.netmask:byte(i)) then
+        return false
+      end
+    end
+    return true
+  end
+
+  -- Count set bits in a 4-byte netmask (prefix length).
+  local function count_prefix_bits(mask)
+    local n = 0
+    for i = 1, 4 do
+      local b = mask:byte(i)
+      while b > 0 do
+        if b % 2 == 1 then n = n + 1 end
+        b = math.floor(b / 2)
+      end
+    end
+    return n
+  end
+
+  -- Bitwise AND of two 4-byte IP strings.
+  local function ip_band(a, b)
+    return string.char(band(a:byte(1), b:byte(1)), band(a:byte(2), b:byte(2)),
+      band(a:byte(3), b:byte(3)), band(a:byte(4), b:byte(4)))
+  end
+
+  -- Longest-prefix-match route lookup. Returns the next-hop IP (gateway, or
+  -- dest_ip for a directly-connected route), or nil if no route matches.
+  function M.route_lookup(dest_ip)
+    local best_match = -1
+    local best_gw = nil
+    for _, route in ipairs(M.routes) do
+      local match = true
+      for i = 1, 4 do
+        if band(dest_ip:byte(i), route.mask:byte(i)) ~= band(route.dest:byte(i), route.mask:byte(i)) then
+          match = false
+          break
+        end
+      end
+      if match then
+        local prefix = count_prefix_bits(route.mask)
+        if prefix > best_match then
+          best_match = prefix
+          if route.gw == string.char(0, 0, 0, 0) then
+            best_gw = dest_ip
+          else
+            best_gw = route.gw
+          end
+        end
+      end
+    end
+    return best_gw
+  end
+
+  -- Build a full IP packet (header + payload). flags_frag is the 16-bit
+  -- flags/fragment-offset field (offset in 8-byte units).
+  function M._build_ip(dest_ip, proto, id, flags_frag, payload)
+    local total_len = 20 + #payload
+    local header = string.char(0x45, 0,
+      math.floor(total_len / 256), total_len % 256,
+      math.floor(id / 256), id % 256,
+      math.floor(flags_frag / 256), flags_frag % 256,
+      64, proto, 0, 0)
+      .. M.ip .. dest_ip
+    local cs = M.ip_checksum(header)
+    header = header:sub(1, 10) .. string.char(math.floor(cs / 256), cs % 256) .. header:sub(13)
+    return header .. payload
+  end
+
+  function M._send_ip_frame(mac, dest_ip, proto, payload)
+    local id = M.ip_id
+    M.ip_id = (M.ip_id + 1) % 65536
+    if #payload > MTU - 20 then
+      -- fragment (offset in 8-byte units)
+      local offset = 0
+      while offset < #payload do
+        local chunk = payload:sub(offset + 1, offset + MTU - 20)
+        local mf = (offset + #chunk < #payload) and 1 or 0
+        local ff = mf * 8192 + math.floor(offset / 8)
+        M.transmit(M.eth_build(mac, 0x0800, M._build_ip(dest_ip, proto, id, ff, chunk)))
+        offset = offset + #chunk
+      end
+    else
+      M.transmit(M.eth_build(mac, 0x0800, M._build_ip(dest_ip, proto, id, 0, payload)))
+    end
+  end
+
+  -- Send an IP payload to dest_ip (4-byte string). Resolves the next-hop MAC
+  -- via ARP (queues the send until resolution completes if needed).
+  function M.send_ip(dest_ip, proto, payload)
+    if not M.enabled then return nil, "network disabled" end
+    if dest_ip == string.char(255, 255, 255, 255) then
+      M._send_ip_frame(BROADCAST_MAC, dest_ip, proto, payload)
+      return #payload
+    end
+    local target = M.route_lookup(dest_ip)
+    if not target then
+      if M._same_subnet(dest_ip) then target = dest_ip else target = M.gateway end
+    end
+    local entry = M.arp_cache[M.ip_to_str(target)]
+    if entry then
+      M._send_ip_frame(entry.mac, dest_ip, proto, payload)
+      return #payload
+    end
+    -- ARP pending: queue the send until resolution completes
+    M.arp_resolve(target, function(mac)
+      M._send_ip_frame(mac, dest_ip, proto, payload)
+    end)
+    return nil, "arp pending"
+  end
+
+  function M.register_proto(proto_num, handler)
+    M.protos[proto_num] = handler
+  end
+
+  function M._demux(proto, data, src)
+    local h = M.protos[proto]
+    if h then h(data, src) end
+  end
+
+  function M.ip_handle(payload)
+    if #payload < 20 then return end
+    local ver_ihl = payload:byte(1)
+    if math.floor(ver_ihl / 16) ~= 4 then return end
+    local ihl = ver_ihl % 16
+    if ihl < 5 then return end
+    local total_len = payload:byte(3) * 256 + payload:byte(4)
+    local id = payload:byte(5) * 256 + payload:byte(6)
+    local flags_frag = payload:byte(7) * 256 + payload:byte(8)
+    local proto = payload:byte(10)
+    local src = payload:sub(13, 16)
+    local dest = payload:sub(17, 20)
+    -- verify header checksum (a valid header verifies to 0)
+    if M.ip_checksum(payload:sub(1, ihl * 4)) ~= 0 then return end
+    -- destination check
+    if dest ~= M.ip and dest ~= string.char(255, 255, 255, 255) then return end
+    local frag_offset = flags_frag % 8192
+    local mf = flags_frag >= 8192
+    local data = payload:sub(ihl * 4 + 1, total_len)
+    if mf or frag_offset > 0 then
+      -- reassembly: collect fragments, sort by offset, check contiguity
+      local key = M.ip_to_str(src) .. ":" .. id .. ":" .. proto
+      local frag = M.frag_buf[key]
+      if not frag then
+        frag = { parts = {}, last = false, created = os.clock() }
+        M.frag_buf[key] = frag
+      end
+      frag.parts[frag_offset] = data
+      if not mf then frag.last = true end
+      if frag.last then
+        local offsets = {}
+        for off in pairs(frag.parts) do offsets[#offsets + 1] = off end
+        table.sort(offsets)
+        local buf, expected, complete = {}, 0, true
+        for _, off in ipairs(offsets) do
+          if off * 8 ~= expected then complete = false break end
+          buf[#buf + 1] = frag.parts[off]
+          expected = expected + #frag.parts[off]
+        end
+        if complete then
+          M.frag_buf[key] = nil
+          M._demux(proto, table.concat(buf), src)
+        end
+      end
+      return
+    end
+    M._demux(proto, data, src)
+  end
+
+  -- ---- ICMP (echo only) ----
+
+  -- ---- timers ----
+
+  -- Pre-dispatch hook: returns true if timer_id was a network timer.
+  function M.timer_fired(timer_id)
+    local action = M.timers[timer_id]
+    if not action then return false end
+    M.timers[timer_id] = nil
+    action()
+    return true
+  end
+
+  -- ---- init ----
+
+  function M.init()
+    M.enabled = false
+    if not peripheral then
+      K.log("net: no peripheral API, network disabled")
+      return
+    end
+    local modem = peripheral.find("modem")
+    if not modem then
+      K.log("net: no modem found, network disabled")
+      return
+    end
+    M.modem = modem
+    M.side = peripheral.getName(modem)
+    local cid = os.getComputerID() or 0
+    M.mac = string.char(2, 0, 0, 0, math.floor(cid / 256) % 256, cid % 256)
+    M.channel = 0
+    modem.open(M.channel)
+    M.enabled = true
+    K.log("net: enabled on " .. tostring(M.side) .. " mac " .. M.mac_to_str(M.mac))
+    -- Seed routing table: default route via gateway + directly-connected subnet
+    if M.gateway ~= string.char(0, 0, 0, 0) then
+      M.routes[1] = { dest = string.char(0, 0, 0, 0), mask = string.char(0, 0, 0, 0), gw = M.gateway, metric = 0, family = M.AF_MODEM4 }
+    end
+    M.routes[#M.routes + 1] = { dest = ip_band(M.ip, M.netmask), mask = M.netmask, gw = string.char(0, 0, 0, 0), metric = 0, family = M.AF_MODEM4 }
+    -- /dev/modemN: thin wrapper over the same link layer (root-only, 0600)
+    K.vfs.register_device("modem0", {
+      mode = 0x180,
+      read = function(n)
+        if #M.rx_queue > 0 then return table.remove(M.rx_queue, 1) end
+        return nil
+      end,
+      write = function(data)
+        M.transmit(data)
+        return #data
+      end,
+    })
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/net_icmp.lua 0755 7780 3ab431a3 src---
+--[[
+  KNUCK ICMP module
+  =================
+  Loadable kernel module implementing ICMP (Internet Control Message Protocol,
+  RFC 792). Replaces the hardcoded _icmp_handle in net.lua.
+
+  Provides:
+    - Protocol handler registered via K.net.register_proto(IPPROTO_ICMP, handler)
+    - AF_MODEM4 socket domain with IPPROTO_ICMP for userland ping/traceroute
+      (AF_ICMP is a deprecated alias for AF_MODEM4 + IPPROTO_ICMP)
+    - Per-socket receive queues with blocking recv
+    - ICMP statistics (sent/received/errors)
+
+  ICMP types handled:
+    0  echo reply
+    3  destination unreachable
+    11 time exceeded
+    8  echo request (handled by kernel, also forwarded to sockets)
+
+  Socket model (new):
+    socket("modem4", "raw", 1)   -- AF_MODEM4, SOCK_RAW, IPPROTO_ICMP
+    bind(fd, "0.0.0.0")          -- optional, binds to filter
+    sendto(fd, data, dest_ip)    -- sends ICMP with auto-ident/seq
+    recvfrom(fd)                 -- blocks until ICMP packet arrives
+
+  Deprecated socket model (compat):
+    socket("icmp", "dgram", 1)   -- AF_ICMP (deprecated), SOCK_DGRAM, IPPROTO_ICMP
+]]
+
+return function(K)
+  local M = {}
+
+  local net = nil               -- set in init()
+
+  -- ---- ICMP constants ----
+
+  local ICMP_ECHO_REPLY    = 0
+  local ICMP_DEST_UNREACH  = 3
+  local ICMP_TIME_EXCEED   = 11
+  local ICMP_ECHO_REQUEST  = 8
+
+  -- ---- state ----
+
+  local sockets = {}           -- all ICMP sockets (fd.sock references)
+  local ident_counter = 1      -- auto-incrementing ICMP ident
+  local stats = {
+    sent = 0,
+    received = 0,
+    errors = 0,
+    echo_requests = 0,
+    echo_replies = 0,
+  }
+
+  -- ---- ICMP checksum (RFC 1071) ----
+
+  local function icmp_checksum(data)
+    local sum = 0
+    for i = 1, #data, 2 do
+      local hi = data:byte(i) or 0
+      local lo = data:byte(i + 1) or 0
+      sum = sum + hi * 256 + lo
+    end
+    while sum > 0xFFFF do
+      sum = (sum % 0x10000) + math.floor(sum / 0x10000)
+    end
+    return K.net.bxor(sum, 0xFFFF)
+  end
+
+  -- Build ICMP header: type(1) + code(1) + checksum(2) + rest(4) + payload
+  local function build_icmp(type, code, rest, payload)
+    -- rest is 4 bytes (e.g. ident+seq for echo, or unused for error)
+    payload = payload or ""
+    local header = string.char(type, code, 0, 0) .. rest .. payload
+    local cs = icmp_checksum(header)
+    header = string.char(type, code, math.floor(cs / 256), cs % 256) .. rest .. payload
+    return header
+  end
+
+  -- ---- protocol handler (called by net._demux for proto=1) ----
+
+  function M.handle(data, src_ip)
+    if #data < 8 then
+      stats.errors = stats.errors + 1
+      return
+    end
+
+    local typ = data:byte(1)
+    stats.received = stats.received + 1
+
+    -- Echo request: kernel responds AND forwards to sockets
+    if typ == ICMP_ECHO_REQUEST then
+      stats.echo_requests = stats.echo_requests + 1
+      -- Kernel auto-reply: type 8 -> type 0
+      local reply_payload = data:sub(9)  -- everything after 8-byte ICMP header
+      local reply_rest = data:sub(5, 8)  -- ident + sequence
+      local reply = build_icmp(ICMP_ECHO_REPLY, 0, reply_rest, reply_payload)
+      net.send_ip(src_ip, net.IPPROTO_ICMP, reply)
+      stats.sent = stats.sent + 1
+    elseif typ == ICMP_ECHO_REPLY then
+      stats.echo_replies = stats.echo_replies + 1
+    end
+
+    -- Forward to all matching ICMP sockets
+    for _, s in ipairs(sockets) do
+      if not s.closed then
+        -- Filter: if bound to a specific ident, only deliver matching
+        local ident = nil
+        if #data >= 5 then
+          ident = data:byte(5) * 256 + data:byte(6)
+        end
+        local deliver = true
+        if s.bound_ident and ident and s.bound_ident ~= ident then
+          deliver = false
+        end
+        if deliver then
+          s.queue[#s.queue + 1] = {
+            data = data,
+            src_ip = src_ip,
+            typ = typ,
+          }
+          -- Wake a waiting recv
+          if s.recv_waiters then
+            for w in pairs(s.recv_waiters) do
+              s.recv_waiters[w] = nil
+              K.sched.wake("icmp_recv", s, true)
+              break
+            end
+          end
+          K.ipc.wake_fd_ready()
+        end
+      end
+    end
+  end
+
+  -- ---- socket operations ----
+
+  function M.socket_create(domain, socktype, proto)
+    local s = {
+      id = nil,                 -- set by ipc.socket()
+      domain = domain,
+      socktype = socktype,
+      proto = proto,
+      state = "unbound",
+      closed = false,
+      queue = {},               -- inbound ICMP packets
+      recv_waiters = {},
+      bound_ident = nil,        -- nil = accept all, number = filter by ident
+    }
+    sockets[#sockets + 1] = s
+    return s
+  end
+
+  function M.socket_bind(proc, s, addr)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    -- addr can be "0.0.0.0" (any) or a specific ident to filter
+    if addr and addr ~= "0.0.0.0" then
+      local ident = tonumber(addr)
+      if ident then
+        s.bound_ident = ident
+      end
+    end
+    s.state = "bound"
+    return true
+  end
+
+  function M.socket_send(proc, s, data)
+    if s.closed then return nil, "closed" end
+    if s.state ~= "bound" then return nil, "not bound" end
+    -- data should be a raw ICMP packet or at least 8+ bytes
+    if #data < 8 then return nil, "invalid argument" end
+
+    local dest_ip = s.dest_ip
+    if not dest_ip then return nil, "no destination" end
+
+    -- Compute checksum and send
+    local cs = icmp_checksum(data)
+    local packet = data:sub(1, 2)
+      .. string.char(math.floor(cs / 256), cs % 256)
+      .. data:sub(5)
+
+    local ok, err = net.send_ip(dest_ip, net.IPPROTO_ICMP, packet)
+    if ok then
+      stats.sent = stats.sent + 1
+      return #data
+    end
+    return nil, err
+  end
+
+  function M.socket_sendto(proc, s, data, dest_ip, dest_port)
+    if s.closed then return nil, "closed" end
+    if #data < 8 then return nil, "invalid argument" end
+
+    s.dest_ip = dest_ip
+    s.state = "bound"
+
+    local cs = icmp_checksum(data)
+    local packet = data:sub(1, 2)
+      .. string.char(math.floor(cs / 256), cs % 256)
+      .. data:sub(5)
+
+    local ok, err = net.send_ip(dest_ip, net.IPPROTO_ICMP, packet)
+    if ok then
+      stats.sent = stats.sent + 1
+      return #data
+    end
+    return nil, err
+  end
+
+  function M.socket_recv(proc, s, n, flags)
+    if s.closed then return nil end
+    local dontwait = flags and (flags % 2 == 1) or false
+
+    if #s.queue > 0 then
+      local pkt = table.remove(s.queue, 1)
+      -- Return: data + src_ip as a table for recvfrom semantics
+      return pkt.data, pkt.src_ip
+    end
+
+    if dontwait then return nil end
+
+    -- Block until ICMP packet arrives
+    s.recv_waiters[proc] = true
+    K.sched.wait(proc, "icmp_recv", s, function()
+      s.recv_waiters[proc] = nil
+      if #s.queue > 0 then
+        local pkt = table.remove(s.queue, 1)
+        return pkt.data, pkt.src_ip
+      end
+      return nil
+    end)
+  end
+
+  function M.socket_readable(s)
+    if s.closed then return true end  -- EOF
+    return #s.queue > 0
+  end
+
+  function M.socket_close(s)
+    if s.closed then return true end
+    s.closed = true
+    -- Remove from sockets list
+    for i, sock in ipairs(sockets) do
+      if sock == s then
+        table.remove(sockets, i)
+        break
+      end
+    end
+    return true
+  end
+
+  -- ---- stats ----
+
+  function M.stats()
+    return {
+      sent = stats.sent,
+      received = stats.received,
+      errors = stats.errors,
+      echo_requests = stats.echo_requests,
+      echo_replies = stats.echo_replies,
+    }
+  end
+
+  -- ---- init ----
+
+  function M.init()
+    net = K.net
+    -- Register ICMP protocol handler
+    net.register_proto(net.IPPROTO_ICMP, M.handle)
+    K.log("net_icmp: loaded, ICMP protocol handler registered (proto=" .. net.IPPROTO_ICMP .. ")")
+  end
+
+  return M
+end
+---FILE /lib/knuck/kernel/net_transport.lua 0755 17955 1913f4f8 src---
+--[[
+  KNUCK transport layer
+  =====================
+  UDP + TCP (RFC 793) over the net.lua link/IP layer.
+
+  Registers protocol handlers with K.net:
+    K.net.register_proto(IPPROTO_TCP,  tcp_handle)   -- 6
+    K.net.register_proto(IPPROTO_UDP,  udp_handle)   -- 17
+
+  IP protocol constants (from net.lua):
+    IPPROTO_ICMP = 1,  IPPROTO_TCP = 6,  IPPROTO_UDP = 17
+
+  UDP: port table with per-port receive queues. sendto/recvfrom semantics.
+  TCP: full state machine (CLOSED/LISTEN/SYN_SENT/SYN_RECEIVED/ESTABLISHED/
+  FIN_WAIT_1/FIN_WAIT_2/CLOSE_WAIT/LAST_ACK/TIME_WAIT), sequence/ACK tracking,
+  retransmit with exponential backoff (RTO 1s, double, give up after 5).
+
+  Blocking model: processes block via K.sched.wait(reason, key); transport
+  activity wakes them via K.sched.wake. Timers (retransmit, TIME_WAIT) use
+  os.startTimer and are serviced through K.net.timer_fired.
+]]
+
+return function(K)
+  local M = {}
+
+  local net = nil               -- set in init()
+
+  -- ---- TCP constants ----
+  local TCP_HEADER = 20
+  local FLAG_FIN, FLAG_SYN, FLAG_RST, FLAG_ACK = 0x01, 0x02, 0x04, 0x10
+  local RTO_INIT = 1            -- seconds
+  local RTO_MAX_RETRIES = 5
+  local TIME_WAIT_SECS = 30
+
+  -- ---- UDP ----
+
+  local udp_ports = {}          -- port -> { queue = {}, waiters = {} }
+
+  function M.udp_bind(port)
+    if udp_ports[port] then return nil, "address in use" end
+    udp_ports[port] = { queue = {}, waiters = {} }
+    return true
+  end
+
+  function M.udp_unbind(port)
+    udp_ports[port] = nil
+  end
+
+  -- Is a bound UDP port readable (has queued datagrams)?
+  function M.udp_readable(port)
+    local p = udp_ports[port]
+    return p ~= nil and #p.queue > 0
+  end
+
+  -- Send a UDP datagram from src_port to dest_ip:dest_port.
+  function M.udp_send(src_port, dest_ip, dest_port, data)
+    local len = 8 + #data
+    local header = string.char(
+      math.floor(src_port / 256), src_port % 256,
+      math.floor(dest_port / 256), dest_port % 256,
+      math.floor(len / 256), len % 256, 0, 0)  -- checksum 0 (optional)
+    return K.net.send_ip(dest_ip, K.net.IPPROTO_UDP, header .. data)
+  end
+
+  -- Blocking receive from a bound UDP port. Returns data, src_ip, src_port.
+  function M.udp_recv(proc, port)
+    local p = udp_ports[port]
+    if not p then return nil, "not bound" end
+    if #p.queue > 0 then
+      local d = table.remove(p.queue, 1)
+      return d.data, d.src_ip, d.src_port
+    end
+    p.waiters[proc] = true
+    return K.sched.wait(proc, "udp_recv", port, function()
+      p.waiters[proc] = nil
+      if #p.queue > 0 then
+        local d = table.remove(p.queue, 1)
+        return { d.data, d.src_ip, d.src_port }
+      end
+      return nil
+    end)
+  end
+
+  function M.udp_handle(payload, src_ip)
+    if #payload < 8 then return end
+    local src_port = payload:byte(1) * 256 + payload:byte(2)
+    local dest_port = payload:byte(3) * 256 + payload:byte(4)
+    local len = payload:byte(5) * 256 + payload:byte(6)
+    local p = udp_ports[dest_port]
+    if not p then return end  -- no listener: drop
+    local data = payload:sub(9, len)
+    p.queue[#p.queue + 1] = { data = data, src_ip = src_ip, src_port = src_port }
+    -- wake a waiting receiver
+    for w in pairs(p.waiters) do
+      p.waiters[w] = nil
+      K.sched.wake("udp_recv", dest_port, true)
+      break
+    end
+  end
+
+  -- ---- TCP ----
+
+  local tcp_ports = {}          -- port -> { state="listen", backlog={}, waiters={} }
+  local tcp_conns = {}          -- conn objects (active + established)
+  M.tcp_conns = tcp_conns       -- exposed for diagnostics/tests
+
+  -- Allocate an ephemeral local port (49152+ range, avoids listeners).
+  local next_tcp_ephemeral = 49152
+  function M.alloc_port()
+    local start = next_tcp_ephemeral
+    for i = 0, 16383 do
+      local port = start + (i % 16384)
+      local used = false
+      for conn in pairs(tcp_conns) do
+        if conn.local_port == port then used = true; break end
+      end
+      if not used and not tcp_ports[port] then
+        next_tcp_ephemeral = (port + 1) % 16384 + 49152
+        return port
+      end
+    end
+    return nil, "no free ports"
+  end
+
+  local function new_conn()
+    return {
+      local_port = 0,
+      remote_ip = nil,
+      remote_port = 0,
+      state = "CLOSED",
+      snd_nxt = 0, snd_una = 0, snd_wnd = 0,
+      rcv_nxt = 0,
+      iss = 0, irs = 0,
+      send_queue = {},          -- outbound data awaiting ACK
+      recv_queue = {},          -- inbound data awaiting read
+      recv_waiters = {},
+      send_waiters = {},
+      rto = RTO_INIT,
+      retries = 0,
+      timer_id = nil,
+      timer_kind = nil,         -- "retransmit" | "timewait"
+      closed = false,
+    }
+  end
+
+  local function tcp_checksum(src_ip, dest_ip, payload)
+    -- pseudo-header + TCP segment
+    local len = #payload
+    local pseudo = src_ip .. dest_ip .. string.char(0, K.net.IPPROTO_TCP,
+      math.floor(len / 256), len % 256)
+    local seg = pseudo .. payload
+    local sum = 0
+    for i = 1, #seg, 2 do
+      local hi = seg:byte(i) or 0
+      local lo = seg:byte(i + 1) or 0
+      sum = sum + hi * 256 + lo
+    end
+    while sum > 0xFFFF do
+      sum = (sum % 0x10000) + math.floor(sum / 0x10000)
+    end
+    return K.net.bxor(sum, 0xFFFF)
+  end
+
+  local function build_tcp(conn, flags, seq, ack, data)
+    local data_offset_flags = 5 * 256 + flags
+    local header = string.char(
+      math.floor(conn.local_port / 256), conn.local_port % 256,
+      math.floor(conn.remote_port / 256), conn.remote_port % 256,
+      math.floor(seq / 16777216) % 256, math.floor(seq / 65536) % 256,
+      math.floor(seq / 256) % 256, seq % 256,
+      math.floor(ack / 16777216) % 256, math.floor(ack / 65536) % 256,
+      math.floor(ack / 256) % 256, ack % 256,
+      math.floor(data_offset_flags / 256), data_offset_flags % 256,
+      0, 0,  -- window
+      0, 0,  -- checksum
+      0, 0)  -- urgent
+    local seg = header .. (data or "")
+    local cs = tcp_checksum(conn.remote_ip, conn.local_ip, seg)
+    seg = seg:sub(1, 16) .. string.char(math.floor(cs / 256), cs % 256) .. seg:sub(19)
+    return seg
+  end
+
+  -- Send a TCP segment via the IP layer.
+  local function send_segment(conn, flags, seq, ack, data)
+    local seg = build_tcp(conn, flags, seq, ack, data)
+    K.net.send_ip(conn.remote_ip, K.net.IPPROTO_TCP, seg)
+  end
+
+  -- Schedule a retransmit timer for a connection.
+  local function schedule_retransmit(conn)
+    if conn.timer_id then
+      K.net.timers[conn.timer_id] = nil
+      conn.timer_id = nil
+    end
+    conn.timer_id = os.startTimer(conn.rto)
+    conn.timer_kind = "retransmit"
+    K.net.timers[conn.timer_id] = function()
+      conn.timer_id = nil
+      conn.timer_kind = nil
+      M._tcp_retransmit(conn)
+    end
+  end
+
+  function M._tcp_retransmit(conn)
+    if conn.state == "CLOSED" or conn.closed then return end
+    conn.retries = conn.retries + 1
+    if conn.retries > RTO_MAX_RETRIES then
+      -- give up: reset the connection
+      conn.state = "CLOSED"
+      conn.closed = true
+      M._wake_conn(conn)
+      return
+    end
+    -- resend unacked data (or SYN/FIN)
+    if conn.state == "SYN_SENT" then
+      send_segment(conn, FLAG_SYN, conn.iss, 0, nil)
+    elseif conn.state == "SYN_RECEIVED" then
+      send_segment(conn, FLAG_SYN + FLAG_ACK, conn.iss, conn.rcv_nxt, nil)
+    elseif #conn.send_queue > 0 then
+      local data = table.concat(conn.send_queue)
+      send_segment(conn, FLAG_ACK, conn.snd_una, conn.rcv_nxt, data)
+    elseif conn.state == "FIN_WAIT_1" then
+      send_segment(conn, FLAG_FIN + FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+    end
+    conn.rto = conn.rto * 2
+    schedule_retransmit(conn)
+  end
+
+  -- Wake all waiters on a connection.
+  function M._wake_conn(conn)
+    for w in pairs(conn.recv_waiters) do
+      conn.recv_waiters[w] = nil
+      K.sched.wake("tcp_recv", conn, true)
+    end
+    for w in pairs(conn.send_waiters) do
+      conn.send_waiters[w] = nil
+      K.sched.wake("tcp_send", conn, true)
+    end
+  end
+
+  -- ---- TCP public API ----
+
+  -- Open a TCP connection to remote_ip:remote_port. Blocks until established.
+  function M.tcp_connect(proc, remote_ip, remote_port, local_port)
+    local conn = new_conn()
+    if local_port and local_port > 0 then
+      conn.local_port = local_port
+    else
+      local p, err = M.alloc_port()
+      if not p then return nil, err end
+      conn.local_port = p
+    end
+    conn.remote_ip = remote_ip
+    conn.remote_port = remote_port
+    conn.local_ip = K.net.ip
+    conn.iss = math.floor(os.clock() * 1000) % 65536
+    conn.snd_nxt = conn.iss + 1
+    conn.state = "SYN_SENT"
+    tcp_conns[conn] = true
+    send_segment(conn, FLAG_SYN, conn.iss, 0, nil)
+    schedule_retransmit(conn)
+    -- block until established or failed
+    conn.connect_waiters = conn.connect_waiters or {}
+    conn.connect_waiters[proc] = true
+    return K.sched.wait(proc, "tcp_connect", conn, function()
+      conn.connect_waiters[proc] = nil
+      if conn.state == "ESTABLISHED" then
+        return { true }
+      end
+      return { nil, "connection failed" }
+    end)
+  end
+
+  -- Listen on a port.
+  function M.tcp_listen(port)
+    if tcp_ports[port] then return nil, "address in use" end
+    tcp_ports[port] = { state = "listen", backlog = {}, waiters = {} }
+    return true
+  end
+
+  -- Accept a connection from a listening port. Blocks until one arrives.
+  function M.tcp_accept(proc, port, on_conn)
+    local lp = tcp_ports[port]
+    if not lp or lp.state ~= "listen" then return nil, "not listening" end
+    if #lp.backlog > 0 then
+      local conn = table.remove(lp.backlog, 1)
+      return on_conn(conn)
+    end
+    lp.waiters[proc] = true
+    return K.sched.wait(proc, "tcp_accept", port, function()
+      lp.waiters[proc] = nil
+      if #lp.backlog > 0 then
+        local conn = table.remove(lp.backlog, 1)
+        return { on_conn(conn) }
+      end
+      return nil
+    end)
+  end
+
+  -- Send data on an established connection. Blocks until ACKed.
+  function M.tcp_send(proc, conn, data)
+    if conn.state ~= "ESTABLISHED" then return nil, "not connected" end
+    conn.send_queue[#conn.send_queue + 1] = data
+    send_segment(conn, FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, data)
+    conn.snd_nxt = conn.snd_nxt + #data
+    schedule_retransmit(conn)
+    -- block until the data is ACKed
+    conn.send_waiters[proc] = true
+    return K.sched.wait(proc, "tcp_send", conn, function()
+      conn.send_waiters[proc] = nil
+      if conn.closed then return { nil, "closed" } end
+      return { #data }
+    end)
+  end
+
+  -- Receive data on an established connection. Blocks until data or close.
+  function M.tcp_recv(proc, conn)
+    if #conn.recv_queue > 0 then
+      return table.remove(conn.recv_queue, 1)
+    end
+    if conn.state == "CLOSE_WAIT" or conn.state == "CLOSED" then
+      return nil  -- EOF
+    end
+    conn.recv_waiters[proc] = true
+    return K.sched.wait(proc, "tcp_recv", conn, function()
+      conn.recv_waiters[proc] = nil
+      if #conn.recv_queue > 0 then return table.remove(conn.recv_queue, 1) end
+      return nil
+    end)
+  end
+
+  -- Close a connection (FIN handshake).
+  function M.tcp_close(conn)
+    if conn.state == "ESTABLISHED" then
+      conn.state = "FIN_WAIT_1"
+      send_segment(conn, FLAG_FIN + FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+      conn.snd_nxt = conn.snd_nxt + 1
+      schedule_retransmit(conn)
+    elseif conn.state == "CLOSE_WAIT" then
+      conn.state = "LAST_ACK"
+      send_segment(conn, FLAG_FIN + FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+      conn.snd_nxt = conn.snd_nxt + 1
+      schedule_retransmit(conn)
+    else
+      conn.state = "CLOSED"
+      conn.closed = true
+    end
+    return true
+  end
+
+  -- ---- TCP receive path ----
+
+  function M.tcp_handle(payload, src_ip)
+    if #payload < TCP_HEADER then return end
+    local src_port = payload:byte(1) * 256 + payload:byte(2)
+    local dest_port = payload:byte(3) * 256 + payload:byte(4)
+    local seq = payload:byte(5) * 16777216 + payload:byte(6) * 65536
+      + payload:byte(7) * 256 + payload:byte(8)
+    local ack = payload:byte(9) * 16777216 + payload:byte(10) * 65536
+      + payload:byte(11) * 256 + payload:byte(12)
+    local data_offset = math.floor(payload:byte(13) / 16)
+    local flags = payload:byte(14)
+    local data = payload:sub(data_offset * 4 + 1)
+
+    -- find or create the connection
+    local conn = M._find_conn(dest_port, src_ip, src_port)
+    if not conn then
+      -- no matching connection: if listening, create a passive open
+      local lp = tcp_ports[dest_port]
+      if lp and lp.state == "listen" and flags % 2 == 0 and (flags % 4) / 2 >= 1 then
+        -- SYN received
+        conn = new_conn()
+        conn.local_port = dest_port
+        conn.remote_ip = src_ip
+        conn.remote_port = src_port
+        conn.local_ip = K.net.ip
+        conn.irs = seq
+        conn.rcv_nxt = seq + 1
+        conn.iss = math.floor(os.clock() * 1000) % 65536
+        conn.snd_nxt = conn.iss + 1
+        conn.state = "SYN_RECEIVED"
+        tcp_conns[conn] = true
+        send_segment(conn, FLAG_SYN + FLAG_ACK, conn.iss, conn.rcv_nxt, nil)
+        schedule_retransmit(conn)
+      else
+        -- unknown: send RST
+        local rst = new_conn()
+        rst.local_port = dest_port
+        rst.remote_ip = src_ip
+        rst.remote_port = src_port
+        rst.local_ip = K.net.ip
+        send_segment(rst, FLAG_RST + FLAG_ACK, 0, seq + #data, nil)
+        return
+      end
+    end
+
+    -- process flags
+    local syn = (flags % 4) / 2 >= 1
+    local fin = flags % 2 == 1
+    local rst = (flags % 8) / 4 >= 1
+    local ackf = (flags % 32) / 16 >= 1
+
+    if rst then
+      conn.state = "CLOSED"
+      conn.closed = true
+      M._wake_conn(conn)
+      return
+    end
+
+    if syn then
+      if conn.state == "SYN_SENT" then
+        -- SYN-ACK received: connection established
+        conn.irs = seq
+        conn.rcv_nxt = seq + 1
+        conn.snd_una = ack
+        conn.state = "ESTABLISHED"
+        if conn.timer_id then K.net.timers[conn.timer_id] = nil; conn.timer_id = nil end
+        send_segment(conn, FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+        -- wake connect waiter
+        for w in pairs(conn.connect_waiters or {}) do
+          conn.connect_waiters[w] = nil
+          K.sched.wake("tcp_connect", conn, true)
+        end
+      end
+    end
+
+    -- ACK of our SYN-ACK: passive open complete (SYN_RECEIVED -> ESTABLISHED)
+    if ackf and conn.state == "SYN_RECEIVED" then
+      conn.snd_una = ack
+      conn.state = "ESTABLISHED"
+      if conn.timer_id then K.net.timers[conn.timer_id] = nil; conn.timer_id = nil end
+      -- move to listening backlog
+      local lp = tcp_ports[conn.local_port]
+      if lp then
+        lp.backlog[#lp.backlog + 1] = conn
+        for w in pairs(lp.waiters) do
+          lp.waiters[w] = nil
+          K.sched.wake("tcp_accept", conn.local_port, true)
+          break
+        end
+      end
+    end
+
+    -- ACK processing: clear unacked data
+    if ackf and conn.state == "ESTABLISHED" then
+      conn.snd_una = ack
+      -- clear acked data from send_queue
+      local acked = ack - (conn.snd_nxt - #table.concat(conn.send_queue))
+      while acked > 0 and #conn.send_queue > 0 do
+        local d = conn.send_queue[1]
+        if #d <= acked then
+          table.remove(conn.send_queue, 1)
+          acked = acked - #d
+        else
+          break
+        end
+      end
+      if #conn.send_queue == 0 and conn.timer_id and conn.timer_kind == "retransmit" then
+        K.net.timers[conn.timer_id] = nil
+        conn.timer_id = nil
+        conn.timer_kind = nil
+        conn.rto = RTO_INIT
+        conn.retries = 0
+        -- wake send waiters
+        for w in pairs(conn.send_waiters) do
+          conn.send_waiters[w] = nil
+          K.sched.wake("tcp_send", conn, true)
+        end
+      end
+    end
+
+    -- data delivery
+    if #data > 0 and conn.state == "ESTABLISHED" then
+      conn.recv_queue[#conn.recv_queue + 1] = data
+      conn.rcv_nxt = conn.rcv_nxt + #data
+      send_segment(conn, FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+      for w in pairs(conn.recv_waiters) do
+        conn.recv_waiters[w] = nil
+        K.sched.wake("tcp_recv", conn, true)
+      end
+    end
+
+    -- FIN processing
+    if fin then
+      if conn.state == "ESTABLISHED" then
+        conn.state = "CLOSE_WAIT"
+        conn.rcv_nxt = conn.rcv_nxt + 1
+        send_segment(conn, FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+        -- wake recv waiters (EOF)
+        for w in pairs(conn.recv_waiters) do
+          conn.recv_waiters[w] = nil
+          K.sched.wake("tcp_recv", conn, true)
+        end
+      elseif conn.state == "FIN_WAIT_1" then
+        conn.state = "FIN_WAIT_2"
+        conn.rcv_nxt = conn.rcv_nxt + 1
+        send_segment(conn, FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+      elseif conn.state == "FIN_WAIT_2" then
+        conn.state = "TIME_WAIT"
+        conn.rcv_nxt = conn.rcv_nxt + 1
+        send_segment(conn, FLAG_ACK, conn.snd_nxt, conn.rcv_nxt, nil)
+        -- schedule TIME_WAIT expiry
+        conn.timer_id = os.startTimer(TIME_WAIT_SECS)
+        conn.timer_kind = "timewait"
+        K.net.timers[conn.timer_id] = function()
+          conn.state = "CLOSED"
+          conn.closed = true
+          conn.timer_id = nil
+          conn.timer_kind = nil
+        end
+      elseif conn.state == "LAST_ACK" then
+        conn.state = "CLOSED"
+        conn.closed = true
+        if conn.timer_id then K.net.timers[conn.timer_id] = nil; conn.timer_id = nil end
+      end
+    end
+  end
+
+  -- Find an existing connection matching (local_port, remote_ip, remote_port).
+  function M._find_conn(local_port, remote_ip, remote_port)
+    for conn in pairs(tcp_conns) do
+      if conn.local_port == local_port and conn.remote_ip == remote_ip
+        and conn.remote_port == remote_port and not conn.closed then
+        return conn
+      end
+    end
+    return nil
+  end
+
+  -- ---- init ----
+
+  function M.init()
+    net = K.net
+    net.register_proto(net.IPPROTO_TCP, M.tcp_handle)
+    net.register_proto(net.IPPROTO_UDP, M.udp_handle)
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/proc.lua 0755 12833 72754972 src---
+--[[
+  KNUCK process management
+  ========================
+  A process is a coroutine running in a sandboxed _ENV. The sandbox exposes
+  only safe stdlibs + named syscall wrappers (no os/fs/term/...).
+
+  States: ready | running | waiting | stopped | zombie | dead
+  Zombies hold the exit code until the parent waitpid()s; orphans are
+  adopted by init (pid 1).
+]]
+
+return function(K)
+  local M = {}
+
+  local processes = {}          -- pid -> process
+  local next_pid = 1
+  local init_pid = nil
+  local alarm_timers = {}       -- CC timer id -> proc (alarm() SIGALRM delivery)
+
+  -- Safe stdlibs exposed to processes
+  local SAFE_LIBS = { "string", "math", "table", "coroutine", "bit" }
+
+  function M.init(K)
+    -- nothing yet
+  end
+
+  -- Build a sandbox env for a process: safe libs + syscall wrappers.
+  -- system=true grants full env (load, io, os, etc.) for privileged processes.
+  local function make_env(system)
+    local env = {}
+    for _, lib in ipairs(SAFE_LIBS) do
+      env[lib] = _G[lib]
+    end
+    -- basic functions
+    for _, f in ipairs({ "type", "tostring", "tonumber", "pairs", "ipairs", "select",
+      "error", "pcall", "xpcall", "next", "rawget", "rawset",
+      "setmetatable", "getmetatable" }) do
+      env[f] = _G[f]
+    end
+    -- unpack: Lua 5.2+ has no global unpack (it is table.unpack)
+    env.unpack = table.unpack
+    -- syscall wrappers: each yields {"syscall", name, args}
+    for _, name in ipairs(K.syscall.names()) do
+      env[name] = function(...)
+        local args = { ... }
+        local res = coroutine.yield({ "syscall", name, args })
+        -- Signal delivery: the kernel may inject {"__signal", sig, handler}
+        -- instead of the syscall result. Run the handler, then ack.
+        while type(res) == "table" and res[1] == "__signal" do
+          local sig_num, handler = res[2], res[3]
+          if handler == "default" then
+            error("killed by signal " .. sig_num)
+          elseif handler == "ignore" then
+            -- no-op
+          elseif type(handler) == "function" then
+            handler(sig_num)
+          end
+          res = coroutine.yield({ "__ack_signal" })
+        end
+        -- Packed syscall results carry an explicit count (.n) and use a
+        -- sentinel for nil so nil,err results survive the table round-trip.
+        if type(res) == "table" and res.n then
+          local out = {}
+          for i = 1, res.n do
+            if res[i] == K.syscall.NIL then
+              out[i] = nil
+            else
+              out[i] = res[i]
+            end
+          end
+          return table.unpack(out, 1, res.n)
+        end
+        return res
+      end
+    end
+    -- signal number constants (POSIX) for userspace
+    env.signals = {
+      HUP = 1, INT = 2, QUIT = 3, KILL = 9, USR1 = 10, USR2 = 12,
+      PIPE = 13, ALRM = 14, TERM = 15, CHLD = 17, CONT = 18, STOP = 19,
+    }
+    -- network address family / protocol constants for userspace
+    env.AF_UNIX   = 1
+    env.AF_MODEM4 = 2     -- IPv4 over modem link
+    env.AF_INET   = 2     -- alias for AF_MODEM4
+    env.AF_ICMP   = 2     -- DEPRECATED: alias for AF_MODEM4
+    env.AF_HTTP   = 3
+    env.AF_MODEM6 = 10    -- IPv6 over modem link (reserved)
+    env.AF_INET6  = 10    -- alias for AF_MODEM6
+    env.SOCK_STREAM = 1
+    env.SOCK_DGRAM  = 2
+    env.SOCK_RAW    = 3
+    env.IPPROTO_IP   = 0
+    env.IPPROTO_ICMP = 1
+    env.IPPROTO_TCP  = 6
+    env.IPPROTO_UDP  = 17
+    if system then
+      -- Full env for system processes (pine.lua, hook scripts): grant
+      -- load/loadfile/dofile/io/os/require so they can load and run
+      -- Lua chunks that need raw filesystem or OS access.
+      env.load = load
+      if _G.loadstring then env.loadstring = _G.loadstring end
+      env.loadfile = loadfile
+      env.dofile = dofile
+      env.io = _G.io
+      env.os = _G.os
+      env.require = _G.require
+      -- print uses io.write for system processes (full io available)
+      env.print = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+        env.io.write(table.concat(parts, "\t") .. "\n")
+      end
+    else
+      -- print: write to fd 1 (no io library in the sandbox)
+      env.print = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+        env.write(1, table.concat(parts, "\t") .. "\n")
+      end
+    end
+    return env
+  end
+
+  -- Expose the env builder so exec() (syscall.lua) can build a fresh sandbox
+  M.make_env = make_env
+
+  -- Load process code from a VFS path with a sandbox env
+  local function load_process(path, env)
+    local f, err = K.vfs.loadfile(path, env)
+    if not f then return nil, err end
+    return f
+  end
+
+  -- Spawn a process from a VFS path. system=true grants privileged env.
+  function M.spawn(path, ppid, uid, gid, args, tty, fds, parent, system)
+    local env = make_env(system)
+    local fn, err = load_process(path, env)
+    if not fn then return nil, err end
+
+    local pid = next_pid
+    next_pid = next_pid + 1
+
+    local proc = {
+      pid = pid,
+      ppid = ppid or 0,
+      name = path,
+      uid = uid or 0,
+      euid = uid or 0,
+      gid = gid or 0,
+      egid = gid or 0,
+      pgid = pid,
+      priority = 0,
+      sched_policy = "other",  -- "rr" | "fifo" | "other"
+      cwd = "/",
+      root = "/",
+      umask = 0x12,  -- 0022 octal
+      state = "ready",
+      tty = (tty == nil and 1 or tty),
+      console_mode = "cooked",  -- /dev/console input: "cooked" (lines) | "raw" (events)
+      env = env,
+      environ = {},  -- environment variables (name -> value), inherited on spawn
+      fds = { [0] = { type = "console", mode = "r" }, [1] = { type = "console", mode = "w" }, [2] = { type = "console", mode = "w" } },
+      children = {},
+      exitcode = nil,
+      pending_result = nil,
+      system = system or false,  -- system process: full env (load/io/os)
+      sig = {
+        handlers = {},    -- sig_num -> fn | "ignore" | "default"
+        pending = {},     -- set of sig_nums awaiting delivery
+        blocked = {},     -- set of sig_nums blocked from delivery
+        _pending_result = nil,  -- saved syscall result during signal delivery
+      },
+    }
+
+    -- Wire child stdin/stdout/stderr to the parent's open fds (for shell
+    -- redirection and pipelines). Shares the underlying open file
+    -- description, so the child and parent see the same offset/socket.
+    if fds and parent and parent.fds then
+      -- Explicit fds table: map child slots to parent fd numbers
+      for slot, src in pairs(fds) do
+        if parent.fds[src] then
+          proc.fds[slot] = parent.fds[src]
+        end
+      end
+    elseif parent and parent.fds then
+      -- No explicit fds: inherit parent's fds (POSIX fork semantics).
+      -- This ensures children of getty/login services inherit the tty
+      -- device fds that the parent dup2'd, so writes go to the correct tty.
+      for slot, fd in pairs(parent.fds) do
+        proc.fds[slot] = fd
+      end
+    end
+
+    -- Inherit environment variables from the parent.
+    if parent and parent.environ then
+      for k, v in pairs(parent.environ) do
+        proc.environ[k] = v
+      end
+    end
+
+    -- Create the coroutine; pass args
+    proc.co = coroutine.create(function()
+      return fn(table.unpack(args or {}))
+    end)
+
+    processes[pid] = proc
+    if ppid and processes[ppid] then
+      processes[ppid].children[pid] = proc
+    end
+
+    K.sched.enqueue(proc)
+    return pid
+  end
+
+  -- Look up a process by pid
+  function M.lookup(pid)
+    return processes[pid]
+  end
+
+  -- Find a child of parent (pid=-1 = any child)
+  function M.find_child(ppid, pid)
+    local parent = processes[ppid]
+    if not parent then return nil end
+    if pid == -1 then
+      for _, child in pairs(parent.children) do
+        if child.state == "zombie" then return child end
+      end
+      return nil
+    end
+    return parent.children[pid]
+  end
+
+  -- Reap a zombie: return (pid, "exited", code) or (pid, "killed", sig)
+  function M.reap(child)
+    local pid = child.pid
+    local status = child.exitstatus or { "exited", child.exitcode or 0 }
+    processes[pid] = nil
+    if child.ppid and processes[child.ppid] then
+      processes[child.ppid].children[pid] = nil
+    end
+    return pid, status[1], status[2]
+  end
+
+  -- Exit a process (self-terminate)
+  function M.exit(proc, code)
+    proc.state = "zombie"
+    proc.exitcode = code or 0
+    proc.exitstatus = { "exited", code or 0 }
+    M.notify_parent(proc)
+  end
+
+  -- Send a signal to a process. KILL(9)/STOP(19) are immediate and
+  -- unblockable; other signals are queued for delivery at the next resume
+  -- boundary (unless blocked or ignored).
+  function M.send_signal(target, sig_num)
+    if sig_num == 9 then  -- SIGKILL: immediate death
+      target.state = "zombie"
+      target.exitcode = 128 + 9
+      target.exitstatus = { "killed", 9 }
+      M.notify_parent(target)
+      return true
+    elseif sig_num == 19 then  -- SIGSTOP: immediate stop
+      target.state = "stopped"
+      return true
+    elseif sig_num == 18 then  -- SIGCONT: resume a stopped process
+      if target.state == "stopped" then
+        K.sched.enqueue(target)
+      end
+      return true
+    end
+    -- Blocked signals are dropped (POSIX: pending while blocked; this kernel
+    -- keeps it simple: blocked = lost).
+    if target.sig.blocked[sig_num] then return true end
+    local handler = target.sig.handlers[sig_num]
+    if handler == "ignore" then return true end
+    target.sig.pending[sig_num] = true
+    return true
+  end
+
+  -- Pick the next deliverable signal for a process about to be resumed.
+  -- Returns sig_num or nil. Called from sched.resume, which fires both after
+  -- a syscall (state "running") and when waking from a wait (state "waiting";
+  -- M.wake already removed the proc from the waiting table, so enqueueing is
+  -- safe). STOP/CONT are handled directly in send_signal.
+  function M.check_signal(proc)
+    if proc.state ~= "ready" and proc.state ~= "running" and proc.state ~= "waiting" then return nil end
+    for sig_num in pairs(proc.sig.pending) do
+      if not proc.sig.blocked[sig_num] then
+        return sig_num
+      end
+    end
+    return nil
+  end
+
+  -- Kill a process by signal. pid: positive = specific, 0 = own group,
+  -- -1 = all except self (root only). sig 0 = existence check.
+  function M.kill(proc, pid, sig)
+    sig = sig or 15  -- default SIGTERM
+    if pid == 0 then
+      for _, p in pairs(processes) do
+        if p.pgid == proc.pgid and p.pid ~= proc.pid then
+          M.send_signal(p, sig)
+        end
+      end
+      return true
+    end
+    if pid == -1 then
+      if proc.uid ~= 0 then return nil, "permission denied" end
+      for _, p in pairs(processes) do
+        if p.pid ~= proc.pid then
+          M.send_signal(p, sig)
+        end
+      end
+      return true
+    end
+    local target = processes[pid]
+    if not target then return nil, "no such process" end
+    -- permission: same uid or root
+    if proc.uid ~= 0 and proc.uid ~= target.uid then
+      return nil, "permission denied"
+    end
+    if sig == 0 then
+      return true -- signal 0 = existence check
+    end
+    return M.send_signal(target, sig)
+  end
+
+  -- Die from an error/signal (uncaught error -> SIGSEGV)
+  function M.die(proc, sig, detail)
+    proc.state = "zombie"
+    proc.exitcode = 128 + 11 -- SIGSEGV
+    proc.exitstatus = { "killed", sig }
+    if detail then
+      K.log("process " .. proc.pid .. " (" .. proc.name .. ") died: " .. tostring(detail))
+    end
+    M.notify_parent(proc)
+  end
+
+  -- Notify parent (SIGCHLD) and wake a waiting waitpid
+  function M.notify_parent(proc)
+    local reap = { proc.pid, proc.exitstatus[1], proc.exitstatus[2] }
+    local parent = processes[proc.ppid]
+    if parent then
+      K.sched.wake("child", proc.ppid, reap)
+      -- SIGCHLD (17): deliver to parent if it installed a handler
+      if parent.sig and parent.sig.handlers[17] and
+         parent.sig.handlers[17] ~= "ignore" and
+         not parent.sig.blocked[17] then
+        parent.sig.pending[17] = true
+      end
+    else
+      -- orphan: adopt by init
+      if init_pid and processes[init_pid] then
+        processes[init_pid].children[proc.pid] = proc
+        proc.ppid = init_pid
+        K.sched.wake("child", init_pid, reap)
+      end
+    end
+  end
+
+  -- Set init process (pid 1)
+  function M.set_init(pid)
+    init_pid = pid
+  end
+
+  -- Alarm timer map (timer id -> proc); read by sched.lua event dispatch
+  M.alarm_timers = alarm_timers
+
+  -- Snapshot for /proc
+  function M.snapshot()
+    local out = {}
+    for pid, p in pairs(processes) do
+      out[pid] = {
+        name = p.name,
+        state = p.state,
+        ppid = p.ppid,
+        uid = p.uid,
+        priority = p.priority,
+        fds = p.fds,
+      }
+    end
+    return out
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/sched.lua 0755 8435 567036dc src---
+--[[
+  KNUCK scheduler
+  ===============
+  Preemptive round-robin with priorities. Each process is a coroutine.
+  The kernel owns os.pullEvent (the only code that touches the OS event loop).
+
+  Preemption: debug.sethook count-hook fires every QUANTUM instructions and
+  yields {"preempt"}; the kernel requeues the process. If yield-from-hook is
+  unavailable (selfcheck.preempt == false), falls back to cooperative.
+
+  Processes yield to the kernel with:
+    {"syscall", name, args}   -- a syscall request
+    {"preempt"}               -- quantum expired (from count hook)
+    nil                       -- process returned (exit 0)
+  An error unwinding the coroutine = process death (SIGSEGV).
+]]
+
+return function(K)
+  local M = {}
+
+  local QUANTUM = 1000          -- instructions per quantum
+  M.QUANTUM = QUANTUM           -- exposed for /sys/kernel/quantum
+  local ready = {}              -- ready queue (list of processes)
+  local waiting = {}            -- waiting processes: waiting[reason][key] = proc
+  local current = nil           -- currently running process
+  local running = false
+
+  local proc_mod = nil          -- set in init()
+
+  function M.init(K)
+    proc_mod = K.proc
+  end
+
+  -- Currently running process (used by device drivers to resolve the caller)
+  function M.current()
+    return current
+  end
+
+  -- Enqueue a ready process
+  function M.enqueue(proc)
+    proc.state = "ready"
+    ready[#ready + 1] = proc
+  end
+
+  -- Dequeue highest-priority ready process (lower priority number = higher)
+  function M.dequeue()
+    if #ready == 0 then return nil end
+    local best, best_idx = ready[1], 1
+    for i = 2, #ready do
+      if ready[i].priority < best.priority then
+        best, best_idx = ready[i], i
+      end
+    end
+    table.remove(ready, best_idx)
+    return best
+  end
+
+  -- Mark a process as waiting on reason/key. resume_fn (optional) computes
+  -- the value to resume the process with on wake; if absent, the wake
+  -- result is used.
+  function M.wait(proc, reason, key, resume_fn)
+    proc.state = "waiting"
+    proc.wait_reason = reason
+    proc.wait_key = key
+    proc.resume_fn = resume_fn
+    waiting[reason] = waiting[reason] or {}
+    waiting[reason][key] = proc
+  end
+
+  -- Check if a process is waiting on a given reason/key pair.
+  function M.is_waiting(reason, key)
+    return waiting[reason] ~= nil and waiting[reason][key] ~= nil
+  end
+
+  -- Wake a waiting process (resume it with a result)
+  function M.wake(reason, key, result)
+    local w = waiting[reason]
+    if not w then return end
+    local proc = w[key]
+    if not proc then return end
+    w[key] = nil
+    proc.wait_reason = nil
+    proc.wait_key = nil
+    local r = result
+    if proc.resume_fn then
+      r = proc.resume_fn()
+      proc.resume_fn = nil
+    end
+    M.resume(proc, r)
+  end
+
+  -- Resume a process with a result (or nil). Re-enqueues it.
+  -- Pending signals are delivered first: the result is saved and the
+  -- process resumes with {"__signal", sig, handler} instead.
+  function M.resume(proc, result)
+    local sig_num = proc_mod.check_signal(proc)
+    if sig_num then
+      proc.sig._pending_result = result
+      local handler = proc.sig.handlers[sig_num] or "default"
+      proc.sig.pending[sig_num] = nil
+      proc.pending_result = { "__signal", sig_num, handler }
+    else
+      proc.pending_result = result
+    end
+    M.enqueue(proc)
+  end
+
+  -- Run one process to its next yield/exit/error
+  local function run(proc)
+    current = proc
+    proc.state = "running"
+
+    -- Set count hook for preemption
+    if K.selfcheck.preempt then
+      debug.sethook(proc.co, function()
+        coroutine.yield({ "preempt" })
+      end, "", M.QUANTUM)
+    end
+
+    local ok, req = coroutine.resume(proc.co, proc.pending_result)
+    proc.pending_result = nil
+
+    -- Remove hook
+    if K.selfcheck.preempt then
+      debug.sethook(proc.co)
+    end
+
+    if not ok then
+      -- Process died with an error -> SIGSEGV
+      current = nil
+      proc_mod.die(proc, "SIGSEGV", req)
+      return
+    end
+
+    if req == nil then
+      -- Process returned -> exit(0)
+      proc_mod.exit(proc, 0)
+    elseif type(req) == "table" then
+      if req[1] == "syscall" then
+        -- Keep `current` set so syscall handlers (e.g. tty/term drivers)
+        -- can resolve the calling process via K.sched.current.
+        K.syscall.handle(proc, req[2], req[3])
+      elseif req[1] == "preempt" then
+        -- Quantum expired: requeue
+        M.enqueue(proc)
+      elseif req[1] == "__ack_signal" then
+        -- Signal handler finished: restore the saved syscall result and
+        -- chain any further pending signals.
+        local saved = proc.sig._pending_result
+        proc.sig._pending_result = nil
+        local next_sig = proc_mod.check_signal(proc)
+        if next_sig then
+          proc.sig._pending_result = saved
+          proc.sig.pending[next_sig] = nil
+          local handler = proc.sig.handlers[next_sig] or "default"
+          proc.pending_result = { "__signal", next_sig, handler }
+        else
+          proc.pending_result = saved
+        end
+        M.enqueue(proc)
+      end
+    end
+
+    current = nil
+  end
+
+  -- Main scheduler loop. Never returns.
+  function M.start()
+    running = true
+    local runs_since_idle = 0
+    while true do
+      local proc = M.dequeue()
+      if proc then
+        run(proc)
+        runs_since_idle = runs_since_idle + 1
+        -- Starvation guard: force an idle tick every 256 consecutive runs
+        -- so pending OS events (timers, network, input) are always dispatched
+        -- within a bounded time even when processes never block.
+        if runs_since_idle >= 256 then
+          runs_since_idle = 0
+          K.env.os.startTimer(0)
+          local ev = { K.env.os.pullEvent() }
+          K.events.dispatch(ev)
+        end
+      else
+        runs_since_idle = 0
+        -- Idle: wait for an OS event, dispatch to waiting processes
+        local ev = { K.env.os.pullEvent() }
+        K.events.dispatch(ev)
+      end
+    end
+  end
+
+  -- Event dispatch: wake processes waiting on the event
+  K.events = {
+    dispatch = function(ev)
+      local name = ev[1]
+      if name == "timer" then
+        -- alarm() timers deliver SIGALRM to the owning process
+        local alarm_proc = proc_mod.alarm_timers and proc_mod.alarm_timers[ev[2]]
+        if alarm_proc then
+          proc_mod.alarm_timers[ev[2]] = nil
+          alarm_proc.sig._alarm_timer = nil
+          proc_mod.send_signal(alarm_proc, 14)  -- SIGALRM
+          return
+        end
+        -- network timers (ARP expiry, etc.) are handled first
+        if K.net and K.net.timer_fired and K.net.timer_fired(ev[2]) then return end
+        -- socket recv timeouts (SO_RCVTIMEO)
+        if K.ipc and K.ipc.recv_timeout_fired and K.ipc.recv_timeout_fired(ev[2]) then return end
+        M.wake("timer", ev[2], true)
+      elseif name == "modem_message" then
+        if K.net and K.net.on_modem_message then
+          K.net.on_modem_message(ev[2], ev[3], ev[4], ev[5], ev[6])
+        end
+      elseif name == "char" or name == "key" then
+        -- console input: route to the active virtual terminal.
+        -- NOTE: do NOT route key_up/mouse_click here -- those are release/
+        -- pointer events and would corrupt the line buffer if a reader
+        -- consumed them as input.
+        if K.tty then
+          K.tty.handle_input(ev)
+        else
+          M.wake("input", "console", ev)
+        end
+        -- also feed /dev/input raw-event readers
+        M.wake("input", "input", ev)
+      elseif name == "mouse_click" or name == "mouse_scroll" then
+        -- pointer events: feed /dev/input raw-event readers only
+        M.wake("input", "input", ev)
+      elseif name == "peripheral" then
+        -- device hotplug: mount/unmount disk drives, wake devctl readers
+        local side = ev[2]
+        local kind = ev[3] == "detach" and "detach" or "attach"
+        if K.vfs and K.vfs.drive_side then
+          if kind == "attach" then
+            K.vfs.drive_side(side)
+          else
+            K.vfs.drive_side(side, true)
+          end
+        end
+        M.wake("devctl", "devctl", kind .. " " .. tostring(side))
+      elseif name == "http_success" then
+        if K.ipc and K.ipc.http_event then K.ipc.http_event("success", ev[2]) end
+      elseif name == "http_failure" then
+        if K.ipc and K.ipc.http_event then K.ipc.http_event("failure", ev[2], ev[3]) end
+      end
+    end,
+  }
+
+  return M
+end---FILE /lib/knuck/kernel/syscall.lua 0755 28395 0fd28711 src---
+--[[
+  KNUCK syscall dispatcher
+  ========================
+  Processes yield {"syscall", name, args}; the scheduler calls handle().
+  Handlers either return a result (process resumes) or block the process
+  (proc.wait -> resumed later by an event).
+
+  The syscall registry also drives the process sandbox env (proc.lua builds
+  named wrappers from it).
+]]
+
+return function(K)
+  local M = {}
+
+  local syscalls = {}
+  local proc_mod = nil
+
+  -- Sentinel for nil in packed syscall results. Lua tables can't hold a nil
+  -- in the middle of an array without breaking #t / table.unpack, so nil
+  -- results are stored as this sentinel and converted back in the wrapper.
+  local NIL = {}
+  local function pack(...)
+    local t = { n = select("#", ...) }
+    for i = 1, t.n do
+      local v = select(i, ...)
+      t[i] = (v == nil) and NIL or v
+    end
+    return t
+  end
+  -- Expose the nil sentinel so the process wrapper (proc.lua) can convert it
+  -- back to nil when unpacking syscall results.
+  M.NIL = NIL
+
+  function M.init(K)
+    proc_mod = K.proc
+  end
+
+  -- Register a syscall handler
+  function M.register(name, handler)
+    syscalls[name] = handler
+  end
+
+  -- List of registered syscall names (for building process env)
+  function M.names()
+    local out = {}
+    for name in pairs(syscalls) do out[#out + 1] = name end
+    return out
+  end
+
+  -- Handle a syscall request from a process
+  function M.handle(proc, name, args)
+    local handler = syscalls[name]
+    if not handler then
+      proc_mod.die(proc, "SIGSYS", "unknown syscall: " .. tostring(name))
+      return
+    end
+    -- Pack all handler return values (preserving nil, err) into a table.
+    -- pcall wraps so an error kills the process (SIGSYS).
+    local ok, packed = pcall(function()
+      return pack(handler(proc, table.unpack(args or {})))
+    end)
+    if not ok then
+      proc_mod.die(proc, "SIGSYS", name .. ": " .. tostring(packed))
+      return
+    end
+    -- If the handler blocked the process, it is now "waiting"; do not resume.
+    -- Otherwise resume with the packed results.
+    if proc.state == "running" then
+      K.sched.resume(proc, packed)
+    end
+  end
+
+  -- ============================================================
+  -- Syscall handlers
+  -- ============================================================
+
+  -- proc identity
+  M.register("getpid", function(proc) return proc.pid end)
+  M.register("getppid", function(proc) return proc.ppid end)
+  M.register("getuid", function(proc) return proc.uid end)
+  M.register("geteuid", function(proc) return proc.euid end)
+  M.register("getgid", function(proc) return proc.gid end)
+  M.register("getegid", function(proc) return proc.egid end)
+  M.register("getpgrp", function(proc) return proc.pgid end)
+  M.register("getcwd", function(proc) return proc.cwd end)
+
+  -- getenv / setenv: process environment variables
+  M.register("getenv", function(proc, name)
+    return proc.environ and proc.environ[name]
+  end)
+  M.register("setenv", function(proc, name, value)
+    if not name then return false end
+    if value == nil then
+      if proc.environ then proc.environ[name] = nil end
+    else
+      if not proc.environ then proc.environ = {} end
+      proc.environ[name] = tostring(value)
+    end
+    return true
+  end)
+
+  -- exit
+  M.register("exit", function(proc, code)
+    proc_mod.exit(proc, code or 0)
+  end)
+
+  -- sleep (blocking)
+  M.register("sleep", function(proc, secs)
+    local id = K.env.os.startTimer(secs or 0)
+    K.sched.wait(proc, "timer", id)
+  end)
+
+  -- print: write args to stdout with a newline
+  M.register("print", function(proc, ...)
+    local parts = { ... }
+    for i, v in ipairs(parts) do parts[i] = tostring(v) end
+    local line = table.concat(parts, "\t") .. "\n"
+    local fd = proc.fds[1]
+    if not fd then return nil, "no stdout" end
+    return K.vfs.write(proc, fd, line)
+  end)
+
+  -- clear: clear the terminal screen (userspace has no term access)
+  M.register("clear", function(proc)
+    K.env.term.clear()
+    K.env.term.setCursorPos(1, 1)
+    return true
+  end)
+
+  -- diag: report terminal/tty state so the shell can self-diagnose rendering.
+  -- Returns { tty, active, cx, cy, w, h, out } where out is the type of fd 1.
+  M.register("diag", function(proc)
+    local cx, cy = 0, 0
+    local w, h = 0, 0
+    local t = K.env.term
+    if t and t.getCursorPos then cx, cy = t.getCursorPos() end
+    if t and t.getSize then w, h = t.getSize() end
+    local out = "?"
+    if proc and proc.fds and proc.fds[1] then
+      out = tostring(proc.fds[1].type or "?")
+    end
+    local res = {
+      tty = (proc and proc.tty) or 1,
+      active = K.tty and K.tty.active_id() or 1,
+      cx = cx, cy = cy, w = w, h = h, out = out,
+    }
+    if K.log then
+      K.log("diag: tty=" .. tostring(res.tty) .. " active=" .. tostring(res.active)
+        .. " cur=" .. tostring(cx) .. "," .. tostring(cy)
+        .. " size=" .. tostring(w) .. "x" .. tostring(h)
+        .. " out=" .. tostring(out))
+    end
+    return res
+  end)
+
+  -- spawn a child process
+  M.register("spawn", function(proc, path, ...)
+    local args = { ... }
+    -- optional trailing fds table: { [0]=fdnum, [1]=fdnum, [2]=fdnum }
+    -- wires the child's stdin/stdout/stderr to the parent's open fds
+    -- (shares the underlying open file description, like dup).
+    local fds = nil
+    if type(args[#args]) == "table" then
+      fds = args[#args]
+      args[#args] = nil
+    end
+    -- optional trailing boolean: system flag (full env, root-only)
+    local system = false
+    if type(args[#args]) == "boolean" and args[#args] then
+      system = true
+      args[#args] = nil
+    end
+    if system and proc.uid ~= 0 then
+      return nil, "permission denied: only root may spawn system processes"
+    end
+    return proc_mod.spawn(path, proc.pid, proc.uid, proc.gid, args, proc.tty, fds, proc, system)
+  end)
+
+  -- exec(path, ...) — execve(2) analog: replace the current process image.
+  -- On success never returns; on failure returns nil, err (old image keeps
+  -- running). Applies setuid/setgid bits and resets signal handlers (POSIX).
+  M.register("exec", function(proc, path, ...)
+    local args = { ... }
+    local resolved = K.vfs.resolve(proc, path)
+    if not resolved then return nil, "no such file" end
+    local ino = K.vfs.get_inode(resolved)
+    if not ino then return nil, "no such file" end
+    if ino.type ~= "file" then return nil, "not a file" end
+    if not K.fs.check_access(proc, ino, "x") then
+      return nil, "permission denied"
+    end
+    -- setuid/setgid bits (04000=0x800, 02000=0x400 octal)
+    if K.bit.band(ino.mode, 0x800) ~= 0 then proc.euid = ino.uid end
+    if K.bit.band(ino.mode, 0x400) ~= 0 then proc.egid = ino.gid end
+    -- fresh sandbox env + load the new image (preserve system flag)
+    local env = proc_mod.make_env(proc.system)
+    local fn, err = K.vfs.loadfile(resolved, env)
+    if not fn then return nil, err end
+    proc.co = coroutine.create(function()
+      return fn(table.unpack(args))
+    end)
+    proc.env = env
+    proc.name = path
+    -- POSIX exec semantics: reset signal handlers/mask to default
+    proc.sig.handlers = {}
+    proc.sig.pending = {}
+    proc.sig.blocked = {}
+    proc.sig._pending_result = nil
+    -- Enqueue with nil result. handle() sees state ~= "running" and skips
+    -- its own resume, so the process runs the new image exactly once.
+    K.sched.resume(proc, nil)
+  end)
+
+  -- waitpid (blocking)
+  M.register("waitpid", function(proc, pid, opt)
+    if opt == "nohang" then
+      local child = proc_mod.find_child(proc.pid, pid)
+      if child and child.state == "zombie" then
+        return proc_mod.reap(child)
+      end
+      return nil
+    end
+    -- blocking: wait for a child to become zombie
+    local child = proc_mod.find_child(proc.pid, pid)
+    if child and child.state == "zombie" then
+      return proc_mod.reap(child)
+    end
+    K.sched.wait(proc, "child", proc.pid)
+  end)
+
+  -- kill
+  M.register("kill", function(proc, pid, sig)
+    return proc_mod.kill(proc, pid, sig)
+  end)
+
+  -- signal(sig, handler|nil|"ignore") — sigaction(2) analog
+  M.register("signal", function(proc, sig, handler)
+    if sig == 9 or sig == 19 then
+      return nil, "cannot change handler for SIGKILL/SIGSTOP"
+    end
+    if handler == nil then
+      proc.sig.handlers[sig] = "default"
+    elseif handler == "ignore" then
+      proc.sig.handlers[sig] = "ignore"
+    elseif type(handler) == "function" then
+      proc.sig.handlers[sig] = handler
+    else
+      return nil, "invalid handler"
+    end
+    return true
+  end)
+
+  -- sigprocmask(how, set) — "block"|"unblock"|"set". KILL/STOP never blockable.
+  M.register("sigprocmask", function(proc, how, set)
+    if how == "block" then
+      for _, s in ipairs(set or {}) do
+        if s ~= 9 and s ~= 19 then proc.sig.blocked[s] = true end
+      end
+    elseif how == "unblock" then
+      for _, s in ipairs(set or {}) do
+        proc.sig.blocked[s] = nil
+      end
+    elseif how == "set" then
+      proc.sig.blocked = {}
+      for _, s in ipairs(set or {}) do
+        if s ~= 9 and s ~= 19 then proc.sig.blocked[s] = true end
+      end
+    else
+      return nil, "invalid how"
+    end
+    return true
+  end)
+
+  -- alarm(secs) — SIGALRM after secs; 0/nil cancels the pending alarm
+  M.register("alarm", function(proc, secs)
+    if proc.sig._alarm_timer then
+      K.env.os.cancelTimer(proc.sig._alarm_timer)
+      proc_mod.alarm_timers[proc.sig._alarm_timer] = nil
+      proc.sig._alarm_timer = nil
+    end
+    if secs and secs > 0 then
+      local id = K.env.os.startTimer(secs)
+      proc.sig._alarm_timer = id
+      proc_mod.alarm_timers[id] = proc
+    end
+    return true
+  end)
+
+  -- sched_yield
+  M.register("sched_yield", function(proc)
+    K.sched.enqueue(proc)
+  end)
+
+  -- getpriority / setpriority
+  M.register("getpriority", function(proc, pid)
+    local p = proc_mod.lookup(pid or proc.pid)
+    if not p then return nil, "no such process" end
+    return p.priority
+  end)
+  M.register("setpriority", function(proc, pid, prio)
+    local target = proc_mod.lookup(pid or proc.pid)
+    if not target then return nil, "no such process" end
+    if proc.uid ~= 0 and proc.uid ~= target.uid then
+      return nil, "permission denied"
+    end
+    target.priority = prio or 0
+    return true
+  end)
+
+  -- time / clock
+  M.register("time", function() return K.env.os.time() end)
+  M.register("clock", function() return K.env.os.clock() end)
+
+  -- clock_gettime(clock) -> secs, nsecs. CLOCK_REALTIME=0, CLOCK_MONOTONIC=1.
+  M.register("clock_gettime", function(proc, clock)
+    if clock == 1 then  -- CLOCK_MONOTONIC
+      local s = K.env.os.clock()
+      local secs = math.floor(s)
+      return secs, math.floor((s - secs) * 1e9)
+    end
+    -- CLOCK_REALTIME (default)
+    return K.env.os.time(), 0
+  end)
+
+  -- reboot() / halt() — power control via CC os API
+  M.register("reboot", function(proc)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    if K.env.os.reboot then K.env.os.reboot() end
+    return true
+  end)
+  M.register("halt", function(proc)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    if K.env.os.shutdown then K.env.os.shutdown() end
+    return true
+  end)
+
+  -- setpgid(pid, pgid) — set process group
+  M.register("setpgid", function(proc, pid, pgid)
+    local target = proc_mod.lookup(pid or proc.pid)
+    if not target then return nil, "no such process" end
+    if proc.uid ~= 0 and proc.uid ~= target.uid then
+      return nil, "permission denied"
+    end
+    target.pgid = pgid or target.pid
+    return true
+  end)
+
+  -- sched_setscheduler(pid?, policy) — "rr" | "fifo" | "other"
+  M.register("sched_setscheduler", function(proc, pid, policy)
+    local target = proc_mod.lookup(pid or proc.pid)
+    if not target then return nil, "no such process" end
+    if proc.uid ~= 0 and proc.uid ~= target.uid then
+      return nil, "permission denied"
+    end
+    if policy ~= "rr" and policy ~= "fifo" and policy ~= "other" then
+      return nil, "invalid policy"
+    end
+    target.sched_policy = policy
+    return true
+  end)
+
+  -- insmod(path) — load a kernel module at runtime (root only)
+  M.register("insmod", function(proc, path)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    if not path then return nil, "no path" end
+    local ok, mod = pcall(K.loader.load, path, K)
+    if not ok then return nil, tostring(mod) end
+    local name = path:match("([^/]+)%.lua$") or path
+    K.modules[name] = mod
+    K.module_paths = K.module_paths or {}
+    K.module_paths[name] = path
+    return true
+  end)
+
+  -- rmmod(name) — unload a kernel module (root only)
+  M.register("rmmod", function(proc, name)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    if not K.modules[name] then return nil, "no such module" end
+    K.modules[name] = nil
+    if K.module_paths and K.module_paths[name] then
+      K.loader.unload(K.module_paths[name])
+      K.module_paths[name] = nil
+    end
+    return true
+  end)
+
+  -- chdir
+  M.register("chdir", function(proc, path)
+    local resolved = K.vfs.resolve(proc, path)
+    local ino = K.vfs.get_inode(resolved)
+    if not ino or ino.type ~= "dir" then return nil, "not a directory" end
+    if not K.fs.check_access(proc, ino, "x") then return nil, "permission denied" end
+    proc.cwd = resolved
+    return true
+  end)
+
+  -- ============================================================
+  -- File syscalls
+  -- ============================================================
+
+  -- Allocate a new fd number for a process
+  local function alloc_fd(proc, fd)
+    for i = 3, 1024 do
+      if not proc.fds[i] then
+        proc.fds[i] = fd
+        return i
+      end
+    end
+    return nil
+  end
+
+  M.register("open", function(proc, path, flags, mode)
+    -- Normalize flags: accept POSIX numeric flags (O_RDONLY=0, O_WRONLY=1,
+    -- O_RDWR=2, O_APPEND=0x400) or string modes ("r"/"w"/"a"). CraftOS
+    -- fs.open only understands string modes.
+    if type(flags) == "number" then
+      local n = flags
+      local acc = n % 8
+      if acc == 1 then flags = "w"
+      elseif acc == 2 then flags = "r"
+      else flags = "r" end
+      if math.floor(n / 0x400) % 2 == 1 then flags = flags .. "a" end
+    end
+    local fd, err = K.vfs.open(proc, path, flags or "r", mode, function(f)
+      local n = alloc_fd(proc, f)
+      if not n then return nil, "too many open files" end
+      return n
+    end)
+    if not fd then return nil, err end
+    local n = alloc_fd(proc, fd)
+    if not n then return nil, "too many open files" end
+    return n
+  end)
+
+  M.register("close", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    K.vfs.close(fd)
+    proc.fds[fdnum] = nil
+    return true
+  end)
+
+  -- dup(fdnum) — duplicate an fd to the lowest free number (shares the
+  -- underlying open file description: same offset, same socket).
+  M.register("dup", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    local n = alloc_fd(proc, fd)
+    if not n then return nil, "too many open files" end
+    return n
+  end)
+
+  -- dup2(fdnum, newfd) — duplicate fd to a specific number, closing newfd
+  -- first if it is open. Returns newfd on success.
+  M.register("dup2", function(proc, fdnum, newfd)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    if newfd == fdnum then return newfd end
+    local old = proc.fds[newfd]
+    if old then
+      K.vfs.close(old)
+      proc.fds[newfd] = nil
+    end
+    proc.fds[newfd] = fd
+    return newfd
+  end)
+
+  M.register("read", function(proc, fdnum, n)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.vfs.read(proc, fd, n)
+  end)
+
+  M.register("write", function(proc, fdnum, data)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.vfs.write(proc, fd, data)
+  end)
+
+  M.register("lseek", function(proc, fdnum, offset, whence)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.vfs.lseek(fd, offset or 0, whence or "set")
+  end)
+
+  M.register("stat", function(proc, path)
+    return K.vfs.stat(proc, path)
+  end)
+
+  M.register("fstat", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    local ino = fd.path and K.vfs.get_inode(fd.path)
+    if ino then
+      return { type = ino.type, mode = ino.mode, uid = ino.uid, gid = ino.gid,
+        nlink = ino.nlink, size = ino.size or 0, path = fd.path }
+    end
+    -- fd without a path (console, pipe, device, socket)
+    local mode = 0x1B6
+    local ftype = fd.type
+    if fd.type == "pipe_r" or fd.type == "pipe_w" then
+      ftype = "fifo"
+    elseif fd.type == "file" then
+      mode = 0x1A4
+    end
+    return { type = ftype, mode = mode, uid = proc.uid, gid = proc.gid, nlink = 1, size = 0 }
+  end)
+
+  M.register("readdir", function(proc, path)
+    return K.vfs.readdir(proc, path)
+  end)
+
+  M.register("mkdir", function(proc, path, mode)
+    return K.vfs.mkdir(proc, path, mode)
+  end)
+
+  M.register("rmdir", function(proc, path)
+    return K.vfs.rmdir(proc, path)
+  end)
+
+  M.register("unlink", function(proc, path)
+    return K.vfs.unlink(proc, path)
+  end)
+
+  M.register("rename", function(proc, old, new)
+    return K.vfs.rename(proc, old, new)
+  end)
+
+  M.register("chmod", function(proc, path, mode)
+    return K.vfs.chmod(proc, path, mode)
+  end)
+
+  M.register("chown", function(proc, path, uid, gid)
+    return K.vfs.chown(proc, path, uid, gid)
+  end)
+
+  M.register("chgrp", function(proc, path, gid)
+    return K.vfs.chown(proc, path, nil, gid)
+  end)
+
+  M.register("symlink", function(proc, target, path)
+    return K.vfs.symlink(proc, target, path)
+  end)
+
+  M.register("readlink", function(proc, path)
+    return K.vfs.readlink(proc, path)
+  end)
+
+  M.register("link", function(proc, old, new)
+    return K.vfs.link(proc, old, new)
+  end)
+
+  M.register("chroot", function(proc, path)
+    return K.vfs.chroot(proc, path)
+  end)
+
+  M.register("mount", function(proc, source, target, fstype, flags)
+    return K.vfs.mount(proc, source, target, fstype, flags)
+  end)
+
+  M.register("umount", function(proc, target)
+    return K.vfs.umount(proc, target)
+  end)
+
+  M.register("umask", function(proc, mask)
+    return K.vfs.umask(proc, mask)
+  end)
+
+  -- ============================================================
+  -- IPC syscalls
+  -- ============================================================
+
+  -- pipe() -> read_fd, write_fd
+  M.register("pipe", function(proc)
+    local rfd, wfd = K.ipc.pipe()
+    local rn = alloc_fd(proc, rfd)
+    local wn = alloc_fd(proc, wfd)
+    if not rn or not wn then return nil, "too many open files" end
+    return rn, wn
+  end)
+
+  -- mkfifo(path, mode)
+  M.register("mkfifo", function(proc, path, mode)
+    return K.vfs.mkfifo(proc, path, mode)
+  end)
+
+  -- select(readfds, writefds, exceptfds, timeout) -> r, w, e
+  M.register("fdselect", function(proc, readfds, writefds, exceptfds, timeout)
+    local r, w, e = {}, {}, {}
+    local function check()
+      r, w, e = {}, {}, {}
+      for _, n in ipairs(readfds or {}) do
+        local fd = proc.fds[n]
+        if fd and K.ipc.fd_readable(fd) then r[#r + 1] = n end
+      end
+      for _, n in ipairs(writefds or {}) do
+        local fd = proc.fds[n]
+        if fd and K.ipc.fd_writable(fd) then w[#w + 1] = n end
+      end
+    end
+    check()
+    if #r > 0 or #w > 0 then return r, w, e end
+    if timeout and timeout > 0 then
+      -- block once for the full timeout; on wake, re-check
+      local id = K.env.os.startTimer(timeout)
+      K.sched.wait(proc, "timer", id, function()
+        check()
+        return { r, w, e }
+      end)
+    elseif not timeout then
+      -- block indefinitely until fd activity; on wake, re-check
+      K.ipc.wait_fd_ready(proc, function()
+        check()
+        return { r, w, e }
+      end)
+    end
+    return r, w, e
+  end)
+
+  -- poll(fds, timeout) -> ready fds
+  M.register("poll", function(proc, fds, timeout)
+    local ready = {}
+    local function check()
+      ready = {}
+      for _, spec in ipairs(fds or {}) do
+        local n = spec.fd
+        local fd = proc.fds[n]
+        local events = 0
+        if fd and K.ipc.fd_readable(fd) then events = K.bit.bor(events, 1) end  -- POLLIN
+        if fd and K.ipc.fd_writable(fd) then events = K.bit.bor(events, 4) end  -- POLLOUT
+        if events ~= 0 then ready[#ready + 1] = { fd = n, revents = events } end
+      end
+    end
+    check()
+    if #ready > 0 then return ready end
+    if timeout and timeout > 0 then
+      local id = K.env.os.startTimer(timeout)
+      K.sched.wait(proc, "timer", id, function()
+        check()
+        return ready
+      end)
+    elseif not timeout then
+      K.ipc.wait_fd_ready(proc, function()
+        check()
+        return ready
+      end)
+    end
+    return ready
+  end)
+
+  -- socket(domain, type, proto) -> fd
+  -- Domains: AF_MODEM4(2)|AF_MODEM6(10)|AF_UNIX(1)|AF_HTTP(3); deprecated: AF_ICMP(2)=AF_MODEM4
+  -- Types:   SOCK_STREAM(1)|SOCK_DGRAM(2)|SOCK_RAW(3)
+  -- Proto:   IPPROTO_ICMP(1)|IPPROTO_TCP(6)|IPPROTO_UDP(17)|0
+  -- ICMP raw: socket("modem4", "raw", 1) or deprecated socket("icmp", "dgram", 1)
+  M.register("socket", function(proc, domain, socktype, proto)
+    local fd = K.ipc.socket(domain, socktype, proto)
+    local n = alloc_fd(proc, fd)
+    if not n then return nil, "too many open files" end
+    return n
+  end)
+
+  -- bind(fd, path)
+  M.register("bind", function(proc, fdnum, path)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_bind(proc, fd, path)
+  end)
+
+  -- listen(fd, backlog)
+  M.register("listen", function(proc, fdnum, backlog)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_listen(proc, fd, backlog)
+  end)
+
+  -- accept(fd) -> new fd
+  M.register("accept", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    local connfd = K.ipc.socket_accept(proc, fd, function(cfd)
+      local n = alloc_fd(proc, cfd)
+      if not n then return nil, "too many open files" end
+      return n
+    end)
+    if not connfd then return nil end
+    local n = alloc_fd(proc, connfd)
+    if not n then return nil, "too many open files" end
+    return n
+  end)
+
+  -- connect(fd, path)
+  M.register("connect", function(proc, fdnum, path)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_connect(proc, fd, path)
+  end)
+
+  -- send(fd, data)
+  M.register("send", function(proc, fdnum, data, flags)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_send(proc, fd, data, flags)
+  end)
+
+  -- recv(fd, n, flags) — flags: MSG_DONTWAIT=1, MSG_PEEK=2
+  M.register("recv", function(proc, fdnum, n, flags)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_recv(proc, fd, n, flags)
+  end)
+
+  -- sendto(fd, data, dest_ip, dest_port)  (AF_MODEM4/AF_MODEM6)
+  M.register("sendto", function(proc, fdnum, data, dest_ip, dest_port)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_sendto(proc, fd, data, dest_ip, dest_port)
+  end)
+
+  -- recvfrom(fd) -> data, src_ip, src_port  (AF_MODEM4/AF_MODEM6)
+  M.register("recvfrom", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return K.ipc.socket_recvfrom(proc, fd)
+  end)
+
+  -- shutdown(fd, how) — "read" | "write" | "both"
+  M.register("shutdown", function(proc, fdnum, how)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    if not fd.sock then return nil, "not a socket" end
+    return K.ipc.socket_shutdown(fd, how)
+  end)
+
+  -- getsockname(fd)
+  M.register("getsockname", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return fd.sock.path
+  end)
+
+  -- getpeername(fd)
+  M.register("getpeername", function(proc, fdnum)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    return fd.sock.peer
+  end)
+
+  -- setsockopt / getsockopt (SO_BROADCAST, SO_REUSEADDR, SO_RCVTIMEO; HTTP options)
+  -- HTTP level = 2: METHOD=1 (GET|POST), HEADERS=2 (table), BODY=3 (string)
+  M.register("setsockopt", function(proc, fdnum, level, opt, val)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    if level == 1 then  -- SOL_SOCKET
+      if opt == 2 then  -- SO_REUSEADDR
+        if fd.sock then fd.sock.reuseaddr = val == true or val == 1 end
+        return true
+      elseif opt == 20 then  -- SO_RCVTIMEO (seconds)
+        local t = tonumber(val)
+        if t and t < 0 then return nil, "invalid timeout" end
+        if fd.sock then fd.sock.rcvtimeo = t or 0 end
+        return true
+      elseif opt == 6 then  -- SO_BROADCAST
+        if fd.sock then fd.sock.broadcast = val == true or val == 1 end
+        return true
+      end
+    end
+    if fd.sock and fd.sock.domain == "http" and level == 2 then
+      if opt == 1 then fd.sock.http_method = tostring(val or "GET"):upper(); return true
+      elseif opt == 2 then fd.sock.http_headers = val or {}; return true
+      elseif opt == 3 then fd.sock.http_body = val; return true end
+    end
+    return true
+  end)
+  M.register("getsockopt", function(proc, fdnum, level, opt)
+    local fd = proc.fds[fdnum]
+    if not fd then return nil, "bad fd" end
+    if level == 1 and fd.sock then  -- SOL_SOCKET
+      if opt == 2 then  -- SO_REUSEADDR
+        return fd.sock.reuseaddr and 1 or 0
+      elseif opt == 20 then  -- SO_RCVTIMEO
+        return fd.sock.rcvtimeo or 0
+      elseif opt == 6 then  -- SO_BROADCAST
+        return fd.sock.broadcast and 1 or 0
+      end
+    end
+    return nil
+  end)
+
+  -- ============================================================
+  -- Virtual terminals (tty)
+  -- ============================================================
+
+  -- ioctl(fd, request, arg): VT_ACTIVATE switches active terminal;
+  -- TCSETS sets /dev/console input mode ('cooked' lines / 'raw' events);
+  -- TIOCSCTTY makes fd's tty the controlling tty (real Linux).
+  -- Old names "tty_switch" / "console_mode" kept as aliases.
+  M.register("ioctl", function(proc, fdnum, request, arg)
+    if request == "VT_ACTIVATE" or request == "tty_switch" then
+      return K.tty.switch(arg)
+    elseif request == "TCSETS" or request == "console_mode" then
+      proc.console_mode = (arg == "raw") and "raw" or "cooked"
+      return true
+    elseif request == "TIOCSCTTY" then
+      local fd = proc.fds[fdnum]
+      if not fd then return nil, "bad fd" end
+      if proc.uid ~= 0 then return nil, "permission denied" end
+      -- fd should be a tty device (/dev/ttyN); derive id from arg or fd
+      local id = (type(arg) == "number" and arg > 0) and arg or nil
+      if not id and fd.path then id = tonumber(fd.path:match("tty(%d+)")) end
+      if not id and fd.tty_id then id = fd.tty_id end
+      if not id or id < 1 or id > K.tty.count() then return nil, "invalid tty" end
+      proc.tty = id
+      return true
+    end
+    return nil
+  end)
+
+  -- ============================================================
+  -- Account database (auth)
+  -- ============================================================
+  M.register("getpwnam", function(proc, name)
+    return K.auth.getpwnam(name)
+  end)
+
+  -- getpwuid(uid) -> entry table or nil
+  M.register("getpwuid", function(proc, uid)
+    return K.auth.getpwuid(uid)
+  end)
+
+  -- getgrnam(name) -> group table or nil
+  M.register("getgrnam", function(proc, name)
+    return K.auth.getgrnam(name)
+  end)
+
+  -- getgrgid(gid) -> group table or nil
+  M.register("getgrgid", function(proc, gid)
+    return K.auth.getgrgid(gid)
+  end)
+
+  -- login(name, pass) -> uid, gid or nil
+  M.register("login", function(proc, name, pass)
+    return K.auth.login(name, pass)
+  end)
+
+  -- setuid(uid): only root may change to arbitrary uid; else must match own
+  M.register("setuid", function(proc, uid)
+    if proc.uid ~= 0 and uid ~= proc.uid then return nil, "permission denied" end
+    proc.uid, proc.euid = uid, uid
+    return true
+  end)
+
+  -- setgid(gid): only root may change to arbitrary gid
+  M.register("setgid", function(proc, gid)
+    if proc.uid ~= 0 and gid ~= proc.gid then return nil, "permission denied" end
+    proc.gid, proc.egid = gid, gid
+    return true
+  end)
+
+  return M
+end---FILE /lib/knuck/kernel/tty.lua 0755 7921 ce297a84 src---
+--[[
+  KNUCK virtual terminals (multi-tty)
+  ===================================
+  N virtual terminals /dev/tty1..ttyN. Each has an output buffer. Only the
+  ACTIVE tty renders to the physical CraftOS terminal; inactive ttys buffer
+  their output. Input (char/key) is routed to the active tty's readers.
+
+  Switching: ioctl(fd, "VT_ACTIVATE", id) on /dev/console, or a devctl
+  write. Each process is bound to a tty (proc.tty, default 1).
+]]
+
+return function(K)
+  local M = {}
+
+  local N = 6
+  local SCROLLBACK = 500
+  local ttys = {}
+  local active = 1
+  for i = 1, N do
+    ttys[i] = { id = i, buffer = "", line = "", readers = {}, scroll = 0 }
+  end
+
+  local function get_h()
+    local ok, w, h = pcall(function() return term.getSize() end)
+    if ok and h then return h end
+    if term and term.getSize then
+      local _, hh = term.getSize()
+      return hh or 19
+    end
+    return 19
+  end
+  local function trim_buffer(t)
+    local cnt = 0
+    for _ in t.buffer:gmatch("\n") do cnt = cnt + 1 end
+    if cnt > SCROLLBACK then
+      local excess = cnt - SCROLLBACK
+      local pos = 1
+      for i = 1, excess do
+        local nl = t.buffer:find("\n", pos, true)
+        if not nl then break end
+        pos = nl + 1
+      end
+      t.buffer = t.buffer:sub(pos)
+      if t.scroll > 0 then t.scroll = math.max(0, t.scroll - excess) end
+    end
+  end
+  local function redraw(t)
+    term.clear()
+    term.setCursorPos(1, 1)
+    if t.scroll == 0 then
+      K.term_write(t.buffer)
+    else
+      local buf = t.buffer
+      local lines = {}
+      local i = 1
+      while true do
+        local nl = buf:find("\n", i, true)
+        if nl then
+          lines[#lines+1] = buf:sub(i, nl-1)
+          i = nl + 1
+        else
+          lines[#lines+1] = buf:sub(i)
+          break
+        end
+      end
+      if buf:sub(-1) == "\n" and lines[#lines] == "" then table.remove(lines) end
+      local h = get_h()
+      local total = #lines
+      local start = math.max(1, total - h - t.scroll + 1)
+      local finish = math.min(total, total - t.scroll)
+      local slice = {}
+      for idx = start, finish do slice[#slice+1] = lines[idx] end
+      local text = table.concat(slice, "\n")
+      if total > 0 and buf:sub(-1) == "\n" and finish == total then text = text .. "\n" end
+      K.term_write(text)
+    end
+  end
+  function M.do_scroll(id, delta)
+    local t = ttys[id]
+    if not t then return end
+    local h = get_h()
+    local cnt = 0
+    for _ in t.buffer:gmatch("\n") do cnt = cnt + 1 end
+    if t.buffer:sub(-1) ~= "\n" and #t.buffer > 0 then cnt = cnt + 1 end
+    local max_scroll = math.max(0, cnt - h)
+    if max_scroll == 0 then return end
+    t.scroll = t.scroll + delta
+    if t.scroll < 0 then t.scroll = 0 end
+    if t.scroll > max_scroll then t.scroll = max_scroll end
+    redraw(t)
+  end
+
+  function M.init(K)
+    -- nothing yet
+  end
+
+  function M.count() return N end
+  function M.active_id() return active end
+
+  -- Write to a process's tty. If that tty is active, render to physical term.
+  -- Detached (tty 0/nil) writes go nowhere (or to log ring) — init is detached.
+  function M.write(proc, data)
+    local id = (proc and proc.tty)
+    if not id or id == 0 then return #(tostring(data or "")) end
+    local t = ttys[id]
+    if not t then return #(tostring(data or "")) end
+    local s = tostring(data or "")
+    t.buffer = t.buffer .. s
+    trim_buffer(t)
+    if id == active then
+      if t.scroll == 0 then
+        K.term_write(s)
+      end
+    end
+    return #s
+  end
+
+  -- Read from a process's tty. Blocks until input arrives on that tty.
+  -- Cooked mode (default): returns a line of text on Enter.
+  -- Raw mode: returns the raw input event table.
+  -- Detached has no tty to read from — return nil.
+  function M.read(proc, n)
+    local id = (proc and proc.tty)
+    if not id or id == 0 then return nil, "no tty" end
+    if not ttys[id] then return nil, "no tty" end
+    if proc and proc.console_mode == "raw" then
+      K.sched.wait(proc, "tty_input", id)
+      return proc.pending_result
+    end
+    K.sched.wait(proc, "tty_cooked", id)
+    return proc.pending_result
+  end
+
+  -- Switch the active tty and render its buffer.
+  function M.switch(id)
+    if not ttys[id] then return false end
+    active = id
+    ttys[id].scroll = 0
+    term.clear()
+    term.setCursorPos(1, 1)
+    K.term_write(ttys[id].buffer)
+    return true
+  end
+
+  -- Route an input event to the active tty's readers.
+  -- Raw readers get the event directly; cooked readers accumulate chars
+  -- into the line buffer and are woken with the line on Enter.
+  -- Echo helpers for cooked mode — user must see what they type.
+  local function echo(s)
+    if active == ttys[active].id then K.term_write(s) end
+  end
+
+  function M.handle_input(ev)
+    if ev[1] == "key" then
+      local k = ev[2]
+      if k == 201 or k == 199 then
+        M.do_scroll(active, -(get_h() - 1))
+        return
+      elseif k == 209 then
+        M.do_scroll(active, get_h() - 1)
+        return
+      elseif k == 200 then
+        M.do_scroll(active, -1)
+        return
+      elseif k == 208 then
+        M.do_scroll(active, 1)
+        return
+      end
+    end
+    local t = ttys[active]
+    if t.scroll ~= 0 then
+      if ev[1] == "char" or (ev[1] == "key" and (ev[2] == 14 or ev[2] == 259 or ev[2] == 28 or ev[2] == 13 or ev[2] == 257 or ev[2] == 200 or ev[2] == 208)) then
+        t.scroll = 0
+        redraw(t)
+      end
+    end
+    -- Wake raw readers on the active tty (only the active VT receives input,
+    -- matching real terminal behavior). Getty must call VT_ACTIVATE to make
+    -- its tty active before reading.
+    -- Shift+PageUp/PageDown already handled above (also handle held shift variant bare PageUp)
+    K.sched.wake("tty_input", active, ev)
+
+    -- Cooked processing only when a cooked waiter exists.
+    -- In raw mode (login password prompt, etc.) no cooked waiter is present,
+    -- so line buffering, echo, and cooked wake are all skipped — preventing
+    -- double echo and password leakage.
+    if not K.sched.is_waiting("tty_cooked", active) then return end
+
+    -- Backspace / delete — erase last char from cooked line buffer
+    if ev[1] == "key" and (ev[2] == 14 or ev[2] == 259) then  -- Backspace(14), Delete(259)
+      if #t.line > 0 then
+        t.line = t.line:sub(1, -2)
+        echo("\b \b")
+      end
+      return
+    end
+
+    if ev[1] == "char" then
+      local ch = ev[2]
+      -- Also handle \b and DEL (\x7f) as backspace in char events
+      if ch == "\b" or ch == "\x7f" then
+        if #t.line > 0 then
+          t.line = t.line:sub(1, -2)
+          echo("\b \b")
+        end
+      elseif ch == "\n" or ch == "\r" then
+        echo("\n")
+        local line = t.line
+        t.line = ""
+        K.sched.wake("tty_cooked", active, line)
+      else
+        t.line = t.line .. ch
+        echo(ch)  -- echo typed character to active terminal
+      end
+    elseif ev[1] == "key" and (ev[2] == 28 or ev[2] == 13 or ev[2] == 257) then  -- Enter key
+      echo("\n")
+      local line = t.line
+      t.line = ""
+      K.sched.wake("tty_cooked", active, line)
+    end
+  end
+
+  -- Bind a process to a tty (inherited from parent on spawn).
+  function M.bind(proc, id)
+    proc.tty = id or 1
+  end
+
+  -- Device driver for /dev/ttyN
+  function M.make_driver(id)
+    return {
+      mode = 0x1B6,
+      write = function(data)
+        local proc = K.sched.current()
+        local t = ttys[id]
+        local s = tostring(data or "")
+        t.buffer = t.buffer .. s
+        trim_buffer(t)
+        if id == active and t.scroll == 0 then K.term_write(s) end
+        return #s
+      end,
+      read = function(n)
+        local proc = K.sched.current()
+        if proc and proc.console_mode == "raw" then
+          K.sched.wait(proc, "tty_input", id)
+          return proc.pending_result
+        end
+        K.sched.wait(proc, "tty_cooked", id)
+        return proc.pending_result
+      end,
+    }
+  end
+
+  return M
+end---FILE /lib/knuck/kernel/vfs.lua 0755 35952 f589e43e src---
+--[[
+  KNUCK VFS
+  =========
+  Mount table + path resolution + virtual filesystems (/proc, /sys, /dev)
+  + device nodes + top-level file operations used by syscalls.
+
+  Mounts:
+    /        disk   (real CraftOS storage)
+    /boot    disk
+    /tmp     tmp    (real CraftOS storage)
+    /rom     rom    (real CraftOS storage)
+    /dev     dev    (virtual device nodes)
+    /sys     sys    (virtual kernel info)
+    /proc    proc   (virtual process info)
+
+  Real-fs mounts map VFS path directly onto the CraftOS fs (real_root="/").
+  Virtual mounts generate content on demand from kernel state.
+]]
+
+return function(K)
+  local M = {}
+  local fs_mod = nil
+
+  local mounts = {}             -- mountpoint -> { fstype, real_root }
+  local devices = {}            -- /dev/name -> device driver table
+
+  function M.init(K)
+    fs_mod = K.fs
+    -- register device drivers
+    local term_drv = K.loader.load("/lib/knuck/kernel/drivers/term.lua", K)
+    M.register_device("console", term_drv)
+    -- virtual terminals /dev/tty1..ttyN
+    if K.tty then
+      for i = 1, K.tty.count() do
+        M.register_device("tty" .. i, K.tty.make_driver(i))
+      end
+    end
+    -- devctl: control device. write "VT_ACTIVATE <id>" switches active tty.
+    M.register_device("devctl", {
+      mode = 0x1B6,
+      write = function(data)
+        local s = tostring(data or "")
+        local id = s:match("VT_ACTIVATE%s+(%d+)") or s:match("tty_switch%s+(%d+)")
+        if id and K.tty then
+          return K.tty.switch(tonumber(id)) and #s or 0
+        end
+        return #s
+      end,
+      read = function(n)
+        local proc = K.sched.current()
+        K.sched.wait(proc, "devctl", "devctl")
+        return proc.pending_result
+      end,
+    })
+    -- /dev/null: read = EOF, write = discard
+    M.register_device("null", {
+      mode = 0x1B6,
+      read = function() return nil end,
+      write = function(data) return #data end,
+    })
+    -- /dev/zero: read = NUL bytes
+    M.register_device("zero", {
+      mode = 0x1B6,
+      read = function(n) return string.rep("\0", n or 0) end,
+      write = function(data) return #data end,
+    })
+    -- /dev/urandom: read = random bytes
+    M.register_device("urandom", {
+      mode = 0x1B6,
+      read = function(n)
+        local out = {}
+        for i = 1, (n or 1) do out[i] = string.char(math.random(0, 255)) end
+        return table.concat(out)
+      end,
+      write = function(data) return #data end,
+    })
+    -- /dev/input: raw input events (term/char/mouse), fed by the scheduler
+    M.register_device("input", {
+      mode = 0x1B6,
+      read = function(n)
+        local proc = K.sched.current()
+        K.sched.wait(proc, "input", "input")
+        return proc.pending_result
+      end,
+      write = function(data) return #data end,
+    })
+  end
+
+  -- Thin wrapper over a CC peripheral at a side. write "method arg1 arg2"
+  -- calls peripheral.call(side, method, ...). read returns nil (peripherals
+  -- are method-based, not streams).
+  local function make_periph_driver(side)
+    return {
+      mode = 0x1B6,
+      read = function() return nil end,
+      write = function(data)
+        if not peripheral then return 0 end
+        local method, rest = tostring(data):match("^(%S+)%s*(.*)$")
+        if not method then return 0 end
+        local args = {}
+        for a in (rest or ""):gmatch("%S+") do args[#args + 1] = a end
+        local ok = pcall(peripheral.call, side, method, table.unpack(args))
+        return ok and #data or 0
+      end,
+    }
+  end
+
+  -- /dev/peripherals helpers: side <-> type mapping, dynamic enumeration
+  local periph_type_plural = {
+    monitor = "monitors", computer = "computers", modem = "modems",
+    drive = "drives", printer = "printers", turtle = "turtles",
+    speaker = "speakers", energy = "energy",
+  }
+  local function periph_sides()
+    if not (peripheral and peripheral.getNames) then return {} end
+    local ok, names = pcall(peripheral.getNames)
+    if not ok or type(names) ~= "table" then return {} end
+    return names
+  end
+  local function periph_type_of(side)
+    if not (peripheral and peripheral.getType) then return nil end
+    local ok, t = pcall(peripheral.getType, side)
+    return ok and t or nil
+  end
+  local function periph_devices_by_type(plural)
+    local out = {}
+    for _, side in ipairs(periph_sides()) do
+      local t = periph_type_of(side)
+      if t and periph_type_plural[t] == plural then out[#out+1] = side end
+    end
+    table.sort(out)
+    return out
+  end
+  local function side_for_typed(plural, name)
+    -- name like monitor0, printer2 -> index 0-based
+    local idx = tonumber(name:match("(%d+)$"))
+    if idx == nil then return nil end
+    local list = periph_devices_by_type(plural)
+    return list[idx+1] -- 0 -> 1st
+  end
+
+  function M.mount_root()
+    mounts["/"] = { fstype = "disk", real_root = "/" }
+    mounts["/boot"] = { fstype = "disk", real_root = "/boot" }
+    mounts["/tmp"] = { fstype = "tmp", real_root = "/tmp" }
+    mounts["/rom"] = { fstype = "rom", real_root = "/rom" }
+    mounts["/dev"] = { fstype = "dev" }
+    mounts["/sys"] = { fstype = "sys" }
+    mounts["/proc"] = { fstype = "proc" }
+    -- ensure real-fs base dirs exist
+    for _, d in ipairs({ "/tmp", "/boot", "/rom" }) do
+      if not fs_mod.exists(d) then fs_mod.make_dir(d) end
+    end
+    -- ensure /var/lib/pine dirs exist (package manager)
+    for _, d in ipairs({ "/var", "/var/lib", "/var/lib/pine",
+      "/var/lib/pine/db", "/var/lib/pine/conffiles", "/var/lib/pine/stage" }) do
+      if not fs_mod.exists(d) then fs_mod.make_dir(d) end
+    end
+    -- tmpfs /tmp: wipe contents at boot (spec: "чистится при старте")
+    local function wipe(dir)
+      for _, name in ipairs(fs_mod.list(dir) or {}) do
+        local p = dir .. "/" .. name
+        if fs_mod.is_dir(p) then
+          wipe(p)
+          fs_mod.remove(p)
+        else
+          fs_mod.remove(p)
+        end
+      end
+    end
+    wipe("/tmp")
+  end
+
+  -- Mount all present disk drives at /mnt/disk0..N (fstype floppy/hdd).
+  -- Returns the number of drives mounted.
+  function M.mount_drives()
+    local idx = 0
+    local names = {}
+    if peripheral and peripheral.getNames then
+      names = peripheral.getNames()
+    end
+    for _, side in ipairs(names) do
+      local ok, ptype = pcall(peripheral.getType, side)
+      if ok and ptype == "drive" then
+        M.drive_side(side)
+        idx = idx + 1
+      end
+    end
+    return idx
+  end
+
+  -- Mount/unmount a single drive by peripheral side (hotplug).
+  -- detach=true unmounts; otherwise mounts the drive at the next /mnt/diskN.
+  local drive_sides = {}   -- side -> mountpoint
+  local drive_next = 0
+  function M.drive_side(side, detach)
+    if detach then
+      local mp = drive_sides[side]
+      if mp then
+        M.unmount_drive(mp)
+        drive_sides[side] = nil
+      end
+      return
+    end
+    local ok, ptype = pcall(peripheral.getType, side)
+    if not ok or ptype ~= "drive" then return end
+    local ok2, mpath = pcall(disk.getMountPath, side)
+    if not ok2 or not mpath then return end
+    local mp = "/mnt/disk" .. drive_next
+    drive_next = drive_next + 1
+    mounts[mp] = { fstype = "floppy", real_root = mpath }
+    fs_mod.set_drive_mount(mp, mpath)
+    drive_sides[side] = mp
+  end
+
+  -- Unmount a drive by its /mnt/diskN mountpoint (on detach).
+  function M.unmount_drive(mp)
+    if not mounts[mp] then return false end
+    mounts[mp] = nil
+    fs_mod.clear_drive_mount(mp)
+    return true
+  end
+
+  -- Register a device node driver
+  function M.register_device(name, driver)
+    devices[name] = driver
+  end
+
+  -- Register a socket inode (AF_UNIX bind)
+  function M.set_socket(path, sock)
+    fs_mod.set_inode(path, { type = "socket", sock = sock, mode = 0x1B6, uid = 0, gid = 0, nlink = 1 })
+  end
+
+  -- Drop a socket inode (AF_UNIX close)
+  function M.drop_socket(path)
+    fs_mod.drop_inode(path)
+  end
+
+  -- ---- path resolution ----
+
+  -- Normalize a path to canonical absolute form
+  function M.normalize(path)
+    local p = path or "/"
+    if p:sub(1, 1) ~= "/" then p = "/" .. p end
+    local parts = {}
+    for part in p:gmatch("[^/]+") do
+      if part == "." then
+        -- skip
+      elseif part == ".." then
+        if #parts > 0 then table.remove(parts) end
+      else
+        parts[#parts + 1] = part
+      end
+    end
+    return "/" .. table.concat(parts, "/")
+  end
+
+  -- Resolve a path relative to a process cwd, following symlinks.
+  -- Returns canonical path (symlinks resolved) or nil.
+  function M.resolve(proc, path)
+    local p = path or "/"
+    if p:sub(1, 1) ~= "/" then
+      p = (proc and proc.cwd or "/") .. "/" .. p
+    end
+    p = M.normalize(p)
+    -- chroot jail: absolute paths resolve inside proc.root (if set)
+    if proc and proc.root and proc.root ~= "/" then
+      p = M.normalize(proc.root .. p)
+    end
+    -- follow symlinks (limit 40)
+    for _ = 1, 40 do
+      local ino = fs_mod.get_inode(p)
+      if ino and ino.type == "symlink" then
+        local tgt = ino.target
+        if tgt:sub(1, 1) ~= "/" then
+          -- relative target: resolve against parent dir
+          local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
+          tgt = parent .. "/" .. tgt
+        end
+        p = M.normalize(tgt)
+      else
+        break
+      end
+    end
+    return p
+  end
+
+  -- Find the mount for a canonical path
+  function M.find_mount(path)
+    local best, best_len = nil, -1
+    for mp, m in pairs(mounts) do
+      local under
+      if path == mp then
+        under = true
+      elseif mp == "/" then
+        -- root mount: every absolute path is under it
+        under = path:sub(1, 1) == "/"
+      else
+        under = path:sub(1, #mp + 1) == mp .. "/"
+      end
+      if under and #mp > best_len then
+        best, best_len = m, #mp
+      end
+    end
+    return best
+  end
+
+  -- ---- virtual filesystem generators ----
+
+  -- /proc: process info
+  local function proc_list()
+    local out = { "uptime", "version", "selfcheck" }
+    for pid in pairs(K.proc.snapshot()) do
+      out[#out + 1] = tostring(pid)
+    end
+    return out
+  end
+
+  local function proc_read(path)
+    local rest = path:match("^/proc/(.+)$")
+    if not rest then return nil end
+    if rest == "uptime" then
+      return tostring(K.env.os.clock()) .. "\n"
+    elseif rest == "version" then
+      return "KNUCK " .. (K.selfcheck.craftos or "?") .. "\n"
+    elseif rest == "selfcheck" then
+      local parts = {}
+      for k, v in pairs(K.selfcheck) do
+        parts[#parts + 1] = k .. "=" .. tostring(v)
+      end
+      table.sort(parts)
+      return table.concat(parts, "\n") .. "\n"
+    elseif rest == "kmsg" then
+      -- dmesg ring, drain-on-read (single consumer: syslogd)
+      local ring = K.log_ring or {}
+      local pos = K.kmsg_pos or 0
+      local lines = {}
+      if pos < #ring then
+        for i = pos + 1, #ring do lines[#lines + 1] = ring[i] end
+      end
+      K.kmsg_pos = #ring
+      return table.concat(lines, "\n") .. (#lines > 0 and "\n" or "")
+    elseif rest == "dmesg" then
+      -- full dmesg ring (repeatable)
+      return table.concat(K.log_ring or {}, "\n") .. "\n"
+    end
+    local pid = tonumber(rest:match("^(%d+)"))
+    if not pid then return nil end
+    local snap = K.proc.snapshot()[pid]
+    if not snap then return nil end
+    local field = rest:match("^%d+/(.+)$")
+    if field == "status" then
+      return "Name:\t" .. snap.name .. "\nState:\t" .. snap.state ..
+        "\nPid:\t" .. pid .. "\nPPid:\t" .. snap.ppid ..
+        "\nUid:\t" .. snap.uid .. "\nPriority:\t" .. snap.priority .. "\n"
+    elseif field == "cmdline" then
+      return snap.name .. "\n"
+    elseif field == "fd" then
+      local lines = {}
+      for fd, f in pairs(snap.fds or {}) do
+        local target = f.path or f.type or "?"
+        lines[#lines + 1] = fd .. "\t" .. target
+      end
+      table.sort(lines, function(a, b)
+        return tonumber(a:match("^(%d+)")) < tonumber(b:match("^(%d+)"))
+      end)
+      return table.concat(lines, "\n") .. "\n"
+    elseif field == "mem" then
+      -- rough resident estimate: fds + env + stack
+      local n = 0
+      for _ in pairs(snap.fds or {}) do n = n + 1 end
+      return tostring(n * 4 + 16) .. "\n"
+    end
+    return nil
+  end
+
+  -- /sys: kernel info
+  local function sys_list(path)
+    if path == "/sys" then
+      return { "kernel", "net", "modules" }
+    elseif path == "/sys/kernel" then
+      return { "version", "scheduler", "quantum", "priority" }
+    elseif path == "/sys/net" then
+      return { "ip", "gateway", "netmask", "arp", "routes", "channel" }
+    end
+    return {}
+  end
+
+  local function sys_read(path)
+    local rest = path:match("^/sys/(.+)$")
+    if not rest then return nil end
+    if rest == "kernel/version" then
+      return "KNUCK " .. (K.selfcheck.craftos or "?") .. "\n"
+    elseif rest == "kernel/scheduler" then
+      return K.selfcheck.preempt and "preemptive\n" or "cooperative\n"
+    elseif rest == "kernel/quantum" then
+      return tostring(K.sched.QUANTUM) .. "\n"
+    elseif rest == "kernel/priority" then
+      return tostring(K.sched.default_priority or 0) .. "\n"
+    elseif rest == "modules" then
+      local parts = {}
+      for name in pairs(K.modules) do parts[#parts + 1] = name end
+      table.sort(parts)
+      return table.concat(parts, "\n") .. "\n"
+    elseif rest == "net/ip" then
+      return K.net.ip_to_str(K.net.ip) .. "\n"
+    elseif rest == "net/gateway" then
+      return K.net.ip_to_str(K.net.gateway) .. "\n"
+    elseif rest == "net/netmask" then
+      return K.net.ip_to_str(K.net.netmask) .. "\n"
+    elseif rest == "net/channel" then
+      return tostring(K.net.channel) .. "\n"
+    elseif rest == "net/arp" then
+      local parts = {}
+      for ip, e in pairs(K.net.arp_cache) do
+        parts[#parts + 1] = ip .. " = " .. K.net.mac_to_str(e.mac)
+      end
+      table.sort(parts)
+      return table.concat(parts, "\n") .. "\n"
+    elseif rest == "net/routes" then
+      local parts = {}
+      for _, route in ipairs(K.net.routes) do
+        parts[#parts + 1] = K.net.ip_to_str(route.dest) .. "/" .. K.net.ip_to_str(route.mask)
+          .. " gw " .. K.net.ip_to_str(route.gw) .. " metric " .. (route.metric or 0)
+      end
+      return table.concat(parts, "\n") .. "\n"
+    end
+    return nil
+  end
+
+  -- /sys writes: root-only (uid 0). Currently only /sys/net/* is writable.
+  local function sys_write(path, data)
+    local rest = path:match("^/sys/(.+)$")
+    if not rest then return nil, "read-only" end
+    local value = data:gsub("%s+$", "")
+    if rest == "kernel/quantum" then
+      local q = tonumber(value)
+      if not q or q < 1 then return nil, "invalid quantum" end
+      K.sched.QUANTUM = q
+      return #data
+    elseif rest == "kernel/priority" then
+      local p = tonumber(value)
+      if not p or p < -20 or p > 19 then return nil, "invalid priority" end
+      K.sched.default_priority = p
+      return #data
+    elseif rest == "modules" then
+      local cmd, arg = value:match("^(%S+)%s+(.+)$")
+      if cmd == "load" and arg then
+        local ok, mod = pcall(K.loader.load, arg, K)
+        if not ok then return nil, tostring(mod) end
+        local name = arg:match("([^/]+)%.lua$") or arg
+        K.modules[name] = mod
+        K.module_paths = K.module_paths or {}
+        K.module_paths[name] = arg
+        return #data
+      elseif cmd == "unload" and arg then
+        if not K.modules[arg] then return nil, "no such module" end
+        K.modules[arg] = nil
+        if K.module_paths and K.module_paths[arg] then
+          K.loader.unload(K.module_paths[arg])
+          K.module_paths[arg] = nil
+        end
+        return #data
+      end
+      return nil, "usage: load <path> | unload <name>"
+    elseif rest == "net/ip" then
+      local ip = K.net.str_to_ip(value)
+      if not ip then return nil, "invalid ip" end
+      K.net.ip = ip
+      return #data
+    elseif rest == "net/gateway" then
+      local gw = K.net.str_to_ip(value)
+      if not gw then return nil, "invalid gateway" end
+      K.net.gateway = gw
+      return #data
+    elseif rest == "net/netmask" then
+      local nm = K.net.str_to_ip(value)
+      if not nm then return nil, "invalid netmask" end
+      K.net.netmask = nm
+      return #data
+    elseif rest == "net/channel" then
+      local ch = tonumber(value)
+      if not ch then return nil, "invalid channel" end
+      K.net.channel = ch
+      if K.net.enabled then
+        K.net.modem.closeAll()
+        K.net.modem.open(ch)
+      end
+      return #data
+    elseif rest == "net/arp" then
+      -- static entry: "ip = mac"
+      local ip, mac = value:match("^(%d+%.%d+%.%d+%.%d+)%s*=%s*(%x+:%x+:%x+:%x+:%x+:%x+)$")
+      if not ip then return nil, "invalid arp entry" end
+      local ip4 = K.net.str_to_ip(ip)
+      local mac6 = K.net.str_to_mac(mac)
+      if not ip4 or not mac6 then return nil, "invalid arp entry" end
+      K.net.arp_cache[ip] = { mac = mac6, ttl = 0, static = true }
+      return #data
+    elseif rest == "net/routes" then
+      -- delete: "del dest/mask gw"
+      local del_dest, del_mask, del_gw = value:match(
+        "^del%s+(%d+%.%d+%.%d+%.%d+)%s*/%s*(%d+%.%d+%.%d+%.%d+)%s+gw%s+(%d+%.%d+%.%d+%.%d+)$")
+      if del_dest then
+        local d, m, g = K.net.str_to_ip(del_dest), K.net.str_to_ip(del_mask), K.net.str_to_ip(del_gw)
+        for i = #K.net.routes, 1, -1 do
+          local r = K.net.routes[i]
+          if r.dest == d and r.mask == m and r.gw == g then
+            table.remove(K.net.routes, i)
+            return #data
+          end
+        end
+        return nil, "route not found"
+      end
+      -- add: "dest/mask gw metric"
+      local dest_s, mask_s, gw_s, metric_s = value:match(
+        "^(%d+%.%d+%.%d+%.%d+)%s*/%s*(%d+%.%d+%.%d+%.%d+)%s+gw%s+(%d+%.%d+%.%d+%.%d+)%s*(.*)")
+      if not dest_s then return nil, "invalid route format" end
+      local dest, mask, gw = K.net.str_to_ip(dest_s), K.net.str_to_ip(mask_s), K.net.str_to_ip(gw_s)
+      if not dest or not mask or not gw then return nil, "invalid ip in route" end
+      K.net.routes[#K.net.routes + 1] = {
+        dest = dest, mask = mask, gw = gw, metric = tonumber(metric_s) or 0,
+      }
+      return #data
+    end
+    return nil, "read-only"
+  end
+
+  -- /dev: device nodes
+  local function dev_list()
+    local out = { "console", "null", "zero", "urandom", "input", "devctl", "periph", "peripherals" }
+    for name in pairs(devices) do
+      if name ~= "console" then out[#out + 1] = name end
+    end
+    return out
+  end
+
+  local function peripherals_list(path)
+    if path == "/dev/peripherals" then
+      local out = {}
+      -- side aliases
+      for _, side in ipairs(periph_sides()) do out[#out+1] = side end
+      -- type dirs (list all known plurals that currently have at least one device, plus keep empty dirs for discoverability)
+      local seen = {}
+      for _, side in ipairs(periph_sides()) do
+        local t = periph_type_of(side)
+        local pl = t and periph_type_plural[t]
+        if pl and not seen[pl] then seen[pl]=true; out[#out+1]=pl end
+      end
+      -- ensure well-known empty type dirs appear for enumeration (user spec: пустые диры если устройств не подключено)
+      for _, pl in ipairs({"monitors","printers","modems","drives","computers","turtles"}) do
+        if not seen[pl] then out[#out+1]=pl end
+      end
+      table.sort(out)
+      return out
+    end
+    local pl = path:match("^/dev/peripherals/([^/]+)$")
+    if pl then
+      local list = periph_devices_by_type(pl)
+      local out = {}
+      for i, side in ipairs(list) do
+        local base = pl:sub(1, -2) -- monitors->monitor
+        if pl == "monitors" then base="monitor"
+        elseif pl == "printers" then base="printer"
+        elseif pl == "modems" then base="modem"
+        elseif pl == "drives" then base="drive"
+        elseif pl == "computers" then base="computer"
+        elseif pl == "turtles" then base="turtle"
+        end
+        out[#out+1] = base..(i-1)
+      end
+      return out
+    end
+    return {}
+  end
+
+  -- ---- inode lookup for a canonical path ----
+
+  -- Get the inode for a canonical path (real or virtual)
+  function M.get_inode(path)
+    local m = M.find_mount(path)
+    if not m then return nil end
+    if m.fstype == "dev" then
+      if path == "/dev" then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      local name = path:match("^/dev/(.+)$")
+      if not name then return nil end
+      if name == "periph" then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      if name:match("^periph/") then
+        return { type = "device", mode = 0x1B6, uid = 0, gid = 0, nlink = 1, device = name }
+      end
+      if name == "peripherals" then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      if name:match("^peripherals/[^/]+/[^/]+$") then
+        -- type device: monitors/monitor0 etc.
+        local pl, dev = name:match("^peripherals/([^/]+)/([^/]+)$")
+        local side = side_for_typed(pl, dev)
+        if side then
+          return { type = "device", mode = 0x1B6, uid = 0, gid = 0, nlink = 1, device = "periph/"..side }
+        end
+        return nil
+      end
+      if name:match("^peripherals/[^/]+$") then
+        local sub = name:match("^peripherals/([^/]+)$")
+        -- side device ?
+        for _, side in ipairs(periph_sides()) do
+          if side == sub then
+            return { type = "device", mode = 0x1B6, uid = 0, gid = 0, nlink = 1, device = "periph/"..side }
+          end
+        end
+        -- type dir
+        if sub=="monitors" or sub=="printers" or sub=="modems" or sub=="drives" or sub=="computers" or sub=="turtles" or sub=="speakers" or sub=="energy" then
+          return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+        end
+        -- also allow any type that currently exists dynamically
+        for _, side in ipairs(periph_sides()) do
+          local t = periph_type_of(side)
+          if t and periph_type_plural[t]==sub then
+            return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+          end
+        end
+        return nil
+      end
+      if devices[name] then
+        local drv = devices[name]
+        return { type = "device", mode = drv.mode or 0x1B6, uid = 0, gid = 0, nlink = 1, device = name }
+      end
+      return nil
+    elseif m.fstype == "proc" then
+      if path == "/proc" then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      local rest = path:match("^/proc/(.+)$")
+      if not rest then return nil end
+      if rest:match("^%d+$") then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      if proc_read(path) then
+        return { type = "file", mode = 0x1A4, uid = 0, gid = 0, nlink = 1 }
+      end
+      return nil
+    elseif m.fstype == "sys" then
+      if path == "/sys" then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      if path == "/sys/net" or path == "/sys/kernel" then
+        return { type = "dir", mode = 0x1ED, uid = 0, gid = 0, nlink = 1 }
+      end
+      if sys_read(path) then
+        return { type = "file", mode = 0x1A4, uid = 0, gid = 0, nlink = 1 }
+      end
+      return nil
+    else
+      -- real-fs backed
+      return fs_mod.inode(path)
+    end
+  end
+
+  -- ---- top-level operations (called by syscalls) ----
+
+  -- stat a path -> table or nil
+  function M.stat(proc, path)
+    local p = M.resolve(proc, path)
+    local ino = M.get_inode(p)
+    if not ino then return nil, "no such file" end
+    return {
+      type = ino.type,
+      mode = ino.mode,
+      uid = ino.uid,
+      gid = ino.gid,
+      nlink = ino.nlink,
+      size = ino.size or 0,
+      path = p,
+    }
+  end
+
+  -- readdir a path -> list of {name, is_dir, ...} entries or nil
+  function M.readdir(proc, path)
+    local p = M.resolve(proc, path)
+    local m = M.find_mount(p)
+    if not m then return nil, "no such file" end
+    local ino = M.get_inode(p)
+    if not ino or ino.type ~= "dir" then return nil, "not a directory" end
+    if not fs_mod.check_access(proc, ino, "r") then return nil, "permission denied" end
+    local names
+    if m.fstype == "proc" then names = proc_list()
+    elseif m.fstype == "sys" then names = sys_list(p)
+    elseif m.fstype == "dev" then
+      if p == "/dev" then names = dev_list()
+      elseif p:match("^/dev/peripherals") then names = peripherals_list(p)
+      else names = {} end
+    else names = fs_mod.list(p) end
+    -- structured entries: {name, is_dir, type, mode, size}
+    local out = {}
+    for _, name in ipairs(names or {}) do
+      local child = M.normalize(p .. "/" .. name)
+      local cino = M.get_inode(child)
+      out[#out + 1] = {
+        name = name,
+        is_dir = (cino and cino.type == "dir") or false,
+        type = cino and cino.type or "file",
+        mode = cino and cino.mode or 0,
+        size = cino and cino.size or 0,
+      }
+    end
+    return out
+  end
+
+  -- open a path -> fd table or nil,err
+  function M.open(proc, path, flags, mode, on_open)
+    local p = M.resolve(proc, path)
+    local m = M.find_mount(p)
+    if not m then return nil, "no such file" end
+    local ino = M.get_inode(p)
+    local creating = flags and flags:find("w") ~= nil
+
+    if not ino then
+      if not creating then return nil, "no such file" end
+      -- create: check parent dir + permission
+      local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
+      local pino = M.get_inode(parent)
+      if not pino or pino.type ~= "dir" then return nil, "no such directory" end
+      if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
+      local h = fs_mod.open(p, "w")
+      if not h then return nil, "cannot create" end
+      h.close()
+      fs_mod.set_inode(p, { type = "file", mode = fs_mod.apply_umask(proc, mode or 0x1A4), uid = proc.uid, gid = proc.gid, nlink = 1, size = 0 })
+      ino = M.get_inode(p)
+    end
+
+    -- permission: read/write based on flags
+    local want = creating and "w" or "r"
+    if not fs_mod.check_access(proc, ino, want) then
+      return nil, "permission denied"
+    end
+
+    if ino.type == "device" then
+      if ino.device:match("^periph/") then
+        local side = ino.device:match("^periph/(.+)$")
+        return { type = "device", device = ino.device, driver = make_periph_driver(side), mode = flags or "r" }
+      end
+      local drv = devices[ino.device]
+      if not drv then return nil, "no such device" end
+      return { type = "device", device = ino.device, driver = drv, mode = flags or "r", path = p }
+    end
+
+    if ino.type == "fifo" then
+      local creating = flags and flags:find("w") ~= nil
+      if creating then
+        return K.ipc.fifo_open_write(proc, ino, on_open)
+      else
+        return K.ipc.fifo_open_read(proc, ino, on_open)
+      end
+    end
+
+    if m.fstype == "proc" or m.fstype == "sys" then
+      local data = (m.fstype == "proc") and proc_read(p) or sys_read(p)
+      return { type = "memfile", data = data or "", pos = 0, path = p }
+    end
+
+    -- real file
+    local handle = fs_mod.open(p, flags or "r")
+    if not handle then return nil, "cannot open" end
+    return { type = "file", handle = handle, path = p, mode = flags or "r", pos = 0 }
+  end
+
+  -- read from an fd
+  function M.read(proc, fd, n)
+    if not fd then return nil, "bad fd" end
+    if fd.type == "console" then
+      local drv = devices["console"]
+      if drv and drv.read then return drv.read(n) end
+      return nil
+    elseif fd.type == "pipe_r" then
+      return K.ipc.pipe_read(proc, fd, n)
+    elseif fd.type == "file" then
+      local data = fd.handle.read(n or 0)
+      return data
+    elseif fd.type == "memfile" then
+      local data = fd.data:sub(fd.pos + 1, fd.pos + (n or #fd.data))
+      fd.pos = fd.pos + #data
+      return data
+    elseif fd.type == "device" then
+      if fd.driver.read then return fd.driver.read(n) end
+      return nil
+    elseif fd.type == "socket" then
+      -- POSIX: read/write on connected STREAM sockets routes to recv/send
+      local s = fd.sock
+      if s.socktype == "stream" and (s.conn or s.tcp_conn) then
+        return K.ipc.socket_recv(proc, fd, n)
+      end
+      return nil, "unsupported fd"
+    end
+    return nil, "unsupported fd"
+  end
+
+  -- write to an fd
+  function M.write(proc, fd, data)
+    if not fd then return nil, "bad fd" end
+    if fd.type == "console" then
+      local drv = devices["console"]
+      if drv and drv.write then return drv.write(data) end
+      return nil, "no console driver"
+    elseif fd.type == "pipe_w" then
+      return K.ipc.pipe_write(proc, fd, data)
+    elseif fd.type == "file" then
+      fd.handle.write(data)
+      return #data
+    elseif fd.type == "memfile" then
+      if fd.path and fd.path:match("^/sys/") then
+        if proc.uid ~= 0 then return nil, "permission denied" end
+        return sys_write(fd.path, data)
+      end
+      return #data
+    elseif fd.type == "device" then
+      if fd.driver.write then return fd.driver.write(data) end
+      return nil
+    elseif fd.type == "socket" then
+      -- POSIX: write on connected STREAM sockets routes to send
+      local s = fd.sock
+      if s.socktype == "stream" and (s.conn or s.tcp_conn) then
+        return K.ipc.socket_send(proc, fd, data)
+      end
+      return nil, "unsupported fd"
+    end
+    return nil, "unsupported fd"
+  end
+
+  -- close an fd
+  function M.close(fd)
+    if not fd then return nil, "bad fd" end
+    if fd.type == "file" and fd.handle then
+      fd.handle.close()
+    end
+    return true
+  end
+
+  -- lseek
+  function M.lseek(fd, offset, whence)
+    if fd.type ~= "file" and fd.type ~= "memfile" then return nil, "not seekable" end
+    local base = 0
+    if whence == "cur" then base = fd.pos
+    elseif whence == "end" then base = #(fd.data or "") end
+    fd.pos = base + offset
+    return fd.pos
+  end
+
+  -- mkdir
+  function M.mkdir(proc, path, mode)
+    local p = M.resolve(proc, path)
+    local m = M.find_mount(p)
+    if not m or m.fstype ~= "disk" and m.fstype ~= "tmp" and m.fstype ~= "rom" then
+      return nil, "read-only or virtual"
+    end
+    if fs_mod.exists(p) then return nil, "exists" end
+    local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
+    local pino = M.get_inode(parent)
+    if not pino or pino.type ~= "dir" then return nil, "no such directory" end
+    if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
+    fs_mod.make_dir(p)
+    fs_mod.set_inode(p, { type = "dir", mode = fs_mod.apply_umask(proc, mode or 0x1ED), uid = proc.uid, gid = proc.gid, nlink = 1 })
+    return true
+  end
+
+  -- mkfifo
+  function M.mkfifo(proc, path, mode)
+    local p = M.resolve(proc, path)
+    local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
+    local pino = M.get_inode(parent)
+    if not pino or pino.type ~= "dir" then return nil, "no such directory" end
+    if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
+    local ino = K.ipc.fifo_create()
+    ino.mode = fs_mod.apply_umask(proc, mode or 0x1A4)
+    ino.uid = proc.uid
+    ino.gid = proc.gid
+    fs_mod.set_inode(p, ino)
+    return true
+  end
+
+  -- rmdir
+  function M.rmdir(proc, path)
+    local p = M.resolve(proc, path)
+    local ino = M.get_inode(p)
+    if not ino then return nil, "no such file" end
+    if ino.type ~= "dir" then return nil, "not a directory" end
+    if not fs_mod.check_access(proc, ino, "w") then return nil, "permission denied" end
+    local entries = M.readdir(proc, p)
+    if entries and #entries > 0 then return nil, "directory not empty" end
+    fs_mod.remove(p)
+    fs_mod.drop_inode(p)
+    return true
+  end
+
+  -- unlink
+  function M.unlink(proc, path)
+    local p = M.resolve(proc, path)
+    local ino = M.get_inode(p)
+    if not ino then return nil, "no such file" end
+    if ino.type == "dir" then return nil, "is a directory" end
+    if not fs_mod.check_access(proc, ino, "w") then return nil, "permission denied" end
+    fs_mod.remove(p)
+    fs_mod.drop_inode(p)
+    return true
+  end
+
+  -- rename
+  function M.rename(proc, old, new)
+    local o = M.resolve(proc, old)
+    local n = M.resolve(proc, new)
+    local ino = M.get_inode(o)
+    if not ino then return nil, "no such file" end
+    if not fs_mod.check_access(proc, ino, "w") then return nil, "permission denied" end
+    if not fs_mod.rename(o, n) then return nil, "rename failed" end
+    fs_mod.drop_inode(o)
+    fs_mod.set_inode(n, ino)
+    return true
+  end
+
+  -- chmod
+  function M.chmod(proc, path, mode)
+    local p = M.resolve(proc, path)
+    local ino = M.get_inode(p)
+    if not ino then return nil, "no such file" end
+    if proc.uid ~= 0 and proc.uid ~= ino.uid then return nil, "permission denied" end
+    ino.mode = K.bit.band(mode, 0xFFF)
+    return true
+  end
+
+  -- chown
+  function M.chown(proc, path, uid, gid)
+    local p = M.resolve(proc, path)
+    local ino = M.get_inode(p)
+    if not ino then return nil, "no such file" end
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    if uid then ino.uid = uid end
+    if gid then ino.gid = gid end
+    return true
+  end
+
+  -- symlink
+  function M.symlink(proc, target, path)
+    local p = M.resolve(proc, path)
+    local parent = p:match("^(.*)/[^/]+$")
+    if parent == "" then parent = "/" end
+    local pino = M.get_inode(parent)
+    if not pino or pino.type ~= "dir" then return nil, "no such directory" end
+    if not fs_mod.check_access(proc, pino, "w") then return nil, "permission denied" end
+    fs_mod.set_inode(p, { type = "symlink", target = target, mode = 0x1FF, uid = proc.uid, gid = proc.gid, nlink = 1 })
+    return true
+  end
+
+  -- readlink (must NOT follow the symlink itself)
+  function M.readlink(proc, path)
+    local p = path or ""
+    if p:sub(1, 1) ~= "/" then
+      p = (proc and proc.cwd or "/") .. "/" .. p
+    end
+    p = M.normalize(p)
+    local ino = fs_mod.get_inode(p)
+    if not ino or ino.type ~= "symlink" then return nil, "not a symlink" end
+    return ino.target
+  end
+
+  -- hardlink (fallback: copy content, share inode metadata)
+  function M.link(proc, old, new)
+    local o = M.resolve(proc, old)
+    local n = M.resolve(proc, new)
+    local ino = M.get_inode(o)
+    if not ino then return nil, "no such file" end
+    if ino.type == "dir" then return nil, "cannot hardlink directory" end
+    if not fs_mod.check_access(proc, ino, "r") then return nil, "permission denied" end
+    if not fs_mod.copy(o, n) then return nil, "link failed" end
+    fs_mod.set_inode(n, ino)
+    ino.nlink = (ino.nlink or 1) + 1
+    return true
+  end
+
+  -- chroot
+  function M.chroot(proc, path)
+    local p = M.resolve(proc, path)
+    local ino = M.get_inode(p)
+    if not ino or ino.type ~= "dir" then return nil, "not a directory" end
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    proc.root = p
+    proc.cwd = p
+    return true
+  end
+
+  -- mount
+  function M.mount(proc, source, target, fstype, flags)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    local t = M.normalize(target)
+    local fst = fstype or "disk"
+    local real = source or t
+    local ro = flags and flags:find("ro") ~= nil
+    mounts[t] = { fstype = fst, real_root = real, ro = ro }
+    return true
+  end
+
+  -- umount
+  function M.umount(proc, target)
+    if proc.uid ~= 0 then return nil, "permission denied" end
+    local t = M.normalize(target)
+    if t == "/" then return nil, "cannot unmount root" end
+    if not mounts[t] then return nil, "not mounted" end
+    mounts[t] = nil
+    return true
+  end
+
+  -- umask
+  function M.umask(proc, mask)
+    local old = proc.umask or 0x1B2
+    if mask then proc.umask = K.bit.band(mask, 0x1FF) end
+    return old
+  end
+
+  -- load a Lua file from VFS with an env (for process spawn)
+  -- mode=nil accepts both text and binary (string.dump'd bytecode) chunks.
+  function M.loadfile(path, env)
+    local f, err = loadfile(path, nil, env)
+    return f, err
+  end
+
+  return M
+end---END PKG---

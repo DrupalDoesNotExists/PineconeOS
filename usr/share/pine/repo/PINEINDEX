@@ -306,3 +306,12 @@ size:8912
 sha:94aeeaab
 file:shell-0.1.3.cone
 ---
+pkg:knuck
+version:1.0.11
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2) — add boot.lua, vfs peripherals virtual dir, tty scroll 1-line Up/Down, sched starvation guard
+size:185158
+sha:5f31e65e
+file:knuck-1.0.11.cone
+---
