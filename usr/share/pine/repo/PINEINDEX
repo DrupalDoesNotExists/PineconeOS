@@ -5,7 +5,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:authutils (1.0.0)
 size:5612
-sha:1c144f16
+sha:d4aca305
 file:authutils-1.0.0.pine
 ---
 pkg:chroot
@@ -14,7 +14,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:chroot (1.0.0)
 size:1259
-sha:d2320f0f
+sha:eeadb3a9
 file:chroot-1.0.0.pine
 ---
 pkg:coreutils
@@ -23,7 +23,7 @@ arch:any
 deps:
 desc:coreutils (1.0.0)
 size:12493
-sha:5dd268eb
+sha:0545636f
 file:coreutils-1.0.0.pine
 ---
 pkg:dhcp
@@ -32,7 +32,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:dhcp (1.0.0)
 size:7260
-sha:42431e82
+sha:85170416
 file:dhcp-1.0.0.pine
 ---
 pkg:fileutils
@@ -41,7 +41,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:fileutils (1.0.0)
 size:5043
-sha:602a88ef
+sha:41446aed
 file:fileutils-1.0.0.pine
 ---
 pkg:kmod
@@ -50,7 +50,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:kmod (1.0.0)
 size:1753
-sha:fe1189a4
+sha:dfb4daad
 file:kmod-1.0.0.pine
 ---
 pkg:knuck
@@ -59,7 +59,7 @@ arch:any
 deps:
 desc:KNUCK microkernel (Lua 5.2)
 size:158960
-sha:5f55e9bd
+sha:af7152fd
 file:knuck-0.1.0.pine
 ---
 pkg:knuck
@@ -68,7 +68,7 @@ arch:any
 deps:
 desc:KNUCK microkernel (includes all kernel modules)
 size:108178
-sha:159b174c
+sha:c3c3ee87
 file:knuck-0.1.1.pine
 ---
 pkg:knuck-icmp
@@ -77,7 +77,7 @@ arch:any
 deps:knuck@>=0.1.0
 desc:knuck-icmp (1.0.0)
 size:9865
-sha:2e15e183
+sha:eb026f07
 file:knuck-icmp-1.0.0.pine
 ---
 pkg:login
@@ -86,7 +86,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:login (1.0.0)
 size:1083
-sha:5c79ec41
+sha:c1109fe3
 file:login-1.0.0.pine
 ---
 pkg:man
@@ -95,7 +95,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:man (1.0.0)
 size:2131
-sha:3ee683c2
+sha:e104f693
 file:man-1.0.0.pine
 ---
 pkg:mount
@@ -104,7 +104,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:mount (1.0.0)
 size:2401
-sha:8dc57da3
+sha:8592dab9
 file:mount-1.0.0.pine
 ---
 pkg:nano
@@ -113,7 +113,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:nano (1.0.0)
 size:5848
-sha:88f0953a
+sha:3612d213
 file:nano-1.0.0.pine
 ---
 pkg:netutils
@@ -122,16 +122,16 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:netutils (1.0.0)
 size:17110
-sha:7a3a2dfd
+sha:c5746e7e
 file:netutils-1.0.0.pine
 ---
 pkg:pine
 version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
-desc:pine (1.0.0)
-size:20767
-sha:529ec8c9
+desc:PineconeOS package manager
+size:22722
+sha:00115503
 file:pine-1.0.0.pine
 ---
 pkg:procutils
@@ -140,7 +140,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:procutils (1.0.0)
 size:8702
-sha:468a8958
+sha:ca9a2749
 file:procutils-1.0.0.pine
 ---
 pkg:rv32emu
@@ -149,7 +149,7 @@ arch:any
 deps:
 desc:rv32emu (0.1.0)
 size:21779
-sha:f36b8ce1
+sha:676b5e5e
 file:rv32emu-0.1.0.pine
 ---
 pkg:shell
@@ -158,7 +158,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:shell (0.1.0)
 size:4416
-sha:6b5284ad
+sha:865835fd
 file:shell-0.1.0.pine
 ---
 pkg:specutils
@@ -167,7 +167,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:specutils (1.0.0)
 size:4738
-sha:b8669b26
+sha:2922fbc8
 file:specutils-1.0.0.pine
 ---
 pkg:textutils
@@ -176,7 +176,7 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:textutils (1.0.0)
 size:14230
-sha:f21cdff8
+sha:11624c42
 file:textutils-1.0.0.pine
 ---
 pkg:vi
@@ -185,6 +185,6 @@ arch:any
 deps:coreutils@>=1.0.0
 desc:vi (1.0.0)
 size:9383
-sha:ca3b95eb
+sha:c5a677b7
 file:vi-1.0.0.pine
 ---

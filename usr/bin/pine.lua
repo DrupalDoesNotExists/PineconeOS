@@ -16,13 +16,18 @@ local CONF_DIR   = "/var/lib/pine/conffiles"
 local STAGE_DIR  = "/var/lib/pine/stage"
 local REPO_INDEX = "/usr/share/pine/repo/PINEINDEX"
 local REPO_DIR   = "/usr/share/pine/repo"
+local REPO_BASE  = "https://raw.githubusercontent.com/DrupalDoesNotExists/PineconeOS-distrorepo/master"
 local LOCK_DIR   = "/var/lib/pine/lock"
 local SEP = ","
 
 -- ---- flags ----
-local flag_force   = false
-local flag_nohook  = false
-local flag_dryrun  = false
+local flag_force     = false
+local flag_nohook    = false
+local flag_dryrun    = false
+local flag_keepcache = false
+
+-- Track which .pine files were fetched this session (for cleanup after install)
+local fetched_pines = {}
 
 local function parse_flags()
   local filtered = {}
@@ -30,6 +35,7 @@ local function parse_flags()
     if a == "--force" then flag_force = true
     elseif a == "--no-hooks" then flag_nohook = true
     elseif a == "--dry-run" then flag_dryrun = true
+    elseif a == "--keep-cache" then flag_keepcache = true
     else filtered[#filtered + 1] = a
     end
   end
@@ -452,7 +458,43 @@ local function find_repo_pkg(name, version)
   if not file_exists(path) then
     return nil, "pine file not found for " .. name
   end
-  return path
+  return path, false
+end
+
+-- Download .pine from remote repo via HTTP, save to REPO_DIR
+-- Returns (path, was_fetched) or (nil, error)
+local function fetch_pine_http(name, version)
+  local index = load_repo_index()
+  local pkg = index[name]
+  if not pkg then return nil, "package " .. name .. " not found in repo index" end
+
+  local filename = pkg.file or (name .. "-" .. pkg.version .. ".pine")
+  local url = REPO_BASE .. "/" .. filename
+
+  if not http then return nil, "HTTP API not available" end
+
+  msg("fetching " .. filename .. " from repo...")
+  local ok, resp = pcall(http.get, url)
+  if not ok or not resp then
+    return nil, "failed to download " .. filename
+  end
+
+  local data = resp.readAll()
+  resp.close()
+
+  if not data or #data == 0 then
+    return nil, "downloaded package is empty"
+  end
+
+  -- Save to REPO_DIR
+  mkdir_p(REPO_DIR)
+  local path = REPO_DIR .. "/" .. filename
+  if not write_file(path, data) then
+    return nil, "failed to write " .. path
+  end
+
+  fetched_pines[path] = true
+  return path, true
 end
 
 -- ---- hooks ----
@@ -513,9 +555,16 @@ end
 
 -- ---- install ----
 
+local install_depth = 0  -- track recursive depth for cleanup
+
 local function do_install(target, resolved_set)
   resolved_set = resolved_set or {}
   local name, version, force_dep
+
+  install_depth = install_depth + 1
+  local depth_at_entry = install_depth
+
+  local ok, install_err = pcall(function()
 
   -- determine if target is a .pine file or a package name
   if target:match("%.pine$") then
@@ -654,10 +703,32 @@ local function do_install(target, resolved_set)
       end
     end
 
+    -- Try local cache first, then fetch from remote
     local pine_path, find_err = find_repo_pkg(target)
-    if not pine_path then die(tostring(find_err)) end
+    if not pine_path then
+      -- Not cached locally — fetch via HTTP
+      local fetch_path, fetch_err = fetch_pine_http(target)
+      if not fetch_path then
+        die(tostring(fetch_err or find_err))
+      end
+      pine_path = fetch_path
+    end
     do_install(pine_path, resolved_set)
   end
+
+  end) -- end pcall
+
+  install_depth = install_depth - 1
+
+  -- At top-level install: clean up fetched .pine files (unless --keep-cache)
+  if depth_at_entry == 1 and not flag_keepcache then
+    for path, _ in pairs(fetched_pines) do
+      unlink(path)
+    end
+    fetched_pines = {}
+  end
+
+  if not ok then error(install_err, 0) end
 end
 
 -- ---- remove ----
@@ -867,6 +938,25 @@ local function do_upgrade(target)
   end
 end
 
+-- ---- clean ----
+
+local function do_clean()
+  local entries = readdir(REPO_DIR)
+  if not entries then
+    msg("repo dir not found or empty")
+    return
+  end
+  local removed = 0
+  for _, e in ipairs(entries) do
+    if e.name:match("%.pine$") and e.name ~= "PINEINDEX" then
+      local path = REPO_DIR .. "/" .. e.name
+      unlink(path)
+      removed = removed + 1
+    end
+  end
+  msg("cleaned " .. removed .. " cached package(s) from " .. REPO_DIR)
+end
+
 -- ---- usage ----
 
 local function usage()
@@ -881,10 +971,12 @@ local function usage()
   write(1, "  search <pattern>         Search repo for packages\n")
   write(1, "  update                   Update repo index\n")
   write(1, "  upgrade [name]           Upgrade package(s)\n")
+  write(1, "  clean                    Delete cached .pine files (keeps PINEINDEX)\n")
   write(1, "Options:\n")
   write(1, "  --force                  Force operation\n")
   write(1, "  --no-hooks               Skip pre/post install/remove hooks\n")
   write(1, "  --dry-run                Show what would happen without doing it\n")
+  write(1, "  --keep-cache             Retain .pine files after install\n")
 end
 
 -- ---- main dispatch ----
@@ -915,6 +1007,8 @@ local ok, res = pcall(function()
     do_update()
   elseif cmd == "upgrade" then
     do_upgrade(args[2])
+  elseif cmd == "clean" then
+    do_clean()
   else
     usage()
   end
