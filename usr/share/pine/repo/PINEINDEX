@@ -1,4 +1,13 @@
 ---PINEINDEX v1---
+pkg:libbase
+version:1.0.0
+arch:any
+deps:
+desc:libbase (1.0.0)
+size:5774
+sha:f4c3f486
+file:libbase-1.0.0.cone
+---
 pkg:authutils
 version:1.0.0
 arch:any
