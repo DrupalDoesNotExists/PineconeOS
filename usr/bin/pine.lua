@@ -318,6 +318,17 @@ local function list_installed()
     end
   end
   table.sort(pkgs)
+  if #pkgs == 0 then
+    -- fallback for fresh image: DB not yet seeded but base packages are already extracted via installer
+    -- consider core packages as installed if their repo entry exists
+    local ok, index = pcall(load_repo_index)
+    if ok and index then
+      for _, name in ipairs({"knuck","pine","shell","coreutils","login"}) do
+        if index[name] then pkgs[#pkgs+1]=name end
+      end
+      table.sort(pkgs)
+    end
+  end
   return pkgs
 end
 
@@ -754,8 +765,12 @@ local function do_install(target, resolved_set)
       end
     end
 
-    -- Try local cache first, then fetch from remote
+    -- Try local cache first, then fetch from remote (refresh index if needed)
     local pine_path, find_err = find_repo_pkg(target)
+    if not pine_path then
+      fetch_repo_index()
+      pine_path, find_err = find_repo_pkg(target)
+    end
     if not pine_path then
       -- Not cached locally — fetch via HTTP
       local fetch_path, fetch_err = fetch_cone_http(target)
@@ -981,9 +996,9 @@ end
 
 local function do_update()
   -- fetch remote PINEINDEX if HTTP available
-  local ok, err = fetch_repo_index()
+  local ok, ferr = fetch_repo_index()
   if not ok then
-    err("could not fetch remote index: " .. tostring(err or "unknown"))
+    err("could not fetch remote index: " .. tostring(ferr or "unknown"))
   end
   -- re-read the (possibly updated) index
   local index = load_repo_index()

@@ -268,43 +268,10 @@ source_file("/etc/profile")
 local home = getenv("HOME")
 if home then source_file(home .. "/.shrc") end
 
--- ---- history ----
-local HIST_MAX = 200
-local hist = {}
-local function hist_path()
-  local h = getenv("HOME")
-  if h and h ~= "" then return h .. "/.sh_history" end
-  return "/.sh_history"
-end
-local function load_history()
-  local p = hist_path()
-  local f = open(p, "r")
-  if not f then return end
-  local data = read(f, 1048576)
-  close(f)
-  if not data then return end
-  for line in (data .. "\n"):gmatch("(.-)\n") do
-    if line ~= "" then hist[#hist+1]=line end
-  end
-  while #hist > HIST_MAX do table.remove(hist,1) end
-end
-local function save_history(line)
-  if not line or line:gsub("%s+","")=="" then return end
-  hist[#hist+1]=line
-  if #hist > HIST_MAX then table.remove(hist,1) end
-  local p = hist_path()
-  local f = open(p, "a")
-  if not f then f = open(p, "w") end
-  if f then write(f, line.."\n"); close(f) end
-end
-load_history()
-
 local use_raw = ioctl(0, "TCSETS", "raw") or ioctl(0, "console_mode", "raw")
 local function read_line_raw(prompt)
   write(1, prompt)
   local buf = ""
-  local hidx = #hist + 1
-  local saved = ""
   while true do
     local ev = read(0, 1)
     if ev == nil then
@@ -328,23 +295,6 @@ local function read_line_raw(prompt)
         elseif k == 28 or k == 13 or k == 257 then
           write(1, "\n")
           return buf
-        elseif k == 200 then
-          if #hist>0 and hidx > 1 then
-            if hidx == #hist+1 then saved = buf end
-            local old = buf
-            hidx = hidx - 1
-            buf = hist[hidx] or ""
-            for i=1,#old do write(1, "\b \b") end
-            write(1, buf)
-          end
-        elseif k == 208 then
-          if hidx <= #hist then
-            local old = buf
-            hidx = hidx + 1
-            if hidx == #hist+1 then buf = saved else buf = hist[hidx] or "" end
-            for i=1,#old do write(1, "\b \b") end
-            write(1, buf)
-          end
         end
       end
     elseif type(ev) == "string" then
@@ -363,7 +313,6 @@ if use_raw then
   while true do
     local line = read_line_raw(prompt_str())
     if not line then break end
-    if line:gsub("%s+","") ~= "" then save_history(line) end
     run_line(line)
   end
 else
@@ -371,7 +320,6 @@ else
     write(1, getcwd_str() .. "> ")
     local line = read(0, 4096)
     if not line then break end
-    if line:gsub("%s+","") ~= "" then save_history(line) end
     run_line(line)
   end
 end
