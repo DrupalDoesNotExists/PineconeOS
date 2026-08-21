@@ -76,8 +76,8 @@ version:1.0.5
 arch:any
 deps:
 desc:KNUCK microkernel (Lua 5.2) — fix TIOCSCTTY tty bind, sched starvation guard, FNV-1a password hashing
-size:175359
-sha:d0b43e3c
+size:116218
+sha:5fbb5929
 file:knuck-1.0.5.cone
 ---
 pkg:knuck-icmp
