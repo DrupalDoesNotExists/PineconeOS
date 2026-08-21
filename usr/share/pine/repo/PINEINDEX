@@ -54,21 +54,12 @@ sha:dfb4daad
 file:kmod-1.0.0.pine
 ---
 pkg:knuck
-version:0.1.0
-arch:any
-deps:
-desc:KNUCK microkernel (Lua 5.2)
-size:158960
-sha:af7152fd
-file:knuck-0.1.0.pine
----
-pkg:knuck
 version:0.1.1
 arch:any
 deps:
 desc:KNUCK microkernel (includes all kernel modules)
-size:108178
-sha:c3c3ee87
+size:112594
+sha:ed7b7c2b
 file:knuck-0.1.1.pine
 ---
 pkg:knuck-icmp
