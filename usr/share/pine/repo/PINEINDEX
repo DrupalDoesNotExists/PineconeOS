@@ -197,3 +197,12 @@ size:2679
 sha:49664f9c
 file:libhttp-1.0.0.cone
 ---
+pkg:knuck
+version:1.0.2
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2)
+size:135267
+sha:bfed81db
+file:knuck-1.0.2.cone
+---
