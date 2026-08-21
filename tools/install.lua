@@ -574,16 +574,16 @@ end
 
   getty = [=[
 #!/usr/bin/env lua
--- Getty: login prompt on console (auth via login)
--- Clears boot noise, then loops: spawn login, wait, clear, repeat.
+-- Getty: allocates tty2 for login as real Linux (init detached, getty creates tty)
+settty(2)
 clear()
-write(1, "PineconeOS (KNUCK)\n\n")
+write(1, "PineconeOS (KNUCK) tty2\n\n")
 while true do
   local pid = spawn("/usr/bin/login.lua")
   if pid then waitpid(pid) end
   sleep(1)
   clear()
-  write(1, "PineconeOS (KNUCK)\n\n")
+  write(1, "PineconeOS (KNUCK) tty2\n\n")
 end
 ]=],
 
