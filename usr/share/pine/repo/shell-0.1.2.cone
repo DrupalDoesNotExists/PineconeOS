@@ -1,3 +1,20 @@
+---PINEPKG v1---
+name=shell
+version=0.1.2
+arch=any
+maintainer=pine@pineconeos.dev
+description=shell (0.1.2) - history ring 200 Up/Down persist ~/.sh_history, scrollback 500 Shift+PageUp/PageDown
+license=MIT
+deps=coreutils@>=1.0.0
+provides=
+conffiles=
+preinst=
+postinst=
+prerem=
+postrem=
+files=1
+---END MANIFEST---
+---FILE /usr/bin/sh.lua 0755 10233 486fa0a8 src---
 --[[
   PineconeOS shell (sh) — xv6 sh port
   ===================================
@@ -375,3 +392,4 @@ else
     run_line(line)
   end
 end
+---END PKG---

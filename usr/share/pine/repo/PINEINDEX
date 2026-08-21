@@ -278,3 +278,13 @@ size:32073
 sha:1874cc23
 file:pine-1.0.2.cone
 ---
+
+pkg:shell
+version:0.1.2
+arch:any
+deps:coreutils@>=1.0.0
+desc:shell (0.1.2) - history ring 200 + scrollback 500 Shift+PgUp/PgDn
+size:10612
+sha:3bf36df3
+file:shell-0.1.2.cone
+---
