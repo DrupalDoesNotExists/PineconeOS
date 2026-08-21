@@ -353,10 +353,12 @@ local function download_and_extract(pkg_name, pkg_info)
   -- Extract files
   msg("Extracting " .. #pkg.files .. " files...")
   -- Ensure critical directories exist (defense-in-depth)
-  mkdir_p("/lib")
-  mkdir_p("/lib/knuck")
-  mkdir_p("/lib/knuck/kernel")
-  mkdir_p("/lib/knuck/kernel/drivers")
+  mkdir_p(INSTALL_ROOT .. "/etc")
+  mkdir_p(INSTALL_ROOT .. "/etc/sv")
+  mkdir_p(INSTALL_ROOT .. "/lib")
+  mkdir_p(INSTALL_ROOT .. "/lib/knuck")
+  mkdir_p(INSTALL_ROOT .. "/lib/knuck/kernel")
+  mkdir_p(INSTALL_ROOT .. "/lib/knuck/kernel/drivers")
   for _, f in ipairs(pkg.files) do
     local target = INSTALL_ROOT .. f.path
     local ok = write_file(target, f.content)
