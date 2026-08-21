@@ -7,7 +7,7 @@
 ]]
 
 -- ---- args ----
-local args = {}
+local args = {...}
 for i = 1, select("#", ...) do args[i] = select(i, ...) end
 
 -- ---- constants ----
@@ -1077,9 +1077,13 @@ local function do_rebuild_db()
   end
   local count = 0
   for name, pkg in pairs(index) do
-    local path, ferr = fetch_cone_http(name, pkg.version)
+    local path, ferr = find_repo_pkg(name, pkg.version)
     if not path then
-      warn("rebuild-db: could not fetch " .. name .. ": " .. tostring(ferr))
+      -- fallback to HTTP fetch if not present in local repo cache
+      path, ferr = fetch_cone_http(name, pkg.version)
+    end
+    if not path then
+      warn("rebuild-db: could not find " .. name .. ": " .. tostring(ferr))
     else
       local cone, perr = read_cone_file(path)
       if not cone then
