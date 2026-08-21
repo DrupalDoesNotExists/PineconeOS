@@ -188,3 +188,12 @@ size:9383
 sha:c5a677b7
 file:vi-1.0.0.cone
 ---
+pkg:libhttp
+version:1.0.0
+arch:any
+deps:libbase@>=1.0.0
+desc:HTTP client over AF_MODEM/TCP (uses libbase)
+size:2679
+sha:49664f9c
+file:libhttp-1.0.0.cone
+---
