@@ -11,7 +11,7 @@
     2. Fetch PINEINDEX from distrorepo
     3. Download and extract core packages
     4. Set up /boot/knuck.conf
-    5. Install /sbin/init.lua (not in any .pine package)
+    5. Install /sbin/init.lua (not in any .cone package)
     6. Write /startup boot entry
     7. Offer reboot
 ]]
@@ -20,7 +20,9 @@
 -- Configuration
 -- ============================================================
 
-local REPO_BASE = "https://raw.githubusercontent.com/DrupalDoesNotExists/PineconeOS-distrorepo/master"
+local PINE_CONF = "/etc/pine.conf"
+local REPO_BASE_DEFAULT = "https://raw.githubusercontent.com/DrupalDoesNotExists/PineconeOS-distrorepo/master"
+local REPO_BASE = REPO_BASE_DEFAULT
 local INDEX_URL = REPO_BASE .. "/PINEINDEX"
 local INSTALL_ROOT = ""  -- empty = install to computer root
 local CORE_PACKAGES = {
@@ -93,10 +95,40 @@ local function write_file(path, data)
   local dir = path:match("^(.+)/[^/]+$")
   if dir then mkdir_p(dir) end
   local h = fs.open(path, "wb")
-  if not h then return false end
+  if not h then
+    err("write_file: cannot open " .. path)
+    return false
+  end
   h.write(data)
   h.close()
+  -- Verify write succeeded
+  if not fs.exists(path) then
+    err("write_file: " .. path .. " not found after write")
+    return false
+  end
   return true
+end
+
+-- ============================================================
+-- Config: read /etc/pine.conf if present
+-- ============================================================
+
+do
+  local conf_path = INSTALL_ROOT .. PINE_CONF
+  local h = fs.open(conf_path, "r")
+  if h then
+    local data = h.readAll()
+    h.close()
+    if data then
+      for line in (data .. "\n"):gmatch("([^\n]*)\n") do
+        local k, v = line:match("^([A-Z_]+)%s*=%s*(.+)$")
+        if k == "REPO_BASE" and v ~= "" then
+          REPO_BASE = v
+          INDEX_URL = REPO_BASE .. "/PINEINDEX"
+        end
+      end
+    end
+  end
 end
 
 -- ============================================================
@@ -181,7 +213,23 @@ local function fetch_index()
     end
     if pkg.pkg then
       pkg.name = pkg.pkg
-      packages[pkg.name] = pkg
+      -- If duplicate name, keep the higher version (not just last-wins)
+      local existing = packages[pkg.name]
+      if existing and existing.version and pkg.version then
+        local function parse_ver(v)
+          local a, b, c = v:match("^(%d+)%.(%d+)%.(%d+)$")
+          if a then return tonumber(a), tonumber(b), tonumber(c) end
+          return 0, 0, 0
+        end
+        local ea, eb, ec = parse_ver(existing.version)
+        local na, nb, nc = parse_ver(pkg.version)
+        if na > ea or (na == ea and nb > eb) or (na == ea and nb == eb and nc > ec) then
+          packages[pkg.name] = pkg  -- new version is higher, replace
+        end
+        -- else keep existing (higher or equal)
+      else
+        packages[pkg.name] = pkg
+      end
     end
   end
 
@@ -193,11 +241,11 @@ local function fetch_index()
 end
 
 -- ============================================================
--- Step 3: Download and extract .pine packages
+-- Step 3: Download and extract .cone packages
 -- ============================================================
 
--- Parse the .pine format (length-prefixed binary)
-local function parse_pine(data)
+-- Parse the .cone format (length-prefixed binary)
+local function parse_cone(data)
   local manifest = {}
   local files = {}
   local pos = 1
@@ -272,7 +320,7 @@ end
 
 local function download_and_extract(pkg_name, pkg_info)
   local version = pkg_info.version
-  local filename = pkg_info.file or (pkg_name .. "-" .. version .. ".pine")
+  local filename = pkg_info.file or (pkg_name .. "-" .. version .. ".cone")
   local url = REPO_BASE .. "/" .. filename
 
   msg("Downloading " .. pkg_name .. " " .. version .. "...")
@@ -291,7 +339,7 @@ local function download_and_extract(pkg_name, pkg_info)
   end
 
   msg("Parsing " .. filename .. "...")
-  local pkg, parse_err = parse_pine(data)
+  local pkg, parse_err = parse_cone(data)
   if not pkg then
     err("Parse error in " .. filename .. ": " .. tostring(parse_err))
     return false
@@ -308,9 +356,14 @@ local function download_and_extract(pkg_name, pkg_info)
   mkdir_p("/lib")
   mkdir_p("/lib/knuck")
   mkdir_p("/lib/knuck/kernel")
+  mkdir_p("/lib/knuck/kernel/drivers")
   for _, f in ipairs(pkg.files) do
     local target = INSTALL_ROOT .. f.path
-    write_file(target, f.content)
+    local ok = write_file(target, f.content)
+    if not ok then
+      err("FAILED to write " .. target)
+      return false
+    end
   end
 
   -- Run postinst hook if present
@@ -396,7 +449,23 @@ init /sbin/init.lua
 end
 
 -- ============================================================
--- Step 6: Install /sbin/init.lua (not in any .pine package)
+-- Step 5b: Write /etc/pine.conf
+-- ============================================================
+
+local function write_pine_conf()
+  header("Writing package manager config")
+
+  local conf = "# Pine package manager configuration\nREPO_BASE=" .. REPO_BASE .. "\n"
+
+  local path = INSTALL_ROOT .. PINE_CONF
+  msg("Writing " .. path .. "...")
+  write_file(path, conf)
+  success("pine config written")
+  return true
+end
+
+-- ============================================================
+-- Step 6: Install /sbin/init.lua (not in any .cone package)
 -- ============================================================
 
 local INIT_SOURCE = [=[
@@ -603,7 +672,13 @@ local function main()
     return
   end
 
-  -- Step 6a: Install init (not in any .pine package)
+  -- Step 5b: Write pine config
+  if not write_pine_conf() then
+    err("Failed to write pine config.")
+    return
+  end
+
+  -- Step 6a: Install init (not in any .cone package)
   if not write_init() then
     err("Failed to install init process.")
     return

@@ -1,7 +1,7 @@
 --[[
   PineconeOS package manager (pine)
   ================================
-  Line-based .pine format. Minimal DB. Bytecode support.
+  Line-based .cone format. Minimal DB. Bytecode support.
   Runs as system process with load/io/os available.
   Uses syscall wrappers for file I/O.
 ]]
@@ -16,9 +16,28 @@ local CONF_DIR   = "/var/lib/pine/conffiles"
 local STAGE_DIR  = "/var/lib/pine/stage"
 local REPO_INDEX = "/usr/share/pine/repo/PINEINDEX"
 local REPO_DIR   = "/usr/share/pine/repo"
-local REPO_BASE  = "https://raw.githubusercontent.com/DrupalDoesNotExists/PineconeOS-distrorepo/master"
+local PINE_CONF  = "/etc/pine.conf"
+local REPO_BASE_DEFAULT = "https://raw.githubusercontent.com/DrupalDoesNotExists/PineconeOS-distrorepo/master"
+local REPO_BASE  = REPO_BASE_DEFAULT
 local LOCK_DIR   = "/var/lib/pine/lock"
 local SEP = ","
+
+-- ---- config ----
+do
+  local fd = open(PINE_CONF, "r")
+  if fd then
+    local data = read(fd, 4096)
+    close(fd)
+    if data then
+      for line in (data .. "\n"):gmatch("([^\n]*)\n") do
+        local k, v = line:match("^([A-Z_]+)%s*=%s*(.+)$")
+        if k == "REPO_BASE" and v ~= "" then
+          REPO_BASE = v
+        end
+      end
+    end
+  end
+end
 
 -- ---- flags ----
 local flag_force     = false
@@ -26,8 +45,8 @@ local flag_nohook    = false
 local flag_dryrun    = false
 local flag_keepcache = false
 
--- Track which .pine files were fetched this session (for cleanup after install)
-local fetched_pines = {}
+-- Track which .cone files were fetched this session (for cleanup after install)
+local fetched_cones = {}
 
 local function parse_flags()
   local filtered = {}
@@ -299,7 +318,7 @@ local function is_installed(name)
   return file_exists(db_path(name))
 end
 
--- ---- .pine parsing (length-prefixed binary-safe) ----
+-- ---- .cone parsing (length-prefixed binary-safe) ----
 
 local function parse_pine(data)
   local manifest = {}
@@ -390,8 +409,8 @@ local function parse_pine(data)
   }
 end
 
--- read and parse a .pine file
-local function read_pine_file(path)
+-- read and parse a .cone file
+local function read_cone_file(path)
   local data = read_all(path)
   if not data then return nil, "cannot read " .. path end
   return parse_pine(data)
@@ -429,7 +448,7 @@ local function load_repo_index()
   return parse_repo_index(data)
 end
 
--- find .pine file path for a package from repo
+-- find .cone file path for a package from repo
 local function find_repo_pkg(name, version)
   local index = load_repo_index()
   local pkg = index[name]
@@ -440,15 +459,15 @@ local function find_repo_pkg(name, version)
       return nil, "repo version " .. pkg.version .. " does not match required " .. version
     end
   end
-  -- look for the .pine file in REPO_DIR
-  local pine_file = pkg.file or (name .. "-" .. pkg.version .. ".pine")
-  local path = REPO_DIR .. "/" .. pine_file
+  -- look for the .cone file in REPO_DIR
+  local cone_file = pkg.file or (name .. "-" .. pkg.version .. ".cone")
+  local path = REPO_DIR .. "/" .. cone_file
   if not file_exists(path) then
-    -- try name-version.pine pattern
+    -- try name-version.cone pattern
     local entries = readdir(REPO_DIR)
     if entries then
       for _, e in ipairs(entries) do
-        if e.name:match("^" .. name:gsub("%-", "%%-") .. "%-.*%.pine$") then
+        if e.name:match("^" .. name:gsub("%-", "%%-") .. "%-.*%.cone$") then
           path = REPO_DIR .. "/" .. e.name
           break
         end
@@ -456,19 +475,27 @@ local function find_repo_pkg(name, version)
     end
   end
   if not file_exists(path) then
-    return nil, "pine file not found for " .. name
+    -- backward compat: try .pine extension
+    local pine_file = pkg.file and pkg.file:gsub("%.cone$", ".pine") or (name .. "-" .. pkg.version .. ".pine")
+    local pine_path = REPO_DIR .. "/" .. pine_file
+    if file_exists(pine_path) then
+      path = pine_path
+    end
+  end
+  if not file_exists(path) then
+    return nil, "cone file not found for " .. name
   end
   return path, false
 end
 
--- Download .pine from remote repo via HTTP, save to REPO_DIR
+-- Download .cone from remote repo via HTTP, save to REPO_DIR
 -- Returns (path, was_fetched) or (nil, error)
-local function fetch_pine_http(name, version)
+local function fetch_cone_http(name, version)
   local index = load_repo_index()
   local pkg = index[name]
   if not pkg then return nil, "package " .. name .. " not found in repo index" end
 
-  local filename = pkg.file or (name .. "-" .. pkg.version .. ".pine")
+  local filename = pkg.file or (name .. "-" .. pkg.version .. ".cone")
   local url = REPO_BASE .. "/" .. filename
 
   if not http then return nil, "HTTP API not available" end
@@ -493,7 +520,7 @@ local function fetch_pine_http(name, version)
     return nil, "failed to write " .. path
   end
 
-  fetched_pines[path] = true
+  fetched_cones[path] = true
   return path, true
 end
 
@@ -566,10 +593,10 @@ local function do_install(target, resolved_set)
 
   local ok, install_err = pcall(function()
 
-  -- determine if target is a .pine file or a package name
-  if target:match("%.pine$") then
+  -- determine if target is a .cone/.pine file or a package name
+  if target:match("%.cone$") or target:match("%.pine$") then
     -- local file
-    local pkg, err = read_pine_file(target)
+    local pkg, err = read_cone_file(target)
     if not pkg then die("parse error: " .. tostring(err)) end
     name = pkg.manifest.name
     version = pkg.manifest.version
@@ -707,7 +734,7 @@ local function do_install(target, resolved_set)
     local pine_path, find_err = find_repo_pkg(target)
     if not pine_path then
       -- Not cached locally — fetch via HTTP
-      local fetch_path, fetch_err = fetch_pine_http(target)
+      local fetch_path, fetch_err = fetch_cone_http(target)
       if not fetch_path then
         die(tostring(fetch_err or find_err))
       end
@@ -720,12 +747,12 @@ local function do_install(target, resolved_set)
 
   install_depth = install_depth - 1
 
-  -- At top-level install: clean up fetched .pine files (unless --keep-cache)
+  -- At top-level install: clean up fetched .cone files (unless --keep-cache)
   if depth_at_entry == 1 and not flag_keepcache then
-    for path, _ in pairs(fetched_pines) do
+    for path, _ in pairs(fetched_cones) do
       unlink(path)
     end
-    fetched_pines = {}
+    fetched_cones = {}
   end
 
   if not ok then error(install_err, 0) end
@@ -948,7 +975,7 @@ local function do_clean()
   end
   local removed = 0
   for _, e in ipairs(entries) do
-    if e.name:match("%.pine$") and e.name ~= "PINEINDEX" then
+    if e.name:match("%.cone$") and e.name ~= "PINEINDEX" then
       local path = REPO_DIR .. "/" .. e.name
       unlink(path)
       removed = removed + 1
@@ -962,7 +989,7 @@ end
 local function usage()
   write(1, "Usage: pine <command> [options]\n")
   write(1, "Commands:\n")
-  write(1, "  install <name|file.pine>  Install a package\n")
+  write(1, "  install <name|file.cone>  Install a package\n")
   write(1, "  remove <name>            Remove an installed package\n")
   write(1, "  list                     List installed packages\n")
   write(1, "  files <name>             List files owned by a package\n")
@@ -971,12 +998,12 @@ local function usage()
   write(1, "  search <pattern>         Search repo for packages\n")
   write(1, "  update                   Update repo index\n")
   write(1, "  upgrade [name]           Upgrade package(s)\n")
-  write(1, "  clean                    Delete cached .pine files (keeps PINEINDEX)\n")
+  write(1, "  clean                    Delete cached .cone files (keeps PINEINDEX)\n")
   write(1, "Options:\n")
   write(1, "  --force                  Force operation\n")
   write(1, "  --no-hooks               Skip pre/post install/remove hooks\n")
   write(1, "  --dry-run                Show what would happen without doing it\n")
-  write(1, "  --keep-cache             Retain .pine files after install\n")
+  write(1, "  --keep-cache             Retain .cone files after install\n")
 end
 
 -- ---- main dispatch ----
@@ -984,7 +1011,7 @@ end
 acquire_lock()
 local ok, res = pcall(function()
   if cmd == "install" then
-    if not args[2] then die("usage: pine install <name|file.pine>") end
+    if not args[2] then die("usage: pine install <name|file.cone>") end
     do_install(args[2])
   elseif cmd == "remove" then
     if not args[2] then die("usage: pine remove <name>") end
