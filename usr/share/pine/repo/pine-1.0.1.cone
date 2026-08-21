@@ -1,3 +1,21 @@
+---PINEPKG v1---
+name=pine
+version=1.0.1
+arch=any
+maintainer=userland@pinecone.dev
+description=PineconeOS package manager (1.0.1)
+license=MIT
+essential=yes
+deps=coreutils@>=1.0.0
+provides=
+conffiles=
+preinst=
+postinst=
+prerem=
+postrem=
+files=1
+---END MANIFEST---
+---FILE /usr/bin/pine.lua 0755 31503 b673af71 src---
 --[[
   PineconeOS package manager (pine)
   ================================
@@ -1102,3 +1120,4 @@ local ok, res = pcall(function()
 end)
 release_lock()
 if not ok then err(res); exit(1) end
+---END PKG---

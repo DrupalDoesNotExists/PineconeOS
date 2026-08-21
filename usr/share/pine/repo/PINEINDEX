@@ -162,13 +162,13 @@ sha:cc8f07da
 file:netutils-1.0.0.cone
 ---
 pkg:pine
-version:1.0.0
+version:1.0.1
 arch:any
 deps:coreutils@>=1.0.0
-desc:PineconeOS package manager
-size:30170
-sha:18ebc426
-file:pine-1.0.0.cone
+desc:PineconeOS package manager (1.0.1) - fetch remote PINEINDEX on update/upgrade
+size:31833
+sha:0239b852
+file:pine-1.0.1.cone
 ---
 pkg:procutils
 version:1.0.0
