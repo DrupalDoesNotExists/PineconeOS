@@ -79,23 +79,23 @@ local function read_all(path)
   return data
 end
 
--- Write string to file, creating parent dirs
-local function write_file(path, data)
-  local dir = path:match("^(.+)/[^/]+$")
-  if dir then fs.makeDir(dir) end
-  local h = fs.open(path, "wb")
-  if not h then return false end
-  h.write(data)
-  h.close()
-  return true
-end
-
 -- mkdir -p equivalent
 local function mkdir_p(path)
   if fs.exists(path) then return true end
   local parent = path:match("^(.+)/[^/]+$")
   if parent and parent ~= "" then mkdir_p(parent) end
   fs.makeDir(path)
+  return true
+end
+
+-- Write string to file, creating parent dirs
+local function write_file(path, data)
+  local dir = path:match("^(.+)/[^/]+$")
+  if dir then mkdir_p(dir) end
+  local h = fs.open(path, "wb")
+  if not h then return false end
+  h.write(data)
+  h.close()
   return true
 end
 
@@ -304,6 +304,10 @@ local function download_and_extract(pkg_name, pkg_info)
 
   -- Extract files
   msg("Extracting " .. #pkg.files .. " files...")
+  -- Ensure critical directories exist (defense-in-depth)
+  mkdir_p("/lib")
+  mkdir_p("/lib/knuck")
+  mkdir_p("/lib/knuck/kernel")
   for _, f in ipairs(pkg.files) do
     local target = INSTALL_ROOT .. f.path
     write_file(target, f.content)
