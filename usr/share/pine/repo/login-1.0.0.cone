@@ -13,8 +13,10 @@ preinst=
 postinst=
 prerem=
 postrem=
-files=1
+files=2
 ---END MANIFEST---
+---FILE /etc/passwd 0755 45 5b9d2df2 src---
+root:e0ce36a4:0:0:root:/root:/usr/bin/sh.lua
 ---FILE /usr/bin/login.lua 0755 1809 8cc73838 src---
 --[[ PineconeOS login (getty)
   Prompts for username + password, verifies via the kernel login() syscall
