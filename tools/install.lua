@@ -12,8 +12,9 @@
     3. Download and extract core packages
     4. Set up /boot/knuck.conf
     5. Install /sbin/init.lua (not in any .cone package)
-    6. Write /startup boot entry
-    7. Offer reboot
+    6. Install default services under /etc/sv
+    7. Write /startup boot entry
+    8. Offer reboot
 ]]
 
 -- ============================================================
@@ -559,6 +560,54 @@ local function write_init()
 end
 
 -- ============================================================
+-- Step 6b: Install default service configs under /etc/sv
+-- ============================================================
+
+local DEFAULT_SV_SERVICES = {
+  dhcp = [=[
+#!/usr/bin/env lua
+-- Default DHCP service
+-- Requests network configuration via modem HTTP API.
+-- Respawn loop: if dhcp.lua crashes, wait and retry.
+while true do
+  local ok, err = pcall(function() dofile("/usr/bin/dhcp.lua") end)
+  if not ok then
+    print("dhcp service error: " .. tostring(err))
+    sleep(5)
+  end
+end
+]=],
+
+  getty = [=[
+#!/usr/bin/env lua
+-- Default login/getty service
+-- Starts an interactive shell session on the terminal.
+while true do
+  local ok, err = pcall(function() dofile("/usr/bin/sh.lua") end)
+  if not ok then
+    print("getty service error: " .. tostring(err))
+    sleep(2)
+  end
+end
+]=],
+}
+
+local function write_default_sv()
+  header("Installing default services")
+
+  for name, source in pairs(DEFAULT_SV_SERVICES) do
+    local dir = INSTALL_ROOT .. "/etc/sv/" .. name
+    mkdir_p(dir)
+    local path = dir .. "/run"
+    msg("Writing " .. path .. "...")
+    write_file(path, source)
+    success("Service " .. name .. " installed")
+  end
+
+  return true
+end
+
+-- ============================================================
 -- Step 7: Write /startup entry point
 -- ============================================================
 
@@ -609,6 +658,8 @@ local function verify_install()
     "/usr/bin/cat.lua",
     "/boot/knuck.conf",
     "/startup",
+    "/etc/sv/dhcp/run",
+    "/etc/sv/getty/run",
   }
 
   local all_ok = true
@@ -690,7 +741,13 @@ local function main()
     return
   end
 
-  -- Step 6b: Write startup entry
+  -- Step 6b: Install default services under /etc/sv
+  if not write_default_sv() then
+    err("Failed to install default services.")
+    return
+  end
+
+  -- Step 6c: Write startup entry
   if not write_startup() then
     err("Failed to write boot entry.")
     return
