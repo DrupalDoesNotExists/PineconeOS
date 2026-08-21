@@ -80,6 +80,42 @@ size:116218
 sha:5fbb5929
 file:knuck-1.0.5.cone
 ---
+pkg:knuck
+version:1.0.6
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2) — cooked-mode TTY line buffering, sched starvation guard
+size:176418
+sha:740a0dd5
+file:knuck-1.0.6.cone
+---
+pkg:knuck
+version:1.0.7
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2) — cooked-mode TTY echo + backspace fix, line buffering
+size:177162
+sha:53c40387
+file:knuck-1.0.7.cone
+---
+pkg:knuck
+version:1.0.8
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2) — conditional cooked-mode TTY processing (fixes double echo, password visible, shell Enter)
+size:177661
+sha:a480b5b1
+file:knuck-1.0.8.cone
+---
+pkg:knuck
+version:1.0.9
+arch:any
+deps:
+desc:KNUCK microkernel (Lua 5.2) — fix-60: Enter keycodes 28/13/257, cooked-mode TTY echo + backspace fix
+size:177712
+sha:223d6f40
+file:knuck-1.0.9.cone
+---
 pkg:knuck-icmp
 version:1.0.0
 arch:any
@@ -197,6 +233,15 @@ size:6237
 sha:d4930ee1
 file:shell-0.1.0.cone
 ---
+pkg:shell
+version:0.1.1
+arch:any
+deps:coreutils@>=1.0.0
+desc:shell (0.1.1) - error handling for command not found, run_pipeline exit status, builtins
+size:7635
+sha:52add6c7
+file:shell-0.1.1.cone
+---
 pkg:specutils
 version:1.0.0
 arch:any
@@ -223,4 +268,13 @@ desc:Vi-style modal text editor
 size:13190
 sha:7018b831
 file:vi-1.0.0.cone
+---
+pkg:pine
+version:1.0.2
+arch:any
+deps:coreutils@>=1.0.0
+desc:PineconeOS package manager (1.0.2) - fix installed DB mkdir_p and write check
+size:32073
+sha:1874cc23
+file:pine-1.0.2.cone
 ---

@@ -1,3 +1,21 @@
+---PINEPKG v1---
+name=pine
+version=1.0.2
+arch=any
+maintainer=userland@pinecone.dev
+description=PineconeOS package manager (1.0.2) - fix installed DB mkdir_p and write check
+license=MIT
+essential=yes
+deps=coreutils@>=1.0.0
+provides=
+conffiles=
+preinst=
+postinst=
+prerem=
+postrem=
+files=1
+---END MANIFEST---
+---FILE /usr/bin/pine.lua 0755 31700 7064ea87 src---
 --[[
   PineconeOS package manager (pine)
   ================================
@@ -1106,3 +1124,4 @@ local ok, res = pcall(function()
 end)
 release_lock()
 if not ok then err(res); exit(1) end
+---END PKG---
