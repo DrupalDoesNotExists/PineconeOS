@@ -1,7 +1,0 @@
--- ttybcd service: claim tty2, proxy a shell via a pty, broadcast to monitors.
--- If ttybcd exits, respawn it (init also supervises this service).
-while true do
-  local pid = spawn("/usr/bin/ttybcd.lua", "2")
-  if pid then waitpid(pid) end
-  sleep(1)
-end

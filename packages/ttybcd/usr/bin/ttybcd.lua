@@ -11,7 +11,7 @@
   recording, etc.
 
   Usage:
-    ttybcd [tty]                                 main mode (default tty 2)
+    ttybcd [tty]                                 main mode (default tty 3)
     ttybcd forward <master_fd> <real_fd> [mon...]  internal output forwarder
 ]]
 
@@ -57,7 +57,7 @@ if mode == "forward" then
 end
 
 -- ---- main mode ----
-local tty = tonumber(args[1]) or 2
+local tty = tonumber(args[1]) or 3
 
 local real_fd = open("/dev/tty" .. tty, 2)  -- O_RDWR
 if not real_fd then

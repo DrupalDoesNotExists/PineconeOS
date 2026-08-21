@@ -649,15 +649,6 @@ while true do
 end
 ]=],
 
-  ttybcd = [=[
-#!/usr/bin/env lua
--- ttybcd: TTY broadcast daemon (mirrors terminal to /dev/peripherals/monitors/*)
-while true do
-  local pid = spawn("/usr/bin/ttybcd.lua")
-  if pid then waitpid(pid) end
-  sleep(1)
-end
-]=],
 }
 
 local function write_default_sv()
