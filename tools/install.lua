@@ -575,19 +575,10 @@ end
 
   getty = [=[
 #!/usr/bin/env lua
--- Getty: login prompt on console
-while true do
-  local ok, err = pcall(function() dofile("/usr/bin/sh.lua") end)
-  if not ok then print("getty error: "..tostring(err)) sleep(2) end
-end
-]=],
-
-  logind = [=[
-#!/usr/bin/env lua
--- logind: user session/logind supervisor (stub, respawn login)
+-- Getty: login prompt on console (auth via login, not raw sh)
 while true do
   local ok, err = pcall(function() dofile("/usr/bin/login.lua") end)
-  if not ok then print("logind error: "..tostring(err)) sleep(2) else sleep(1) end
+  if not ok then print("getty error: "..tostring(err)) sleep(2) end
 end
 ]=],
 
