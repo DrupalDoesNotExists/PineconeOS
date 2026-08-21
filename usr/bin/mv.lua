@@ -1,15 +1,15 @@
 -- mv: move files
 -- Usage: mv <src> <dst>  OR  mv <src...> <dir>
 local function usage()
-    print("usage: mv <source> <dest>")
-    print("       mv <source...> <dir>")
+    write(2, "usage: mv <source> <dest>\n")
+    write(2, "       mv <source...> <dir>\n")
     exit(1)
 end
 
 local function read_file(path)
     local fd, err = open(path, 0)
     if not fd then
-        print("mv: cannot open '"..path.."': "..err)
+        write(2, "mv: cannot open '"..path.."': "..(err or "unknown error").."\n")
         exit(1)
     end
     local chunks = {}
@@ -25,7 +25,7 @@ end
 local function write_file(path, data)
     local fd, err = open(path, "w")
     if not fd then
-        print("mv: cannot create '"..path.."': "..err)
+        write(2, "mv: cannot create '"..path.."': "..(err or "unknown error").."\n")
         exit(1)
     end
     local off = 1
@@ -50,14 +50,14 @@ for i=1,#args-1 do srcs[#srcs+1] = args[i] end
 
 local dst_st = stat(dst)
 if #srcs > 1 and (not dst_st or dst_st.type ~= "directory") then
-    print("mv: target '"..dst.."' is not a directory")
+    write(2, "mv: target '"..dst.."' is not a directory\n")
     exit(1)
 end
 
 for _, src in ipairs(srcs) do
     local src_st = stat(src)
     if not src_st then
-        print("mv: cannot stat '"..src.."': No such file or directory")
+        write(2, "mv: cannot stat '"..src.."': No such file or directory\n")
         exit(1)
     end
     local dest_path

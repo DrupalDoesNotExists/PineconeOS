@@ -95,6 +95,15 @@ end
 
 -- ---- executor ----
 
+-- Expand $VAR / ${VAR} references in a token (unquoted context).
+local function expand_vars(s)
+  return s:gsub("%$(%w+)", function(name)
+    return getenv(name) or ""
+  end):gsub("%$%{(%w+)%}", function(name)
+    return getenv(name) or ""
+  end)
+end
+
 local function run_stage(stage, stdin_fd, stdout_fd)
   -- spawn a single stage with optional stdin/stdout wiring
   local fds = {}
@@ -102,6 +111,7 @@ local function run_stage(stage, stdin_fd, stdout_fd)
   if stdout_fd then fds[1] = stdout_fd end
   -- resolve command name to a path via PATH env var (no fork: spawn loads a file)
   local cmd = stage.argv[1]
+  if not cmd then return nil, "empty command" end
   local path = cmd
   if not cmd:find("/", 1, true) then
     local path_env = getenv("PATH") or "/bin:/usr/bin"
@@ -111,14 +121,20 @@ local function run_stage(stage, stdin_fd, stdout_fd)
       if f then close(f); path = cand; break end
     end
   end
-  local pid = spawn(path, table.unpack(stage.argv, 2), fds)
-  return pid
+  -- expand $VAR in arguments (arg 2+), not in the command name itself
+  local args = {}
+  for i = 2, #stage.argv do
+    args[#args + 1] = expand_vars(stage.argv[i])
+  end
+  local pid, err = spawn(path, table.unpack(args), fds)
+  return pid, err
 end
 
 local function run_pipeline(pipeline)
   local n = #pipeline
   local pids = {}
   local prev_read = nil
+  local last_exit = 0
 
   for i, stage in ipairs(pipeline) do
     -- resolve redirections
@@ -142,8 +158,15 @@ local function run_pipeline(pipeline)
       end
     end
 
-    local pid = run_stage(stage, in_fd, out_fd)
-    if pid then pids[#pids + 1] = pid end
+    local pid, err = run_stage(stage, in_fd, out_fd)
+    if pid then
+      pids[#pids + 1] = pid
+    else
+      -- command not found or failed to spawn — report to stderr
+      local cmd_name = stage.argv[1] or "?"
+      write(2, "sh: " .. cmd_name .. ": " .. (err or "command not found") .. "\n")
+      last_exit = 127
+    end
 
     -- close parent's copies
     if prev_read then close(prev_read) end
@@ -152,12 +175,19 @@ local function run_pipeline(pipeline)
   end
   if prev_read then close(prev_read) end
 
-  -- wait for foreground pipeline
+  -- wait for foreground pipeline; propagate exit codes
   if not pipeline.bg then
     for _, pid in ipairs(pids) do
-      waitpid(pid)
+      local _, how, code = waitpid(pid)
+      if how == "exited" then
+        last_exit = code or 0
+      elseif how == "killed" then
+        last_exit = 128 + (code or 0)
+      end
     end
   end
+
+  setenv("?", tostring(last_exit))
 end
 
 -- ---- builtins ----
@@ -166,13 +196,28 @@ local function run_builtin(argv)
   if argv[1] == "cd" then
     local dir = argv[2] or "/"
     local ok = chdir(dir)
-    if not ok then print("sh: cd: " .. dir .. ": no such directory") end
+    if not ok then write(2, "sh: cd: " .. dir .. ": no such directory\n") end
     return true
   elseif argv[1] == "exit" then
     exit(tonumber(argv[2]) or 0)
     return true
   elseif argv[1] == "source" or argv[1] == "." then
     source_file(argv[2])
+    return true
+  elseif argv[1] == "echo" then
+    -- Echo arguments, expanding $VAR references
+    local parts = {}
+    for i = 2, #argv do
+      if i > 2 then parts[#parts + 1] = " " end
+      parts[#parts + 1] = expand_vars(argv[i])
+    end
+    print(table.concat(parts))
+    return true
+  elseif argv[1] == "set" then
+    -- setenv: set environment variable (for /usr/bin/set.lua compat)
+    if argv[2] and argv[3] then
+      setenv(argv[2], argv[3])
+    end
     return true
   end
   return false

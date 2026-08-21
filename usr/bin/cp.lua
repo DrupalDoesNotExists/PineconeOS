@@ -1,15 +1,15 @@
 -- cp: copy files
 -- Usage: cp <src> <dst>  OR  cp <src...> <dir>
 local function usage()
-    print("usage: cp <source> <dest>")
-    print("       cp <source...> <dir>")
+    write(2, "usage: cp <source> <dest>\n")
+    write(2, "       cp <source...> <dir>\n")
     exit(1)
 end
 
 local function read_file(path)
     local fd, err = open(path, 0)  -- O_RDONLY
     if not fd then
-        print("cp: cannot open '"..path.."': "..err)
+        write(2, "cp: cannot open '"..path.."': "..(err or "unknown error").."\n")
         exit(1)
     end
     local chunks = {}
@@ -26,7 +26,7 @@ end
 local function write_file(path, data)
     local fd, err = open(path, "w")  -- kernel vfs.open uses string flags, not numeric O_*
     if not fd then
-        print("cp: cannot create '"..path.."': "..err)
+        write(2, "cp: cannot create '"..path.."': "..(err or "unknown error").."\n")
         exit(1)
     end
     local off = 1
@@ -51,7 +51,7 @@ local dst_st = stat(dst)
 if #srcs > 1 then
     -- multiple sources: dst must be a directory (or we can't handle file->file multiple)
     if not dst_st or dst_st.type ~= "directory" then
-        print("cp: target '"..dst.."' is not a directory")
+        write(2, "cp: target '"..dst.."' is not a directory\n")
         exit(1)
     end
 end
@@ -59,7 +59,7 @@ end
 for _, src in ipairs(srcs) do
     local src_st = stat(src)
     if not src_st then
-        print("cp: cannot stat '"..src.."': No such file or directory")
+        write(2, "cp: cannot stat '"..src.."': No such file or directory\n")
         exit(1)
     end
     local dest_path
