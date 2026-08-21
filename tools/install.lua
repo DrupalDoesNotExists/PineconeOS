@@ -4,15 +4,16 @@
   Runs on stock CraftOS (no KNUCK yet). Downloads and installs the
   base system from the GitHub distrorepo.
 
-  Usage: pastebin run <code> or copy to /startup.lua on a fresh computer.
+  Usage: pastebin run <code> or copy to /startup on a fresh computer.
 
   Steps:
     1. Check HTTP API availability
     2. Fetch PINEINDEX from distrorepo
     3. Download and extract core packages
     4. Set up /boot/knuck.conf
-    5. Install /startup.lua entry point
-    6. Offer reboot
+    5. Install /sbin/init.lua (not in any .pine package)
+    6. Write /startup boot entry
+    7. Offer reboot
 ]]
 
 -- ============================================================
@@ -391,7 +392,95 @@ init /sbin/init.lua
 end
 
 -- ============================================================
--- Step 6: Write /startup.lua entry point
+-- Step 6: Install /sbin/init.lua (not in any .pine package)
+-- ============================================================
+
+local INIT_SOURCE = [=[
+--[[
+  PineconeOS init (pid 1) -- runit-style supervisor
+  =================================================
+  Scans /etc/sv/ for service directories, spawns each <name>/run script,
+  then supervises them: on exit, respawns with a short backoff so a crashing
+  service doesn't spin the CPU.
+
+  Service layout (runit convention):
+    /etc/sv/<name>/run     executable Lua script (the service)
+
+  The kernel spawns this as pid 1 (default /sbin/init.lua, overridable via
+  init path in /boot/knuck.conf).
+]]
+
+local BACKOFF = 1  -- seconds to wait before respawning a crashed service
+
+local function log(msg)
+  print("[init] " .. msg)
+end
+
+-- discover services under /etc/sv
+local services = {}  -- { name = <name>, path = <path>, pid = <pid> }
+local ok, entries = pcall(readdir, "/etc/sv")
+if ok and entries then
+  for _, entry in ipairs(entries) do
+    local name = entry.name
+    local run = "/etc/sv/" .. name .. "/run"
+    local ino = stat(run)
+    if ino and ino.type == "file" then
+      services[#services + 1] = { name = name, path = run, pid = nil }
+    end
+  end
+else
+  log("no /etc/sv, starting with no services")
+end
+
+-- spawn all services
+for _, svc in ipairs(services) do
+  local pid = spawn(svc.path)
+  if pid then
+    svc.pid = pid
+    log("started " .. svc.name .. " pid " .. pid)
+  else
+    log("FAILED to start " .. svc.name)
+  end
+end
+
+-- supervise: reap children, respawn crashed services
+while true do
+  local pid, how, code = waitpid(-1)
+  if pid then
+    -- find which service this pid belonged to
+    local svc = nil
+    for _, s in ipairs(services) do
+      if s.pid == pid then svc = s break end
+    end
+    if svc then
+      log(svc.name .. " exited (" .. tostring(how) .. " " .. tostring(code) .. "), respawning")
+      sleep(BACKOFF)
+      local np = spawn(svc.path)
+      if np then
+        svc.pid = np
+        log("restarted " .. svc.name .. " pid " .. np)
+      else
+        log("FAILED to restart " .. svc.name)
+      end
+    else
+      log("reaped unknown pid " .. pid)
+    end
+  end
+end
+]=]
+
+local function write_init()
+  header("Installing init process")
+
+  local path = INSTALL_ROOT .. "/sbin/init.lua"
+  msg("Writing " .. path .. "...")
+  write_file(path, INIT_SOURCE)
+  success("Init process installed")
+  return true
+end
+
+-- ============================================================
+-- Step 7: Write /startup entry point
 -- ============================================================
 
 local function write_startup()
@@ -410,7 +499,7 @@ end
 f()
 ]]
 
-  local path = INSTALL_ROOT .. "/startup.lua"
+  local path = INSTALL_ROOT .. "/startup"
   msg("Writing " .. path .. "...")
   write_file(path, startup)
   success("Boot entry written")
@@ -432,7 +521,7 @@ local function verify_install()
     "/usr/bin/ls.lua",
     "/usr/bin/cat.lua",
     "/boot/knuck.conf",
-    "/startup.lua",
+    "/startup",
   }
 
   local all_ok = true
@@ -502,7 +591,13 @@ local function main()
     return
   end
 
-  -- Step 6: Write startup
+  -- Step 6a: Install init (not in any .pine package)
+  if not write_init() then
+    err("Failed to install init process.")
+    return
+  end
+
+  -- Step 6b: Write startup entry
   if not write_startup() then
     err("Failed to write boot entry.")
     return
