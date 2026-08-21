@@ -1,0 +1,337 @@
+---PINEPKG v1---
+name=shell
+version=0.1.3
+arch=any
+maintainer=pine@pineconeos.dev
+description=shell (0.1.3) - history removed, tty scroll handled by kernel
+license=MIT
+deps=coreutils@>=1.0.0
+files=1
+---END MANIFEST---
+---FILE /usr/bin/sh.lua 0755 8630 f6bd2666 src---
+--[[
+  PineconeOS shell (sh) — xv6 sh port
+  ===================================
+  Supports: simple commands, pipelines (|), redirection (<, >, >>),
+  background (&), sequential lists (;), quotes. Builtins: cd, exit.
+
+  No fork: pipelines use spawn with fd wiring (child stdin/stdout set to
+  pipe/file ends via the spawn fds table).
+]]
+
+-- ---- tokenizer ----
+
+local function tokenize(line)
+  local tokens = {}
+  local i, n = 1, #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if c == " " or c == "\t" then
+      i = i + 1
+    elseif c == ">" and line:sub(i + 1, i + 1) == ">" then
+      tokens[#tokens + 1] = ">>"
+      i = i + 2
+    elseif c:match("[|<>;&]") then
+      tokens[#tokens + 1] = c
+      i = i + 1
+    elseif c == '"' or c == "'" then
+      local quote, j, buf = c, i + 1, {}
+      while j <= n and line:sub(j, j) ~= quote do
+        buf[#buf + 1] = line:sub(j, j)
+        j = j + 1
+      end
+      tokens[#tokens + 1] = table.concat(buf)
+      i = j + 1
+    else
+      local j, buf = i, {}
+      while j <= n and not line:sub(j, j):match("[%s|<>;&]") do
+        buf[#buf + 1] = line:sub(j, j)
+        j = j + 1
+      end
+      tokens[#tokens + 1] = table.concat(buf)
+      i = j
+    end
+  end
+  return tokens
+end
+
+-- ---- parser ----
+-- Produces a list of commands. Each command is a list of pipeline stages.
+-- Each stage: { argv = {...}, in = <file|nil>, out = <file|nil>, append = bool }
+
+local function parse(tokens)
+  local commands = {}   -- list of pipelines
+  local pipeline = {}   -- current pipeline (list of stages)
+  local stage = { argv = {} }
+  local i, n = 1, #tokens
+
+  local function push_stage()
+    if #stage.argv > 0 or stage.stdin or stage.stdout then
+      pipeline[#pipeline + 1] = stage
+    end
+    stage = { argv = {} }
+  end
+  local function push_pipeline()
+    push_stage()
+    if #pipeline > 0 then
+      commands[#commands + 1] = pipeline
+    end
+    pipeline = {}
+  end
+
+  while i <= n do
+    local t = tokens[i]
+    if t == "|" then
+      push_stage()
+    elseif t == ";" then
+      push_pipeline()
+    elseif t == "&" then
+      if #commands == 0 then push_pipeline() end
+      commands[#commands].bg = true
+    elseif t == "<" then
+      i = i + 1
+      stage.stdin = tokens[i]
+    elseif t == ">" or t == ">>" then
+      i = i + 1
+      stage.stdout = tokens[i]
+      stage.append = (t == ">>")
+    else
+      stage.argv[#stage.argv + 1] = t
+    end
+    i = i + 1
+  end
+  push_pipeline()
+  return commands
+end
+
+-- ---- executor ----
+
+-- Expand $VAR / ${VAR} references in a token (unquoted context).
+local function expand_vars(s)
+  return s:gsub("%$(%w+)", function(name)
+    return getenv(name) or ""
+  end):gsub("%$%{(%w+)%}", function(name)
+    return getenv(name) or ""
+  end)
+end
+
+local function run_stage(stage, stdin_fd, stdout_fd)
+  -- spawn a single stage with optional stdin/stdout wiring
+  local fds = {}
+  if stdin_fd then fds[0] = stdin_fd end
+  if stdout_fd then fds[1] = stdout_fd end
+  -- resolve command name to a path via PATH env var (no fork: spawn loads a file)
+  local cmd = stage.argv[1]
+  if not cmd then return nil, "empty command" end
+  local path = cmd
+  if not cmd:find("/", 1, true) then
+    local path_env = getenv("PATH") or "/bin:/usr/bin"
+    for dir in path_env:gmatch("[^:]+") do
+      local cand = dir .. "/" .. cmd .. ".lua"
+      local f = open(cand, "r")
+      if f then close(f); path = cand; break end
+    end
+  end
+  -- expand $VAR in arguments (arg 2+), not in the command name itself
+  local args = {}
+  for i = 2, #stage.argv do
+    args[#args + 1] = expand_vars(stage.argv[i])
+  end
+  local pid, err = spawn(path, table.unpack(args), fds)
+  return pid, err
+end
+
+local function run_pipeline(pipeline)
+  local n = #pipeline
+  local pids = {}
+  local prev_read = nil
+  local last_exit = 0
+
+  for i, stage in ipairs(pipeline) do
+    -- resolve redirections
+    local in_fd, out_fd = prev_read, nil
+    if stage.stdin then
+      local f = open(stage.stdin, "r")
+      if f then in_fd = f end
+    end
+    if stage.stdout then
+      local f = open(stage.stdout, stage.append and "a" or "w")
+      if f then out_fd = f end
+    end
+
+    -- create pipe to next stage if not last
+    local next_read = nil
+    if i < n then
+      local r, w = pipe()
+      if r then
+        next_read = r
+        if not out_fd then out_fd = w end
+      end
+    end
+
+    local pid, err = run_stage(stage, in_fd, out_fd)
+    if pid then
+      pids[#pids + 1] = pid
+    else
+      -- command not found or failed to spawn — report to stderr
+      local cmd_name = stage.argv[1] or "?"
+      write(2, "sh: " .. cmd_name .. ": " .. (err or "command not found") .. "\n")
+      last_exit = 127
+    end
+
+    -- close parent's copies
+    if prev_read then close(prev_read) end
+    if out_fd and i < n then close(out_fd) end
+    prev_read = next_read
+  end
+  if prev_read then close(prev_read) end
+
+  -- wait for foreground pipeline; propagate exit codes
+  if not pipeline.bg then
+    for _, pid in ipairs(pids) do
+      local _, how, code = waitpid(pid)
+      if how == "exited" then
+        last_exit = code or 0
+      elseif how == "killed" then
+        last_exit = 128 + (code or 0)
+      end
+    end
+  end
+
+  setenv("?", tostring(last_exit))
+end
+
+-- ---- builtins ----
+
+local function run_builtin(argv)
+  if argv[1] == "cd" then
+    local dir = argv[2] or "/"
+    local ok = chdir(dir)
+    if not ok then write(2, "sh: cd: " .. dir .. ": no such directory\n") end
+    return true
+  elseif argv[1] == "exit" then
+    exit(tonumber(argv[2]) or 0)
+    return true
+  elseif argv[1] == "source" or argv[1] == "." then
+    source_file(argv[2])
+    return true
+  elseif argv[1] == "echo" then
+    -- Echo arguments, expanding $VAR references
+    local parts = {}
+    for i = 2, #argv do
+      if i > 2 then parts[#parts + 1] = " " end
+      parts[#parts + 1] = expand_vars(argv[i])
+    end
+    print(table.concat(parts))
+    return true
+  elseif argv[1] == "set" then
+    -- setenv: set environment variable (for /usr/bin/set.lua compat)
+    if argv[2] and argv[3] then
+      setenv(argv[2], argv[3])
+    end
+    return true
+  end
+  return false
+end
+
+-- ---- main loop ----
+
+local function getcwd_str()
+  local c = getcwd()
+  return c or "/"
+end
+
+-- Run a single input line (used by the interactive loop and by source).
+local function run_line(line)
+  line = line:gsub("\r?\n$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if line == "" then return end
+  local commands = parse(tokenize(line))
+  for _, pipeline in ipairs(commands) do
+    -- builtins run in the shell itself
+    local first = pipeline[1]
+    if first and #first.argv > 0 and run_builtin(first.argv) then
+      -- done
+    else
+      run_pipeline(pipeline)
+    end
+  end
+end
+
+-- Source a startup file (run its lines as shell commands).
+function source_file(path)
+  if not path then return false end
+  local f = open(path, "r")
+  if not f then return false end
+  local data = read(f, 1048576)
+  close(f)
+  if data then
+    for line in (data .. "\n"):gmatch("(.-)\n") do
+      run_line(line)
+    end
+  end
+  return true
+end
+
+print("PineconeOS sh")
+
+-- Source system-wide and user rc files at startup.
+source_file("/etc/profile")
+local home = getenv("HOME")
+if home then source_file(home .. "/.shrc") end
+
+local use_raw = ioctl(0, "TCSETS", "raw") or ioctl(0, "console_mode", "raw")
+local function read_line_raw(prompt)
+  write(1, prompt)
+  local buf = ""
+  while true do
+    local ev = read(0, 1)
+    if ev == nil then
+      return nil
+    elseif type(ev) == "table" then
+      if ev[1] == "char" then
+        local ch = ev[2]
+        if ch == "\n" or ch == "\r" then
+          write(1, "\n")
+          return buf
+        elseif ch == "\b" or ch == "\x7f" then
+          if #buf > 0 then buf = buf:sub(1,-2); write(1, "\b \b") end
+        elseif type(ch)=="string" and #ch==1 then
+          buf = buf .. ch
+          write(1, ch)
+        end
+      elseif ev[1] == "key" then
+        local k = ev[2]
+        if k == 14 or k == 259 then
+          if #buf > 0 then buf = buf:sub(1,-2); write(1, "\b \b") end
+        elseif k == 28 or k == 13 or k == 257 then
+          write(1, "\n")
+          return buf
+        end
+      end
+    elseif type(ev) == "string" then
+      local line = ev:gsub("\r?\n$","")
+      write(1, "\n")
+      return line
+    end
+  end
+end
+
+local function prompt_str()
+  return getcwd_str() .. "> "
+end
+
+if use_raw then
+  while true do
+    local line = read_line_raw(prompt_str())
+    if not line then break end
+    run_line(line)
+  end
+else
+  while true do
+    write(1, getcwd_str() .. "> ")
+    local line = read(0, 4096)
+    if not line then break end
+    run_line(line)
+  end
+end
+---END PKG---
