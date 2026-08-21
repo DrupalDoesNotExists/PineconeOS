@@ -408,6 +408,10 @@ end
 local function install_packages(index)
   header("Installing core packages")
 
+  -- Ensure service dir exists even if no package provides it (init scans /etc/sv)
+  mkdir_p(INSTALL_ROOT .. "/etc")
+  mkdir_p(INSTALL_ROOT .. "/etc/sv")
+
   for _, pkg_name in ipairs(CORE_PACKAGES) do
     local pkg_info = index[pkg_name]
     if not pkg_info then
