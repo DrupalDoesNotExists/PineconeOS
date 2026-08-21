@@ -1,15 +1,15 @@
 -- PineconeOS login service (getty): claim a tty, then prompt for login.
 -- Getty pattern: open RDWR + TIOCSCTTY to claim controlling tty, dup2 stdio,
 -- VT_ACTIVATE so output is visible, then loop on spawn login.lua.
-local fd = open("/dev/tty1", 2)  -- O_RDWR=2
+local fd = open("/dev/tty2", 2)  -- O_RDWR=2
 if fd then
-  ioctl(fd, "TIOCSCTTY", 0)  -- make tty1 our controlling tty
+  ioctl(fd, "TIOCSCTTY", 0)  -- make tty2 our controlling tty
   dup2(fd, 0)
   dup2(fd, 1)
   dup2(fd, 2)
   if fd > 2 then close(fd) end
-  -- Switch physical display to tty1 so getty output is visible
-  ioctl(0, "VT_ACTIVATE", 1)
+  -- Switch physical display to tty2 so getty output is visible
+  ioctl(0, "VT_ACTIVATE", 2)
 end
 clear()
 while true do
