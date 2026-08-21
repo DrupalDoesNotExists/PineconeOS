@@ -589,14 +589,25 @@ end
 
   hotplugd = [=[
 #!/usr/bin/env lua
--- hotplugd: watches device hotplug via /dev (stub)
-while true do sleep(10) end
+-- hotplugd: polls /dev for hotplug changes, logs to syslog
+while true do
+  sleep(10)
+  local ok, ents = pcall(readdir, "/dev")
+  if ok and ents then
+    local h = open("/var/log/syslog", "a")
+    if h then write(h, "[hotplug] /dev entries: "..tostring(#ents).."\n") close(h) end
+  end
+end
 ]=],
 
   syslogd = [=[
 #!/usr/bin/env lua
--- syslogd: system log collector (stub)
-while true do sleep(10) end
+-- syslogd: heartbeat logger (real: would drain kernel log ring)
+while true do
+  sleep(10)
+  local h = open("/var/log/syslog", "a")
+  if h then write(h, "[syslog] heartbeat\n") close(h) end
+end
 ]=],
 }
 
