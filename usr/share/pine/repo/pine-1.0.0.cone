@@ -15,7 +15,7 @@ prerem=
 postrem=
 files=1
 ---END MANIFEST---
----FILE /usr/bin/pine.lua 0755 29159 ca21af5f src---
+---FILE /usr/bin/pine.lua 0755 29848 c0a4ec60 src---
 --[[
   PineconeOS package manager (pine)
   ================================
@@ -204,13 +204,33 @@ local function split_csv(s)
 end
 
 -- ---- FNV-1a ----
-local function fnv1a(data)
-  local h = 0x811c9dc5
-  for i = 1, #data do
-    h = bit.bxor(h, string.byte(data, i))
-    h = (h * 0x01000193) % 0x100000000
+-- Try libcrypto first, then libbase; fall back to inline implementation.
+local fnv1a
+do
+  local ok, crypto = pcall(require, "libcrypto")
+  if ok and crypto and crypto.fnv1a then
+    fnv1a = crypto.fnv1a
+  else
+    local ok2, libbase = pcall(require, "libbase")
+    if ok2 and libbase and libbase.fnv1a then
+      fnv1a = libbase.fnv1a
+    else
+      -- Inline fallback (16-bit-split multiply to avoid float precision loss)
+      fnv1a = function(data)
+      local h = 0x811c9dc5
+      for i = 1, #data do
+        h = bit.bxor(h, string.byte(data, i))
+        local lo = h % 0x10000
+        local hi = (h - lo) / 0x10000
+        local plo = 0x01000193 % 0x10000
+        local phi = (0x01000193 - plo) / 0x10000
+        local r = lo * plo + ((lo * phi + hi * plo) % 0x10000) * 0x10000
+        h = r % 0x100000000
+      end
+      return string.format("%08x", h)
+    end
+    end
   end
-  return string.format("%08x", h)
 end
 
 -- ---- version compare ----

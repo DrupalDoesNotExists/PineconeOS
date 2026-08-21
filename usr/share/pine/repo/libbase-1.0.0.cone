@@ -6,7 +6,7 @@ maintainer=knucc
 provides=
 files=1
 ---END MANIFEST---
----FILE /usr/lib/libbase.lua 0755 7561 034a82ab src---
+---FILE /usr/lib/libbase.lua 0755 6902 b2260d7d src---
 --[[
   libbase — Base utilities for PineconeOS
   ========================================
@@ -228,27 +228,7 @@ function M.pseudo_checksum(src_ip, dest_ip, proto, payload)
 end
 
 -- ================================================================
--- 4. FNV-1a hash
--- ================================================================
-
--- FNV-1a 32-bit hash → 8-char hex string
-function M.fnv1a(data)
-  local h = 0x811c9dc5
-  for i = 1, #data do
-    h = M.bxor(h, string.byte(data, i))
-    -- manual 32-bit multiply (bit32 has no mul, avoid float overflow)
-    local lo = h % 0x10000
-    local hi = (h - lo) / 0x10000
-    local plo = 0x01000193 % 0x10000
-    local phi = (0x01000193 - plo) / 0x10000
-    local r = lo * plo + ((lo * phi + hi * plo) % 0x10000) * 0x10000
-    h = r % 0x100000000
-  end
-  return string.format("%08x", h)
-end
-
--- ================================================================
--- 5. IP address helpers
+-- 4. IP address helpers
 -- ================================================================
 
 -- 4-byte string → "a.b.c.d"

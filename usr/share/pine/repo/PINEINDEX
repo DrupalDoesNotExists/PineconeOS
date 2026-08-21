@@ -8,6 +8,15 @@ size:7964
 sha:2891bf0f
 file:authutils-1.0.0.cone
 ---
+pkg:authutils
+version:1.0.1
+arch:any
+deps:coreutils@>=1.0.0
+desc:User management utilities (adduser, deluser, su, passwd) with FNV-1a password hashing
+size:13650
+sha:7f375e36
+file:authutils-1.0.1.cone
+---
 pkg:chroot
 version:1.0.0
 arch:any
@@ -66,9 +75,9 @@ pkg:knuck
 version:1.0.5
 arch:any
 deps:
-desc:KNUCK microkernel (Lua 5.2) — fix TIOCSCTTY tty bind, sched starvation guard
-size:112568
-sha:3aabb555
+desc:KNUCK microkernel (Lua 5.2) — fix TIOCSCTTY tty bind, sched starvation guard, FNV-1a password hashing
+size:175359
+sha:d0b43e3c
 file:knuck-1.0.5.cone
 ---
 pkg:knuck-icmp
@@ -84,10 +93,19 @@ pkg:libbase
 version:1.0.0
 arch:any
 deps:
-desc:libbase (1.0.0)
-size:7737
-sha:1a6c89ba
+desc:libbase (1.0.0) — bit ops, checksums, IP helpers
+size:7078
+sha:9d8dc452
 file:libbase-1.0.0.cone
+---
+pkg:libcrypto
+version:1.0.0
+arch:any
+deps:
+desc:crypto lib (fnv1a, hashing)
+size:1435
+sha:832567cd
+file:libcrypto-1.0.0.cone
 ---
 pkg:libhttp
 version:1.0.0
@@ -148,8 +166,8 @@ version:1.0.0
 arch:any
 deps:coreutils@>=1.0.0
 desc:PineconeOS package manager
-size:29481
-sha:6d5eff8d
+size:30170
+sha:18ebc426
 file:pine-1.0.0.cone
 ---
 pkg:procutils
