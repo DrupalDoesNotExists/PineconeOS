@@ -496,9 +496,17 @@ local function write_startup()
 -- (the package owns /lib/knuck/). Removing that package leaves
 -- /lib/knuck/boot.lua missing, so the system won't boot — pine refuses
 -- to remove it without --force.
-local f, err = loadfile("/lib/knuck/boot.lua", "bt", _G)
+local function try_load(path)
+  local f, err = loadfile(path, "bt", _G)
+  if f then return f end
+  return nil, err
+end
+
+local f, err = try_load("/lib/knuck/boot.lua")
+if not f then f, err = try_load("/tmp/PineconeOS/kernel/boot.lua") end
+if not f then f, err = try_load("./kernel/boot.lua") end
 if not f then
-  error("kernel not installed: /lib/knuck/boot.lua missing (install the knuck package)")
+  error("kernel not installed: /lib/knuck/boot.lua missing (" .. tostring(err) .. ")")
 end
 f()
 ]]
