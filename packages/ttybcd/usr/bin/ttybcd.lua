@@ -90,7 +90,8 @@ local mon_paths = {}
 local ok, entries = pcall(readdir, "/dev/peripherals/monitors")
 if ok and entries then
   for _, e in ipairs(entries) do
-    if e.type == "file" then
+    -- readdir returns monitor entries with type "device" (not "file")
+    if e.type ~= "dir" then
       mon_paths[#mon_paths + 1] = "/dev/peripherals/monitors/" .. e.name
     end
   end
