@@ -951,7 +951,7 @@ end
 
 -- Fetch remote PINEINDEX via AF_HTTP socket (no raw http global, kernel provides external HTTP via AF_HTTP)
 -- Returns true on success, nil+err on failure.
-local function fetch_url_afhttp(url)
+function fetch_url_afhttp(url)
   local fd, ferr = socket(AF_HTTP, SOCK_STREAM, 0)
   if not fd then return nil, "socket: " .. tostring(ferr) end
   local ok, cerr = connect(fd, url)
